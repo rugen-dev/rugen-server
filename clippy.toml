@@ -1,0 +1,22 @@
+# Determinism: no fused multiply-add and no platform libm in simulation code.
+# Use the `libm` crate for transcendentals (see DESIGN.md "Determinism").
+disallowed-methods = [
+  { path = "f32::mul_add", reason = "FMA differs between targets; write a * b + c" },
+  { path = "f64::mul_add", reason = "FMA differs between targets; write a * b + c" },
+  { path = "f32::sin", reason = "use libm::sinf" },
+  { path = "f32::cos", reason = "use libm::cosf" },
+  { path = "f32::tan", reason = "use libm::tanf" },
+  { path = "f32::asin", reason = "use libm::asinf" },
+  { path = "f32::acos", reason = "use libm::acosf" },
+  { path = "f32::atan", reason = "use libm::atanf" },
+  { path = "f32::atan2", reason = "use libm::atan2f" },
+  { path = "f32::exp", reason = "use libm::expf" },
+  { path = "f32::ln", reason = "use libm::logf" },
+  { path = "f32::log", reason = "use libm::logf" },
+  { path = "f32::powf", reason = "use libm::powf" },
+  { path = "f32::powi", reason = "use libm::powf or a loop" },
+  { path = "f32::sqrt", reason = "use libm::sqrtf" },
+  { path = "f32::floor", reason = "use libm::floorf" },
+  { path = "f32::ceil", reason = "use libm::ceilf" },
+  { path = "f32::round", reason = "use libm::roundf" },
+]
