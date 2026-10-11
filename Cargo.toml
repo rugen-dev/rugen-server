@@ -1,0 +1,19 @@
+[package]
+name = "rugen-relay"
+description = "Tiny UDP rendezvous server: pairs two rugen clients by room code for direct netplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rugen-relay"
+path = "src/main.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true
