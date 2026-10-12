@@ -28,6 +28,10 @@ services:
       RUGEN_NAME: ${RUGEN_NAME:-rugen server}
       RUGEN_MOTD: ${RUGEN_MOTD:-}
       RUST_LOG: ${RUST_LOG:-info}
+      # character packages: disk and bandwidth stay small next to other apps
+      RUGEN_PKG_MAX_TOTAL: ${RUGEN_PKG_MAX_TOTAL:-2GB}
+      RUGEN_PKG_RATE_ACCOUNT: ${RUGEN_PKG_RATE_ACCOUNT:-500MB}
+      RUGEN_PKG_RATE_IP: ${RUGEN_PKG_RATE_IP:-1GB}
     volumes:
       - rugen-data:/data
     # no "ports:": only the tunnel reaches the server
@@ -45,6 +49,21 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # good neighbour on a shared host: hard caps, lowest priority under
+    # contention, first to go if the host runs out of memory, bounded logs
+    cpus: ${RUGEN_CPUS:-1.0}
+    mem_limit: ${RUGEN_MEM:-768m}
+    memswap_limit: ${RUGEN_MEM:-768m}
+    cpu_shares: 256
+    blkio_config:
+      weight: 100
+    pids_limit: 256
+    oom_score_adj: 500
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 networks:
   rugen:

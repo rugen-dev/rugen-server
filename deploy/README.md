@@ -53,6 +53,15 @@ from this repository, so no registry login is needed. Set the Watch Paths to
 `deploy/**`, `src/**`, `Cargo.toml` and `Cargo.lock` to redeploy on server
 changes.
 
+On a host shared with other apps it stays out of the way: at most
+`RUGEN_CPUS` (1.0) CPUs and `RUGEN_MEM` (768m) of memory, a quarter of the
+default CPU weight and a low disk-I/O weight (so other containers win under
+contention), first in line for the OOM killer, 3 × 10 MB of logs, and
+character packages capped at 2 GB on disk and 500 MB/h per account. The one
+heavy moment is the Rust build on each deploy (a few CPU-minutes); to avoid it,
+pull the prebuilt GHCR image instead (registry login in Dokploy) or deploy
+less often (Trigger Type: manual).
+
 ## 2. Optional: Cloudflare Tunnel (separate compose)
 
 1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a
