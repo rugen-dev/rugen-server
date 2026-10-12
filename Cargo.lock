@@ -698,6 +698,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -905,6 +914,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1043,6 +1054,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+
+[[package]]
 name = "lzma-rust2"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1056,6 +1073,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "memchr"
@@ -1383,20 +1410,21 @@ dependencies = [
 
 [[package]]
 name = "rugen-cns"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "indexmap",
  "libm",
  "log",
  "rugen-formats",
+ "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "rugen-content"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "blake3",
  "image-webp",
@@ -1405,6 +1433,7 @@ dependencies = [
  "rugen-fair",
  "rugen-formats",
  "rugen-proto",
+ "rugen-sim",
  "serde",
  "serde_json",
  "thiserror",
@@ -1413,14 +1442,17 @@ dependencies = [
 
 [[package]]
 name = "rugen-fair"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "libm",
  "log",
+ "ring",
  "rugen-cns",
  "rugen-formats",
  "rugen-proto",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "zstd",
@@ -1428,44 +1460,52 @@ dependencies = [
 
 [[package]]
 name = "rugen-formats"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "bytemuck",
  "indexmap",
  "log",
+ "lz4_flex",
  "png",
+ "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "rugen-net"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "bincode",
+ "crc32fast",
  "ggrs",
+ "hmac",
  "log",
+ "md-5",
  "rugen-proto",
  "rugen-sim",
+ "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "thiserror",
  "tungstenite 0.27.0",
  "ureq",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
 name = "rugen-proto"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rugen-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1489,14 +1529,16 @@ dependencies = [
 
 [[package]]
 name = "rugen-sim"
-version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
+version = "0.4.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.4.0#a5899e1791f304e1e7514062343c11bde6933a1e"
 dependencies = [
+ "bincode",
  "indexmap",
  "libm",
  "log",
  "rugen-cns",
  "rugen-formats",
+ "serde",
  "thiserror",
 ]
 

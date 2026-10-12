@@ -39,6 +39,16 @@
 //! RUGEN_AUTO_BLOCK_LIARS        players lying about a fingerprint  3 (0 = off)
 //! RUGEN_AUTO_BLOCK_DESYNCS      desynced matches of a fingerprint  10 (0 = off)
 //! RUGEN_AUTO_BLOCK_ANALYSIS     block on server-side cheat flags   on
+//! RUGEN_CF_TURN_KEY_ID          Cloudflare Realtime TURN key id (TURN off without)
+//! RUGEN_CF_TURN_TOKEN           its API token (secret)
+//! RUGEN_TURN_BUDGET_GB          hard monthly TURN cap, decimal GB   500 (half the free 1000)
+//! RUGEN_TURN_SOFT_PERCENT       above this: TURN for ranked only    80
+//! RUGEN_TURN_MAX_MATCHES_PER_HOUR / _PER_DAY        per account     12 / 60
+//! RUGEN_TURN_MAX_MATCHES_PER_HOUR_IP / _PER_DAY_IP  per client IP   24 / 120
+//! RUGEN_TURN_RATE_ESTIMATE      bytes/s per player per direction    8000
+//! RUGEN_TURN_SAFETY             factor on estimates and reports     2.0
+//! RUGEN_TURN_TTL_MAX            longest credential, seconds         1800
+//! RUGEN_CF_ACCOUNT_ID + RUGEN_CF_ANALYTICS_TOKEN  cross-check usage with Cloudflare analytics
 //! ```
 //!
 //! A server is **official** when its signing key is the official key;
@@ -69,6 +79,7 @@ mod store;
 #[cfg(test)]
 mod testkit;
 mod truth;
+mod turn;
 mod udp;
 
 use std::io::{Read, Write};
@@ -355,6 +366,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         thresholds,
         resim,
         truth: truth_cfg,
+        turn: turn::TurnConfig::from_env(),
     };
     if let Some(bind) = &s.udp_bind {
         let socket = Arc::new(
@@ -385,6 +397,10 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     }
     let api = api::Api::new(store, cfg, relay);
     api.sweep_packages();
+    match &api.turn {
+        Some(t) => t.log_startup(&api.store_lock()),
+        None => log::info!("turn: off (set RUGEN_CF_TURN_KEY_ID + RUGEN_CF_TURN_TOKEN)"),
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(32)
@@ -424,6 +440,18 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(Err(e)) => log::warn!("official feed: {e}"),
                         Err(e) => log::error!("official feed task: {e}"),
                     }
+                }
+            });
+        }
+        // TURN credentials: settle, revoke, enforce ceilings
+        if api.turn.is_some() {
+            let t = api.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    every.tick().await;
+                    let a = t.clone();
+                    let _ = tokio::task::spawn_blocking(move || a.sweep_turn()).await;
                 }
             });
         }

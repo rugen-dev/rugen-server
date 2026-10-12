@@ -60,6 +60,13 @@ struct Server {
 }
 
 fn server(data: &Path) -> Server {
+    server_with(data, None)
+}
+
+/// `turn`: Cloudflare TURN config (a mock); the UDP relay is still bound
+/// but not advertised then (like a tunnel-only server: WebSocket relay).
+fn server_with(data: &Path, turn: Option<crate::turn::TurnConfig>) -> Server {
+    let tunnel = turn.is_some();
     let relay = Arc::new(Mutex::new(Relay::default()));
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
     let udp = socket.local_addr().unwrap();
@@ -70,8 +77,9 @@ fn server(data: &Path) -> Server {
         Store::open(Some(data)).unwrap(),
         ApiConfig {
             name: "e2e".into(),
-            udp_public: Some(udp.to_string()),
+            udp_public: (!tunnel).then(|| udp.to_string()),
             data: Some(data.to_path_buf()),
+            turn,
             ..Default::default()
         },
         relay,
@@ -365,6 +373,7 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
         frames: 0,
         checksum: None,
         inputs: log.clone(),
+        ..Default::default()
     };
     a.report(id, ida, &ev(&la_log)).unwrap();
     let ack = b.report(id, ida, &ev(&lb_log)).unwrap();
@@ -465,5 +474,244 @@ fn naruto_vs_sasuke_real_characters() {
         play(srv.udp, &data, [(va, defs_a), (vb, defs_b)], 300);
     assert!(fa >= 300 && fb >= 300, "frames {fa} / {fb}");
     assert_eq!(la_log[..280 * 4], lb_log[..280 * 4]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---- TURN through a tunnel-only server
+
+fn rtt_summary(v: &[u32]) -> String {
+    if v.is_empty() {
+        return "no samples".into();
+    }
+    let ms: Vec<f64> = v.iter().map(|&u| u as f64 / 1000.0).collect();
+    let jitter =
+        ms.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (ms.len().max(2) - 1) as f64;
+    let mut s = ms.clone();
+    s.sort_by(f64::total_cmp);
+    let q = |f: f64| s[((s.len() - 1) as f64 * f) as usize];
+    format!(
+        "n={} median {:.3} ms, p95 {:.3} ms, jitter {:.3} ms",
+        s.len(),
+        q(0.5),
+        q(0.95),
+        jitter
+    )
+}
+
+/// Collect round trips to the peer, then keep answering its pings until
+/// both sides are done.
+fn measure(sock: &mut RelaySocket, peer: u8, done: &std::sync::atomic::AtomicUsize) -> Vec<u32> {
+    use std::sync::atomic::Ordering;
+    let got = sock.peer_rtt_samples(peer, 100, Duration::from_secs(15));
+    done.fetch_add(1, Ordering::SeqCst);
+    let t = Instant::now();
+    while done.load(Ordering::SeqCst) % 2 != 0 && t.elapsed() < Duration::from_secs(20) {
+        let _ = sock.peer_rtt_samples(peer, 1, Duration::from_millis(5));
+    }
+    got
+}
+
+struct TurnSide {
+    frames: u32,
+    log: Vec<u8>,
+    checks: Vec<(u32, u64)>,
+    turn: Option<rugen_net::turn::TurnStats>,
+    ws: Vec<u32>,
+    turn_rtts: Vec<u32>,
+    transport: &'static str,
+}
+
+/// Tunnel-only server (no UDP relay advertised) with Cloudflare TURN
+/// switched on against a mock API that hands out a local coturn: tickets
+/// list `turn` first, the clients signal over the `/relay` WebSocket, play
+/// a rollback match over TURN, report RLE inputs + checksums, and the
+/// server revokes both credentials. Prints WebSocket relay vs TURN round
+/// trips. Needs `RUGEN_TEST_TURN` (see rugen-net's tests/turn_relay.rs).
+#[test]
+fn turn_match_through_a_tunnel_only_server() {
+    let (Some(reference), Ok(turn_host)) = (reference(), std::env::var("RUGEN_TEST_TURN")) else {
+        eprintln!("RUGEN_TEST_TURN or the reference tree missing; skipping");
+        return;
+    };
+    let user = std::env::var("RUGEN_TEST_TURN_USER").unwrap_or_else(|_| "u".into());
+    let pass = std::env::var("RUGEN_TEST_TURN_PASS").unwrap_or_else(|_| "p".into());
+    let cf = crate::turn::tests::mock_cf_with(
+        0,
+        Some((vec![format!("turn:{turn_host}?transport=udp")], user, pass)),
+    );
+    let tmp = crate::testkit::tmp("e2e-turn");
+    let srv = server_with(
+        &tmp.join("server"),
+        Some(crate::turn::tests::config(&cf.url, &[])),
+    );
+    let lib_a = machine(&tmp.join("a"), &reference);
+    copy_dir(&reference.join("chars/kfm"), &tmp.join("a/chars/kfm"));
+    copy_dir(&reference.join("stages"), &tmp.join("a/stages/stage0"));
+    std::fs::remove_file(tmp.join("a/stages/stage0/kfm.def")).unwrap();
+    std::fs::remove_file(tmp.join("a/stages/stage0/stage0-720.def")).unwrap();
+    let lib_b = machine(&tmp.join("b"), &reference);
+    copy_dir(&reference.join("chars/kfm"), &tmp.join("b/chars/kfm"));
+
+    let mut a = OnlineClient::new(&srv.url, None);
+    let mut b = OnlineClient::new(&srv.url, None);
+    let ida = a.register().unwrap().id;
+    b.register().unwrap();
+    let room = a
+        .create_room("", &rugen_net::online::RoomOptions::default())
+        .unwrap();
+    let id = b
+        .join_room(&room.code, "", "", false)
+        .unwrap()
+        .matchup
+        .unwrap()
+        .id;
+    let kfm = decl(&lib_a, "kfm", false);
+    let stage = decl(&lib_a, "stage0", true);
+    a.pick(id, Some(&kfm), Some(&stage)).unwrap();
+    b.pick(id, Some(&decl(&lib_b, "kfm", false)), None).unwrap();
+    a.accept(id, false).unwrap();
+    b.accept(id, false).unwrap();
+    let (ca, cb) = (a.clone(), b.clone());
+    let (la, lb) = (lib_a.clone(), lib_b.clone());
+    let (k2, s2) = (kfm.clone(), stage.clone());
+    let ha = std::thread::spawn(move || sync(&ca, &la, id, &[&k2, &s2]));
+    let hb = std::thread::spawn(move || sync(&cb, &lb, id, &[]));
+    let (va, defs_a, _) = ha.join().unwrap();
+    let (vb, defs_b, _) = hb.join().unwrap();
+    for v in [&va, &vb] {
+        let t = v.ticket.as_ref().unwrap();
+        let kinds: Vec<&str> = t.transports.iter().map(|t| t.kind.as_str()).collect();
+        assert_eq!(kinds, ["turn", "ws"], "TURN first, no UDP on a tunnel");
+        assert!(t.udp.is_none());
+    }
+    assert_ne!(
+        va.ticket.as_ref().unwrap().turn().unwrap().expires,
+        0,
+        "credentials expire"
+    );
+
+    let data = tmp.join("a/data");
+    let frames = 600u32;
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sides: Vec<_> = [(va, defs_a), (vb, defs_b)]
+        .into_iter()
+        .map(|(view, defs)| {
+            let (data, url, done) = (data.clone(), srv.url.clone(), done.clone());
+            std::thread::spawn(move || {
+                let spec = rugen_sim::headless::MatchSpec {
+                    p1: &defs[0],
+                    p2: &defs[1],
+                    stage: Some(&defs[2]),
+                    data_dir: &data,
+                    motif: &data,
+                    zoom: (0.6, 1.25),
+                    movement: Default::default(),
+                    round_time: None,
+                    ai: [0, 0],
+                };
+                let mut w = rugen_sim::headless::build_world(&spec).unwrap();
+                let ticket = view.ticket.unwrap();
+                let slot = ticket.slot as usize;
+                let peer = 1 - ticket.slot;
+                let base = rugen_net::online::base_url(&url);
+                // 1. the WebSocket relay alone (TURN stripped) for reference
+                let mut plain = ticket.clone();
+                plain.transports.retain(|t| t.kind != "turn");
+                let mut s0 =
+                    RelaySocket::connect(&plain, &base, Duration::ZERO, &mut |_| {}).unwrap();
+                assert_eq!(s0.transport_name(), "WebSocket");
+                s0.wait_for(0b11, Duration::from_secs(10), &mut |_| {})
+                    .unwrap();
+                let ws = measure(&mut s0, peer, &done);
+                drop(s0);
+                // 2. the real ticket: signalling over the WebSocket, match over TURN
+                let mut s1 =
+                    RelaySocket::connect(&ticket, &base, Duration::ZERO, &mut |_| {}).unwrap();
+                s1.wait_for(0b11, Duration::from_secs(10), &mut |_| {})
+                    .unwrap();
+                assert!(s1.settle_turn(Duration::from_secs(5)), "TURN path");
+                let transport = s1.transport_name();
+                let turn_rtts = measure(&mut s1, peer, &done);
+                let meter = s1.turn_meter();
+                let mut net =
+                    Netplay::relay(s1, slot, ticket.spectators, &Options::default()).unwrap();
+                let mut seed: u32 = 0x5EED ^ slot as u32;
+                let mut held = Buttons::default();
+                let tick = Duration::from_micros(16_667);
+                let mut next = Instant::now();
+                let start = Instant::now();
+                while w.frame < frames + 40 && start.elapsed() < Duration::from_secs(90) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    if seed % 8 == 0 {
+                        held = Buttons::from_bits(((seed >> 8) & 0x7ff) as u16);
+                    }
+                    net.poll();
+                    net.advance(&mut w, [held, held]).expect("no desync");
+                    next += tick;
+                    if let Some(d) = next.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(d);
+                    }
+                }
+                let end = Instant::now() + Duration::from_millis(600);
+                while Instant::now() < end {
+                    net.poll();
+                    let _ = net.advance(&mut w, [Buttons::default(); 2]);
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                TurnSide {
+                    frames: w.frame,
+                    log: net.input_log_bytes(),
+                    checks: net.checksum_log().to_vec(),
+                    turn: meter.map(|m| *m.lock().unwrap()),
+                    ws,
+                    turn_rtts,
+                    transport,
+                }
+            })
+        })
+        .collect();
+    let mut sides = sides.into_iter().map(|h| h.join().unwrap());
+    let (sa, sb) = (sides.next().unwrap(), sides.next().unwrap());
+    assert!(sa.frames >= frames && sb.frames >= frames);
+    assert_eq!(sa.transport, "TURN/UDP");
+    let n = (frames as usize - 20) * 4;
+    assert_eq!(sa.log[..n], sb.log[..n], "input streams diverged");
+    assert!(sa.checks.len() >= 9, "periodic checksums recorded");
+    eprintln!("WebSocket relay: {}", rtt_summary(&sa.ws));
+    eprintln!("TURN (coturn):   {}", rtt_summary(&sa.turn_rtts));
+    let st = sa.turn.unwrap();
+    eprintln!(
+        "TURN bytes A: rx {} tx {} ({} / {} datagrams)",
+        st.rx_wire, st.tx_wire, st.rx_packets, st.tx_packets
+    );
+
+    // reports: RLE inputs + checksums + TURN bytes; agreement settles them
+    let ev = |s: &TurnSide| rugen_net::online::Evidence {
+        frames: 0,
+        checksum: None,
+        inputs: s.log.clone(),
+        checksums: s.checks.clone(),
+        compact: true,
+        turn_bytes: s.turn.map(|t| (t.rx_wire, t.tx_wire)),
+    };
+    a.report(id, ida, &ev(&sa)).unwrap();
+    let ack = b.report(id, ida, &ev(&sb)).unwrap();
+    assert!(!ack.disputed);
+    let t = Instant::now();
+    while cf.revoked.lock().unwrap().len() < 2 && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        cf.revoked.lock().unwrap().len(),
+        2,
+        "both credentials revoked"
+    );
+    let health = a.info().unwrap();
+    assert_eq!(health.name, "e2e");
+    let st = srv.api.turn.as_ref().unwrap().status(&srv.api.store_lock());
+    assert_eq!(st["matches"], 1);
+    eprintln!("turn status: {st}");
     let _ = std::fs::remove_dir_all(&tmp);
 }

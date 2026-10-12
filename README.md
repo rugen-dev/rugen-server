@@ -9,6 +9,9 @@ SQLite inside):
 - quick match and ranked (Elo K=32, 90-day seasons, leaderboard)
 - the **match relay**: every datagram goes player → server → player over UDP
   (WebSocket fallback), so players never learn each other's IP address
+- optional **Cloudflare Realtime TURN**: real UDP for matches even behind a
+  tunnel-only deployment, under a hard monthly byte budget that keeps it
+  inside Cloudflare's free tier (see `deploy/README.md`, section 2b)
 - **bring your own character**: instant FAIR / UNBALANCED / BLOCKED
   matchup verdicts, verified temporary packages so both players fight with
   byte-identical files

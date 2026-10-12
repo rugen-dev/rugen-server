@@ -243,6 +243,8 @@ pub struct ReportData {
     pub checksum: Option<u64>,
     /// Confirmed inputs, 4 bytes per frame.
     pub inputs: Vec<u8>,
+    /// `(frame, world checksum)` every 60 frames (clients with TURN support).
+    pub checksums: Vec<(u32, u64)>,
 }
 
 /// Outcome of [`Store::report`].
@@ -272,11 +274,41 @@ pub fn reports_agree(a: &ReportData, b: &ReportData) -> bool {
     {
         return false;
     }
-    true
+    // periodic checksums on the frames both confirmed
+    let below = a
+        .frames
+        .min(b.frames)
+        .saturating_sub(UNCONFIRMED_TAIL as u32);
+    rugen_proto::evidence::checksums_agree(&a.checksums, &b.checksums, below)
 }
 
 pub struct Store {
     conn: Connection,
+}
+
+/// One month of TURN accounting (bytes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnMonth {
+    /// Conservative estimate: reservations of issued credentials, settled
+    /// down to the reported usage (times a safety factor) when they end.
+    pub reserved: u64,
+    /// What clients reported moving through TURN.
+    pub reported: u64,
+    /// Cloudflare's own analytics (when configured).
+    pub cloudflare: u64,
+    pub credentials: u64,
+}
+
+impl TurnMonth {
+    /// The number the budget is checked against.
+    pub fn used(&self) -> u64 {
+        self.reserved.max(self.cloudflare).max(self.reported)
+    }
+}
+
+fn checksums_col(b: Option<Vec<u8>>) -> Vec<(u32, u64)> {
+    b.and_then(|b| rugen_proto::evidence::decode_checksums(&b))
+        .unwrap_or_default()
 }
 
 impl Store {
@@ -298,6 +330,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut s = Self { conn };
         let fresh = s.migrate()?;
+        s.ensure_turn_schema()?;
         if s.meta("season")?.is_none() {
             s.set_meta("season", 1)?;
             s.set_meta("season_start", now() as i64)?;
@@ -325,6 +358,89 @@ impl Store {
         }
         tx.commit()?;
         Ok(version == 0)
+    }
+
+    /// TURN budget table and the periodic-checksum column of reports.
+    /// Idempotent and outside [`MIGRATIONS`] on purpose (no schema version
+    /// clash with other branches; fold into a migration when convenient).
+    fn ensure_turn_schema(&self) -> DbResult<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_usage (
+                 month TEXT PRIMARY KEY,
+                 reserved INTEGER NOT NULL DEFAULT 0,
+                 reported INTEGER NOT NULL DEFAULT 0,
+                 cloudflare INTEGER NOT NULL DEFAULT 0,
+                 credentials INTEGER NOT NULL DEFAULT 0
+             );",
+        )?;
+        let has = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('reports') WHERE name = 'checksums'")?
+            .exists([])?;
+        if !has {
+            self.conn
+                .execute_batch("ALTER TABLE reports ADD COLUMN checksums BLOB;")?;
+        }
+        Ok(())
+    }
+
+    /// P1 and P2 of a match.
+    pub fn match_players(&self, match_id: u64) -> DbResult<Option<[u64; 2]>> {
+        self.conn
+            .query_row(
+                "SELECT p1, p2 FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| Ok([r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64]),
+            )
+            .optional()
+    }
+
+    /// TURN usage of a month (`YYYY-MM`, UTC).
+    pub fn turn_usage(&self, month: &str) -> DbResult<TurnMonth> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT reserved, reported, cloudflare, credentials FROM turn_usage WHERE month = ?1",
+                [month],
+                |r| {
+                    Ok(TurnMonth {
+                        reserved: r.get::<_, i64>(0)?.max(0) as u64,
+                        reported: r.get::<_, i64>(1)?.max(0) as u64,
+                        cloudflare: r.get::<_, i64>(2)?.max(0) as u64,
+                        credentials: r.get::<_, i64>(3)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Add to a month's TURN accounting (`reserved` may be negative: a
+    /// settled credential gives back part of its reservation).
+    pub fn turn_add(
+        &self,
+        month: &str,
+        reserved: i64,
+        reported: u64,
+        credentials: u64,
+    ) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO turn_usage (month, reserved, reported, credentials) VALUES (?1, MAX(?2, 0), ?3, ?4)
+             ON CONFLICT(month) DO UPDATE SET reserved = MAX(reserved + ?2, 0),
+                 reported = reported + ?3, credentials = credentials + ?4",
+            params![month, reserved, reported as i64, credentials as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Usage Cloudflare's analytics report for a month (bytes, both ways).
+    pub fn turn_set_cloudflare(&self, month: &str, bytes: u64) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO turn_usage (month, cloudflare) VALUES (?1, ?2)
+             ON CONFLICT(month) DO UPDATE SET cloudflare = MAX(cloudflare, ?2)",
+            params![month, bytes as i64],
+        )?;
+        Ok(())
     }
 
     pub fn schema_version(&self) -> DbResult<usize> {
@@ -662,15 +778,17 @@ impl Store {
             });
         }
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs, checksums)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 match_id as i64,
                 reporter as i64,
                 data.winner as i64,
                 data.frames,
                 data.checksum.map(|c| c as i64),
-                (!data.inputs.is_empty()).then_some(&data.inputs)
+                (!data.inputs.is_empty()).then_some(&data.inputs),
+                (!data.checksums.is_empty())
+                    .then(|| rugen_proto::evidence::encode_checksums(&data.checksums))
             ],
         )?;
         if inserted == 0 {
@@ -682,7 +800,7 @@ impl Store {
         }
         let reports: Vec<ReportData> = {
             let mut st = tx.prepare(
-                "SELECT winner, frames, checksum, inputs FROM reports WHERE match_id = ?1 ORDER BY reporter",
+                "SELECT winner, frames, checksum, inputs, checksums FROM reports WHERE match_id = ?1 ORDER BY reporter",
             )?;
             st.query_map([match_id as i64], |r| {
                 Ok(ReportData {
@@ -690,6 +808,7 @@ impl Store {
                     frames: r.get(1)?,
                     checksum: r.get::<_, Option<i64>>(2)?.map(|c| c as u64),
                     inputs: r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+                    checksums: checksums_col(r.get(4)?),
                 })
             })?
             .collect::<DbResult<_>>()?
@@ -930,7 +1049,7 @@ impl Store {
             return Ok(None);
         };
         let mut st = self.conn.prepare(
-            "SELECT reporter, winner, frames, checksum, inputs FROM reports WHERE match_id = ?1 ORDER BY reporter",
+            "SELECT reporter, winner, frames, checksum, inputs, checksums FROM reports WHERE match_id = ?1 ORDER BY reporter",
         )?;
         let reports = st
             .query_map([match_id as i64], |r| {
@@ -941,6 +1060,7 @@ impl Store {
                         frames: r.get(2)?,
                         checksum: r.get::<_, Option<i64>>(3)?.map(|c| c as u64),
                         inputs: r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                        checksums: checksums_col(r.get(5)?),
                     },
                 ))
             })?
@@ -1365,6 +1485,41 @@ mod tests {
     }
 
     #[test]
+    fn periodic_checksums_catch_a_forged_match() {
+        let mut s = Store::open(None).unwrap();
+        let a = s.register().unwrap().id;
+        let b = s.register().unwrap().id;
+        let honest = ReportData {
+            winner: a,
+            frames: 600,
+            checksum: None,
+            inputs: inputs(600, None),
+            checksums: (1..=10).map(|i| (i * 60, i as u64)).collect(),
+        };
+        // agreeing logs (the other side a few unconfirmed frames short)
+        let m = s.new_match([a, b], true, "{}").unwrap();
+        s.report(a, m, &honest).unwrap();
+        let short = ReportData {
+            frames: 590,
+            checksums: honest.checksums[..9].to_vec(),
+            ..honest.clone()
+        };
+        assert!(!s.report(b, m, &short).unwrap().disputed);
+        // same inputs, but the world diverged at frame 300: disputed
+        let m2 = s.new_match([a, b], true, "{}").unwrap();
+        s.report(a, m2, &honest).unwrap();
+        let mut forged = honest.clone();
+        forged.checksums[4].1 ^= 1;
+        assert!(s.report(b, m2, &forged).unwrap().disputed);
+        // a difference only in the unconfirmed tail does not count
+        let m3 = s.new_match([a, b], true, "{}").unwrap();
+        s.report(a, m3, &honest).unwrap();
+        let mut tail = honest.clone();
+        tail.checksums[9].1 ^= 1; // frame 600 of 600
+        assert!(!s.report(b, m3, &tail).unwrap().disputed);
+    }
+
+    #[test]
     fn input_streams_verify_results_and_become_replays() {
         let mut s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
@@ -1376,12 +1531,14 @@ mod tests {
             frames: 600,
             checksum: Some(42),
             inputs: inputs(600, None),
+            checksums: vec![(60, 1), (120, 2)],
         };
         let rb = ReportData {
             winner: a,
             frames: 590,
             checksum: Some(7),
             inputs: inputs(590, None),
+            checksums: vec![(60, 1), (120, 2)],
         };
         s.report(a, m, &ra).unwrap();
         let out = s.report(b, m, &rb).unwrap();

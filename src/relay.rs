@@ -34,6 +34,8 @@ struct Slot {
     token: [u8; TOKEN_LEN],
     route: Option<Route>,
     rate: (Instant, u32),
+    /// TURN bytes (received, sent) this slot reported in its HELLOs.
+    turn: (u64, u64),
 }
 
 struct Session {
@@ -96,6 +98,7 @@ impl Relay {
                 token: random_token(),
                 route: None,
                 rate: (now, 0),
+                turn: (0, 0),
             })
             .collect();
         let tokens = slots.iter().map(|s| s.token).collect();
@@ -112,6 +115,13 @@ impl Relay {
 
     pub fn close(&mut self, id: u32) {
         self.sessions.remove(&id);
+    }
+
+    /// TURN bytes (received, sent) slot `slot` of session `id` reported;
+    /// `None` once the session is gone.
+    pub fn turn_bytes(&self, id: u32, slot: u8) -> Option<(u64, u64)> {
+        let s = self.sessions.get(&id)?;
+        Some(s.slots.get(slot as usize).map_or((0, 0), |s| s.turn))
     }
 
     pub fn session_count(&self) -> usize {
@@ -201,6 +211,16 @@ impl Relay {
             slot.rate.1 += 1;
             if slot.rate.1 > SLOT_PPS {
                 return None;
+            }
+            // TURN clients put their byte counters in the hello
+            if h.kind == wire::HELLO
+                && let (Ok(rx), Ok(tx)) = (
+                    <[u8; 8]>::try_from(payload.get(..8).unwrap_or_default()),
+                    <[u8; 8]>::try_from(payload.get(8..16).unwrap_or_default()),
+                )
+            {
+                slot.turn.0 = slot.turn.0.max(u64::from_be_bytes(rx));
+                slot.turn.1 = slot.turn.1.max(u64::from_be_bytes(tx));
             }
             let moved = slot.route != Some(from);
             slot.route = if h.kind == wire::BYE {
