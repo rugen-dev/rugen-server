@@ -21,6 +21,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::get;
+use axum::serve::ListenerExt as _;
 use rugen_proto::{ClientMsg, ServerMsg};
 
 use crate::api::{Api, Request, Response};
@@ -133,6 +134,12 @@ pub async fn serve(
     api: Arc<Api>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    // relayed match frames are tiny and latency bound: no Nagle delay
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            log::debug!("set_nodelay: {e}");
+        }
+    });
     axum::serve(
         listener,
         router(api).into_make_service_with_connect_info::<SocketAddr>(),
@@ -542,6 +549,87 @@ mod tests {
         seen += &http(addr, "GET", "/", "").await;
         for ip in ["203.0.113.77", "198.51.100.9", "127.0.0.1"] {
             assert!(!seen.contains(ip), "payload leaked {ip}: {seen}");
+        }
+    }
+
+    /// Loopback round trip of relayed WebSocket frames, server socket with
+    /// and without TCP_NODELAY (two frames per direction per round at 60 Hz,
+    /// like an input + an ack). `cargo test ws_relay_latency -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "benchmark"]
+    async fn ws_relay_latency() {
+        for nodelay in [false, true] {
+            let api = Api::new(
+                Store::open(None).unwrap(),
+                ApiConfig::default(),
+                Arc::new(Mutex::new(Relay::default())),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            if nodelay {
+                let l = listener.tap_io(|t| {
+                    let _ = t.set_nodelay(true);
+                });
+                tokio::spawn(async move { axum::serve(l, app).await });
+            } else {
+                tokio::spawn(async move { axum::serve(listener, app).await });
+            }
+            let (session, tokens) = api.relay.lock().unwrap().create(&[1, 2]).unwrap();
+            let connect = || async {
+                let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay"))
+                    .await
+                    .unwrap();
+                if let tokio_tungstenite::MaybeTlsStream::Plain(t) = ws.get_ref() {
+                    t.set_nodelay(true).unwrap();
+                }
+                ws
+            };
+            let (mut wa, mut wb) = (connect().await, connect().await);
+            let frame = |from: u8, kind: u8, p: &[u8]| {
+                WsMsg::Binary(
+                    wire::encode_client(
+                        Header {
+                            kind,
+                            from,
+                            to: 1 - from,
+                            session,
+                        },
+                        &tokens[from as usize],
+                        p,
+                    )
+                    .into(),
+                )
+            };
+            wa.send(frame(0, wire::HELLO, &[])).await.unwrap();
+            next_bin(&mut wa, wire::ACK).await;
+            wb.send(frame(1, wire::HELLO, &[])).await.unwrap();
+            next_bin(&mut wb, wire::ACK).await;
+            let mut rtts = Vec::new();
+            // paced like a match (~60 rounds/s, under the relay's per-slot rate cap)
+            let mut tick = tokio::time::interval(Duration::from_millis(16));
+            for i in 0..200u32 {
+                tick.tick().await;
+                let t = Instant::now();
+                let p = i.to_be_bytes();
+                wa.send(frame(0, wire::DATA, &p)).await.unwrap();
+                wa.send(frame(0, wire::DATA, &p)).await.unwrap();
+                next_bin(&mut wb, wire::DATA).await;
+                next_bin(&mut wb, wire::DATA).await;
+                wb.send(frame(1, wire::DATA, &p)).await.unwrap();
+                wb.send(frame(1, wire::DATA, &p)).await.unwrap();
+                next_bin(&mut wa, wire::DATA).await;
+                next_bin(&mut wa, wire::DATA).await;
+                rtts.push(t.elapsed().as_micros() as u64);
+            }
+            rtts.sort_unstable();
+            println!(
+                "server nodelay={nodelay}: median {} us, p90 {} us, p99 {} us, max {} us",
+                rtts[rtts.len() / 2],
+                rtts[rtts.len() * 9 / 10],
+                rtts[rtts.len() * 99 / 100],
+                rtts[rtts.len() - 1]
+            );
         }
     }
 

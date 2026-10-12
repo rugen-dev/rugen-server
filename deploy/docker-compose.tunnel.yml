@@ -6,6 +6,11 @@
 #
 # Tunnel public hostname: play.example.com → HTTP → http://rugen-server:8080
 # (cloudflared must share a network with this service: dokploy-network here).
+#
+# This is also the OFFICIAL server profile (play.rugen.dev): set the secret
+# RUGEN_SIGNING_KEY (from `rugen-server --gen-key`) and RUGEN_ADMIN_TOKEN in
+# Dokploy's Environment tab; without the official key the server runs as a
+# community server. See deploy/README.md "Official server".
 
 name: rugen
 
@@ -23,6 +28,8 @@ services:
     environment:
       RUGEN_BIND: 0.0.0.0:8080
       RUGEN_UDP_BIND: "off"
+      # no UDP relay advertised either: clients go straight to /relay (WebSocket)
+      RUGEN_UDP_PUBLIC: "off"
       RUGEN_DATA: /data
       RUGEN_PUBLIC_URL: ${RUGEN_PUBLIC_URL:-}
       RUGEN_NAME: ${RUGEN_NAME:-rugen server}
@@ -32,6 +39,10 @@ services:
       RUGEN_PKG_MAX_TOTAL: ${RUGEN_PKG_MAX_TOTAL:-2GB}
       RUGEN_PKG_RATE_ACCOUNT: ${RUGEN_PKG_RATE_ACCOUNT:-500MB}
       RUGEN_PKG_RATE_IP: ${RUGEN_PKG_RATE_IP:-1GB}
+      # official server: the private signing key (secret) and the admin API;
+      # empty = generated community key in /data/signing.key, admin API off
+      RUGEN_SIGNING_KEY: ${RUGEN_SIGNING_KEY:-}
+      RUGEN_ADMIN_TOKEN: ${RUGEN_ADMIN_TOKEN:-}
     volumes:
       - rugen-data:/data
     # no "ports:": only the tunnel reaches the server

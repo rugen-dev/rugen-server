@@ -14,8 +14,12 @@ SQLite inside):
   byte-identical files
 - ranked result verification, stored replays, optional re-simulation of
   disputed matches (`--features resim`)
+- **official vs community servers**: the official server (`play.rugen.dev`,
+  holder of the official Ed25519 key) is the global ranking and publishes a
+  signed truth feed (cheat blocklist + character ratings) that every
+  community server pulls and enforces; verdicts and results are signed
 
-Docs: <https://rugen-dev.github.io/rugen-docs/> ·
+Docs: <https://rugen.dev> ·
 deployment guide: [`deploy/README.md`](deploy/README.md)
 
 ## Run

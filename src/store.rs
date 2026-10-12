@@ -150,6 +150,18 @@ const MIGRATIONS: &[&str] = &[
      );
      ALTER TABLE matches ADD COLUMN desync INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE matches ADD COLUMN resim TEXT;",
+    // v4: official server: fingerprint blocklist (operator + automatic
+    // entries; `allowed` = cleared by the operator, never re-added
+    // automatically) and the fingerprint a flagged lie was about
+    "CREATE TABLE blocklist (
+         fingerprint TEXT PRIMARY KEY,
+         reason TEXT NOT NULL,
+         source TEXT NOT NULL,
+         allowed INTEGER NOT NULL DEFAULT 0,
+         created INTEGER NOT NULL
+     );
+     ALTER TABLE flags ADD COLUMN fingerprint TEXT;
+     CREATE INDEX flags_fingerprint ON flags(fingerprint);",
 ];
 
 /// Rating every character fingerprint starts from.
@@ -1027,19 +1039,174 @@ impl Store {
             .optional()
     }
 
-    /// Record an anti-cheat finding against an account.
-    pub fn flag(&mut self, account: u64, match_id: Option<u64>, reason: &str) -> DbResult<()> {
+    /// Record an anti-cheat finding against an account; `fingerprint` =
+    /// the content a false profile was declared for (feeds auto-blocking).
+    pub fn flag(
+        &mut self,
+        account: u64,
+        match_id: Option<u64>,
+        reason: &str,
+        fingerprint: Option<&str>,
+    ) -> DbResult<()> {
         log::warn!("flag: account {account}: {reason}");
         self.conn.execute(
-            "INSERT INTO flags (account, match_id, reason, created) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO flags (account, match_id, reason, created, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 account as i64,
                 match_id.map(|m| m as i64),
                 reason,
-                now() as i64
+                now() as i64,
+                fingerprint
             ],
         )?;
         Ok(())
+    }
+
+    /// Distinct accounts flagged for a false profile of `fp`.
+    pub fn liars_for(&self, fp: &str) -> DbResult<u32> {
+        self.conn.query_row(
+            "SELECT COUNT(DISTINCT account) FROM flags WHERE fingerprint = ?1",
+            [fp],
+            |r| r.get(0),
+        )
+    }
+
+    /// Matches with a reported desync that `fp` was part of.
+    pub fn desyncs_for(&self, fp: &str) -> DbResult<u32> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM matches WHERE desync = 1 AND instr(setup, ?1) > 0",
+            [fp],
+            |r| r.get(0),
+        )
+    }
+
+    // ---- blocklist (published in the truth feed)
+
+    /// Changes whenever the blocklist does (feed `sequence`).
+    pub fn truth_seq(&self) -> DbResult<u64> {
+        Ok(self.meta("truth_seq")?.unwrap_or(0) as u64)
+    }
+
+    /// Next sequence: at least the current Unix time, so that a database
+    /// restored from an older backup still publishes newer sequences than
+    /// anything clients already hold once the blocklist changes again.
+    fn bump_truth_seq(&self) -> DbResult<()> {
+        let n = (self.truth_seq()? + 1).max(now());
+        self.set_meta("truth_seq", n as i64)
+    }
+
+    /// Block a fingerprint (operator): replaces any entry, clears `allowed`.
+    pub fn block(&mut self, fp: &str, reason: &str, source: &str) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(fingerprint) DO UPDATE SET reason = ?2, source = ?3, allowed = 0, created = ?4",
+            params![fp, reason, source, now() as i64],
+        )?;
+        self.bump_truth_seq()
+    }
+
+    /// Automatic block: only when the fingerprint has no entry at all (an
+    /// operator-cleared one stays cleared). True when it was added.
+    pub fn auto_block(&mut self, fp: &str, reason: &str) -> DbResult<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, 'auto', 0, ?3)",
+            params![fp, reason, now() as i64],
+        )?;
+        if n > 0 {
+            log::warn!(
+                "blocklist: {} auto-blocked: {reason}",
+                rugen_fair::short(fp)
+            );
+            self.bump_truth_seq()?;
+        }
+        Ok(n > 0)
+    }
+
+    /// Clear a fingerprint (operator). The row stays as `allowed` so that
+    /// automatic rules never block it again. True when it was blocked.
+    pub fn unblock(&mut self, fp: &str) -> DbResult<bool> {
+        let was = self.blocked(fp)?.is_some();
+        self.conn.execute(
+            "INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, 'cleared', 'admin', 1, ?2)
+             ON CONFLICT(fingerprint) DO UPDATE SET allowed = 1",
+            params![fp, now() as i64],
+        )?;
+        self.bump_truth_seq()?;
+        Ok(was)
+    }
+
+    pub fn blocked(&self, fp: &str) -> DbResult<Option<rugen_proto::BlockEntry>> {
+        self.conn
+            .query_row(
+                "SELECT fingerprint, reason, created, source FROM blocklist WHERE fingerprint = ?1 AND allowed = 0",
+                [fp],
+                Self::block_row,
+            )
+            .optional()
+    }
+
+    /// Every blocked fingerprint, oldest first.
+    pub fn blocklist(&self) -> DbResult<Vec<rugen_proto::BlockEntry>> {
+        let mut st = self.conn.prepare(
+            "SELECT fingerprint, reason, created, source FROM blocklist WHERE allowed = 0 ORDER BY created, fingerprint",
+        )?;
+        st.query_map([], Self::block_row)?.collect()
+    }
+
+    fn block_row(r: &Row<'_>) -> DbResult<rugen_proto::BlockEntry> {
+        Ok(rugen_proto::BlockEntry {
+            fingerprint: r.get(0)?,
+            reason: r.get(1)?,
+            since: r.get::<_, i64>(2)? as u64,
+            source: r.get(3)?,
+        })
+    }
+
+    /// Community ratings for the feed, most played first.
+    pub fn feed_ratings(&self, limit: usize) -> DbResult<Vec<rugen_proto::FeedRating>> {
+        let mut st = self.conn.prepare(
+            "SELECT fingerprint, rating, games, wins FROM char_ratings WHERE games > 0
+             ORDER BY games DESC, fingerprint LIMIT ?1",
+        )?;
+        st.query_map([limit as i64], |r| {
+            Ok(rugen_proto::FeedRating {
+                fingerprint: r.get(0)?,
+                rating: r.get(1)?,
+                games: r.get(2)?,
+                wins: r.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// A match as seen by `account`: (ranked, players, winner, delta of the
+    /// account, disputed). None when it is not the account's match.
+    #[allow(clippy::type_complexity)]
+    pub fn match_result(
+        &self,
+        match_id: u64,
+        account: u64,
+    ) -> DbResult<Option<(bool, [u64; 2], Option<u64>, i32, bool)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT ranked, p1, p2, winner, delta1, delta2, disputed FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, bool>(0)?,
+                        [r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64],
+                        r.get::<_, Option<i64>>(3)?.map(|w| w as u64),
+                        [r.get::<_, i32>(4)?, r.get::<_, i32>(5)?],
+                        r.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(ranked, players, winner, deltas, disputed)| {
+            let side = players.iter().position(|&p| p == account)?;
+            Some((ranked, players, winner, deltas[side], disputed))
+        }))
     }
 
     #[cfg(test)]
@@ -1331,6 +1498,37 @@ mod tests {
         assert_eq!(s.account_count().unwrap(), 2);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocklist_admin_auto_and_sticky_clearing() {
+        let mut s = Store::open(None).unwrap();
+        let fp = "a".repeat(64);
+        assert_eq!(s.truth_seq().unwrap(), 0);
+        assert!(s.auto_block(&fp, "auto: regen").unwrap());
+        assert!(!s.auto_block(&fp, "auto: again").unwrap(), "only once");
+        assert_eq!(s.blocked(&fp).unwrap().unwrap().source, "auto");
+        let seq = s.truth_seq().unwrap();
+        assert!(s.unblock(&fp).unwrap());
+        assert!(s.blocked(&fp).unwrap().is_none());
+        assert!(s.truth_seq().unwrap() > seq);
+        // cleared by the operator: automatic rules never block it again
+        assert!(!s.auto_block(&fp, "auto: regen").unwrap());
+        assert!(s.blocklist().unwrap().is_empty());
+        // the operator can still block it
+        s.block(&fp, "infinite loop", "admin").unwrap();
+        let b = s.blocklist().unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            (b[0].reason.as_str(), b[0].source.as_str()),
+            ("infinite loop", "admin")
+        );
+        // liars are counted per distinct account
+        for acc in [1, 1, 2] {
+            s.flag(acc, None, "lie", Some(&fp)).unwrap();
+        }
+        s.flag(3, None, "other", None).unwrap();
+        assert_eq!(s.liars_for(&fp).unwrap(), 2);
     }
 
     #[test]

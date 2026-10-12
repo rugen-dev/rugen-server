@@ -11,6 +11,10 @@ gives rugen players a place to meet:
 - the **match relay**: every match datagram goes player → server → player,
   so players never learn each other's IP address
 - ranked result verification and stored ranked replays
+- **official or community**: the server holding the official signing key is
+  *the* official server (global ranking, global cheat blocklist); every
+  other server is a community server that pulls and enforces the official
+  blocklist (see [Official server](#official-server))
 
 `deploy/docker-compose.yml` runs only `rugen-server` and publishes its two
 ports. HTTPS in front is your choice: Dokploy's domains (Traefik), any
@@ -23,8 +27,10 @@ reverse proxy, or the optional Cloudflare Tunnel add-on in
 | 7001/udp  | match relay, fast path                            | open it in the firewall |
 
 Without 7001/udp reachable, clients fall back to the WebSocket relay on
-8080 after a 1.5 s UDP probe (works everywhere, a bit slower). Host ports
-can be changed with `RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
+8080 after a 1.5 s UDP probe (works everywhere, a bit slower). With
+`RUGEN_UDP_PUBLIC=off` the server binds and advertises no UDP relay at all
+and clients use the WebSocket at once. Host ports can be changed with
+`RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
 
 ## 1. Dokploy
 
@@ -46,12 +52,41 @@ can be changed with `RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
 
 If a Cloudflare Tunnel (or Zero Trust) is the only way in, use
 `deploy/docker-compose.tunnel.yml` as the compose path instead. It publishes
-no ports, turns the UDP relay off (matches use the WebSocket relay through
-the tunnel), joins `dokploy-network` so a cloudflared container there
-reaches it as `http://rugen-server:8080`, and builds the image on the host
-from this repository, so no registry login is needed. Set the Watch Paths to
+no ports, turns the UDP relay off (`RUGEN_UDP_BIND=off`,
+`RUGEN_UDP_PUBLIC=off`: nothing bound, nothing advertised; matches use the
+WebSocket relay through the tunnel with no UDP probe delay), joins
+`dokploy-network` so a cloudflared container there reaches it as
+`http://rugen-server:8080`, and builds the image on the host from this
+repository, so no registry login is needed. Set the Watch Paths to
 `deploy/**`, `src/**`, `Cargo.toml` and `Cargo.lock` to redeploy on server
-changes.
+changes. This is the profile of the official server below.
+
+### Official server
+
+The official server (`https://play.rugen.dev`, the address baked into the
+game) is **never exposed directly**: no `ports:`, no UDP, no DNS record
+pointing at the VPS. Everything goes through the Cloudflare Tunnel, which
+cannot carry raw UDP from players, so it runs WebSocket-relay only
+(sockets use `TCP_NODELAY`; relayed frames are sent one by one, unbatched).
+
+1. Compose path `deploy/docker-compose.tunnel.yml` (above). It already has
+   no port mappings and sets `RUGEN_UDP_BIND=off` / `RUGEN_UDP_PUBLIC=off`.
+2. The cloudflared add-on is **required** (tunnel container on
+   `dokploy-network`). Public hostname: `play.rugen.dev` → service `HTTP`,
+   URL `http://rugen-server:8080`; WebSockets enabled (Network settings),
+   no caching for this hostname.
+3. Environment tab:
+   - `RUGEN_SIGNING_KEY` = the **seed** from `rugen-server --gen-key`
+     (secret; it is what makes this server official),
+   - `RUGEN_ADMIN_TOKEN` = a long random string (moderation API),
+   - `RUGEN_PUBLIC_URL=https://play.rugen.dev`, `RUGEN_NAME=rugen official`,
+     `RUGEN_MOTD=...`.
+4. Deploy. The log must say `OFFICIAL server: signing key xxxx:xxxx:...`;
+   `https://play.rugen.dev/health` shows `"official":true`, a `key` equal to
+   the public key baked into the game, and `"transports":[{"kind":"ws",...}]`
+   with no UDP entry.
+
+Community hosts are free to keep the UDP fast path (section 2, step 4).
 
 On a host shared with other apps it stays out of the way: at most
 `RUGEN_CPUS` (1.0) CPUs and `RUGEN_MEM` (768m) of memory, a quarter of the
@@ -72,11 +107,12 @@ less often (Trigger Type: manual).
    `deploy/cloudflared/docker-compose.yml`, set `CF_TUNNEL_TOKEN` in its
    Environment tab and deploy it after the server (it joins the server's
    `rugen` network; no ports needed).
-4. For the UDP fast path add a **DNS-only** (grey cloud) record such as
-   `udp.example.com` → the server's public IP and set
+4. Community servers only: for the UDP fast path add a **DNS-only** (grey
+   cloud) record such as `udp.example.com` → the server's public IP and set
    `RUGEN_UDP_PUBLIC=udp.example.com:7001` on the server (a proxied name
    cannot carry UDP). With the tunnel you may also drop the `8080` port
-   mapping from the server compose.
+   mapping from the server compose. (The official server stays
+   tunnel-only, see above.)
 
 The image is pulled from `ghcr.io/rugen-dev/rugen-server:latest`
 (published by `.github/workflows/server-image.yml` on `v*` tags). To build
@@ -85,13 +121,15 @@ on the server instead, uncomment the `build:` block in the compose file
 
 ## 3. Players
 
-In the game: **ONLINE → ADD SERVER** → `https://rugen.example.com`, or in
+The official server is built into the game and always listed first. A
+community server is added with **ONLINE → ADD SERVER** →
+`https://rugen.example.com` (REMOVE SERVER takes it out again), or in
 `rugen.toml`:
 
 ```toml
 [net]
-server = "https://rugen.example.com"     # default server
-servers = ["https://friends.example.org", "203.0.113.5:8080"]   # favourites
+server = "https://rugen.example.com"     # default selection ("" = the official server)
+servers = ["https://rugen.example.com", "203.0.113.5:8080"]   # community servers
 input_delay = "auto"                      # or a fixed number of frames
 good_connections_only = false
 websocket_only = false                    # skip the UDP probe
@@ -174,6 +212,109 @@ LAN / direct-IP matches (`--net ip:port`, HOST / JOIN DIRECT MATCH) still
 work without any server; there the players type each other's address on
 purpose.
 
+## Official server
+
+### Official or community
+
+Every server signs with an Ed25519 key:
+
+1. `RUGEN_SIGNING_KEY`: the 32-byte seed, 64 hex digits (or base64),
+2. else `RUGEN_SIGNING_KEY_FILE`: a file holding it (Docker secrets),
+3. else `<data>/signing.key`, generated on first start (mode 0600).
+
+A server whose public key equals the **official public key** (baked into
+the engine at build time, `RUGEN_OFFICIAL_KEY` overrides it here) is the
+official server; every other server is a community server. Players' games
+only call a server OFFICIAL after it signed a random nonce with that key, so
+a community server can never pass as the official one.
+
+Generate the official key pair once:
+
+```sh
+rugen-server --gen-key
+# private: the official server only (secret env / file, never commit)
+RUGEN_SIGNING_KEY=5f0c...
+# public: bake into game builds and pass to community servers if needed
+RUGEN_OFFICIAL_KEY=9a41...
+```
+
+The seed goes into the official server's secret environment; the public key
+becomes the `RUGEN_OFFICIAL_KEY` repository variable of the engine (release
+builds bake it in, see the engine's BUILDING.md). Until then everything uses
+a development key whose seed is public: fine for testing, worthless for
+trust. A server started with it logs a warning.
+
+### Truth feed
+
+`GET /v1/truth` returns this server's signed feed:
+
+```json
+{"purpose":"truth","key":"<public key hex>","sig":"<signature hex>",
+ "payload":"{\"blocked\":[{\"fingerprint\":\"b960...\",\"reason\":\"...\",\"since\":1791830134,\"source\":\"admin\"}],\"expires_at\":...,\"issued_at\":...,\"ratings\":[{\"fingerprint\":\"...\",\"games\":40,\"rating\":1520,\"wins\":22}],\"sequence\":1791830134,\"server\":\"rugen official\",\"v\":1}"}
+```
+
+- `payload` is the statement as **canonical JSON** (keys sorted by bytes,
+  no whitespace, integers only, serde_json string escaping); the Ed25519
+  signature covers `rugen-signed-v1\n<purpose>\n<payload>`. Verifiers check
+  the signature over the received bytes and that the payload is canonical.
+- `issued_at` / `expires_at`: a feed is valid for 3 days (at most 7 are ever
+  accepted); `sequence` grows with every blocklist change (at least the
+  Unix time of the change) and nobody accepts a lower one than they hold.
+- Only the official server's feed counts. **Community servers** pull it from
+  `RUGEN_OFFICIAL_URL` (default `https://play.rugen.dev`, `off` disables)
+  every `RUGEN_OFFICIAL_PULL` seconds, verify it against the official key,
+  keep it in `<data>/official_truth.json`, mirror it at
+  `GET /v1/truth/official`, and enforce it: a blocked fingerprint makes the
+  matchup **BLOCKED** with the reason `blocked by the official server (...)`.
+  Their own blocklist applies on top (`blocked by this server`). Official
+  community ratings refine verdicts when they rest on more games.
+- Games download the feed from the official server (or a community mirror),
+  cache it, and mark blocked fighters in their roster and matchup cards.
+
+### Signed verdicts and results
+
+Matchup views carry `signed` (a `verdict` statement: match id, ranked,
+fingerprints, verdict, reasons) and settled results carry `signed` (a
+`result` statement: match id, account, players, winner, rating, delta,
+season). `GET /match/{id}/result?key=` returns the signed result to the
+player who reported first. `GET /v1/identity?nonce=<hex>` signs a client's
+challenge. Games show OFFICIAL stamps only for the official key, community
+servers with their key fingerprint, and reject forged signatures.
+
+### Moderation
+
+With `RUGEN_ADMIN_TOKEN` set:
+
+```sh
+curl -X POST https://play.rugen.dev/v1/admin/block \
+  -d '{"token":"...","fingerprint":"<64 hex>","reason":"infinite regen"}'
+curl -X POST https://play.rugen.dev/v1/admin/unblock \
+  -d '{"token":"...","fingerprint":"<64 hex>"}'
+curl 'https://play.rugen.dev/v1/admin/blocklist?token=...'
+```
+
+or on the host, against the same database (also while the server runs):
+
+```sh
+docker exec rugen-server /rugen-server --data /data --block <fp> --reason "infinite regen"
+docker exec rugen-server /rugen-server --data /data --unblock <fp>
+docker exec rugen-server /rugen-server --data /data --blocklist
+```
+
+Live matchups are judged again at once. Automatic entries (`source: auto`):
+
+- the server's own analysis of an uploaded package finds a block-level
+  cheat (`RUGEN_AUTO_BLOCK_ANALYSIS`, on),
+- `RUGEN_AUTO_BLOCK_LIARS` (3) different players were caught declaring a
+  false fairness profile for the same fingerprint,
+- the fingerprint took part in `RUGEN_AUTO_BLOCK_DESYNCS` (10) matches with
+  a reported desync.
+
+Unblocking keeps the fingerprint as *cleared*: automatic rules never block
+it again (the operator still can). Restoring an older database backup
+lowers the feed sequence; the next blocklist change publishes a newer one
+again (it is at least the current Unix time).
+
 ## Environment variables
 
 | Variable           | Default            | Meaning |
@@ -183,7 +324,7 @@ purpose.
 | `RUGEN_MOTD`       | empty              | message of the day |
 | `RUGEN_BIND`       | `0.0.0.0:8080`     | HTTP / WebSocket listener |
 | `RUGEN_UDP_BIND`   | `0.0.0.0:7001`     | UDP relay listener, `off` to disable |
-| `RUGEN_UDP_PUBLIC` | public URL host + port | `host:port` clients send UDP to (must not be Cloudflare-proxied) |
+| `RUGEN_UDP_PUBLIC` | public URL host + port | `host:port` clients send UDP to (must not be Cloudflare-proxied); `off` = no UDP relay at all |
 | `RUGEN_DATA`       | `/data`            | directory of `rugen.db` |
 | `RUST_LOG`         | `info`             | `error` … `debug` |
 | `RUGEN_PKG_TTL`    | `24h`              | a package expires this long after its last use (`90m`, `2d`, seconds) |
@@ -197,6 +338,15 @@ purpose.
 | `RUGEN_FAIR_MIN_GAMES` | `10`           | verified games before a character's community rating counts |
 | `RUGEN_RESIM_DATA` | –                  | engine `data/` for re-simulating disputed matches (`--features resim`) |
 | `RUGEN_RESIM_MOTIF` | `RUGEN_RESIM_DATA` | motif for re-simulation |
+| `RUGEN_SIGNING_KEY` | generated `signing.key` | this server's Ed25519 seed; the official key makes it official (secret) |
+| `RUGEN_SIGNING_KEY_FILE` | – | file holding the seed instead |
+| `RUGEN_OFFICIAL_KEY` | baked into the build | public key whose signatures / feed are official |
+| `RUGEN_OFFICIAL_URL` | `https://play.rugen.dev` | where community servers pull the official feed, `off` disables |
+| `RUGEN_OFFICIAL_PULL` | `900` | seconds between feed pulls |
+| `RUGEN_ADMIN_TOKEN` | – | enables `/v1/admin/*` |
+| `RUGEN_AUTO_BLOCK_LIARS` | `3` | players lying about a fingerprint before it is blocked (0 = off) |
+| `RUGEN_AUTO_BLOCK_DESYNCS` | `10` | desynced matches before a fingerprint is blocked (0 = off) |
+| `RUGEN_AUTO_BLOCK_ANALYSIS` | `on` | block fingerprints the server's analysis flags as cheats |
 | `RUGEN_IMAGE`      | GHCR `latest`      | image tag used by the compose file |
 | `RUGEN_HTTP_PORT`  | `8080`             | host port for HTTP (compose only) |
 | `RUGEN_UDP_PORT`   | `7001`             | host port for the UDP relay (compose only) |
@@ -296,3 +446,9 @@ What the client does to keep online play feeling local:
   confirm the fingerprints, rules and game version they will run.
 - **Spectators** join a room before the match starts and receive the host's
   confirmed inputs through the relay (ggrs spectator session).
+- **Transports**: tickets list the relay transports in order of preference
+  (`udp` when the server has a public UDP relay, then the `ws` `/relay`
+  WebSocket; unknown kinds are skipped by clients, so new ones can be added
+  without breaking older games). Both ends of the WebSocket relay disable
+  Nagle (`TCP_NODELAY`): on loopback two frames each way per round went
+  from an 82 ms median to 0.5 ms.
