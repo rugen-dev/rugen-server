@@ -1,6 +1,6 @@
 [package]
 name = "rugen-relay"
-description = "Tiny UDP rendezvous server: pairs two rugen clients by room code for direct netplay"
+description = "rugen-server: UDP rendezvous + JSON API (accounts, rooms, ranked matchmaking, Elo)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "rugen-relay"
+name = "rugen-server"
 path = "src/main.rs"
 
 [dependencies]
+rugen-proto.workspace = true
 log.workspace = true
 env_logger.workspace = true
+serde.workspace = true
+serde_json = "1"
+getrandom = "0.2"
 
 [lints]
 workspace = true

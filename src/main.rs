@@ -1,72 +1,56 @@
-//! `rugen-relay [port]` (default 7777): UDP rendezvous for netplay.
+//! `rugen-server [--port 7777] [--data dir] [--name "my server"]`
 //!
-//! Protocol (plain text datagrams):
-//! * client → server: `rugen1 hello <room> <side>` (side 1 or 2), repeated
-//! * server → client: `rugen1 peer <ip:port>` once both sides of a room are known
+//! One binary, two listeners on the same port number:
+//! * UDP: rendezvous that pairs the two sides of a room (NAT hole punching)
+//! * TCP: JSON API — anonymous accounts, profiles, custom rooms, ranked
+//!   matchmaking with Elo and seasons, leaderboard (see `api.rs`)
 //!
-//! Only public addresses are exchanged; the match itself runs peer to peer.
-//! Rooms expire after two minutes without a hello.
+//! Replaces the former `rugen-relay` binary (same UDP protocol).
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+mod api;
+mod elo;
+mod http;
+mod store;
+mod udp;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let port: u16 = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opt = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
+    // legacy: a bare number is the port
+    let port: u16 = opt("--port")
+        .or_else(|| args.first().filter(|a| !a.starts_with("--")).cloned())
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    let socket = UdpSocket::bind(("0.0.0.0", port))?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    log::info!("rugen-relay listening on udp/{port}");
-    let mut rooms: HashMap<String, [Option<(SocketAddr, Instant)>; 2]> = HashMap::new();
-    let mut buf = [0u8; 512];
-    loop {
-        let now = Instant::now();
-        rooms.retain(|_, sides| {
-            sides
-                .iter()
-                .flatten()
-                .any(|(_, t)| now.duration_since(*t) < Duration::from_secs(120))
-        });
-        let (n, from) = match socket.recv_from(&mut buf) {
-            Ok(x) => x,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => {
-                log::warn!("recv: {e}");
-                continue;
-            }
-        };
-        let text = String::from_utf8_lossy(&buf[..n]);
-        let mut it = text.split_whitespace();
-        if it.next() != Some("rugen1") || it.next() != Some("hello") {
-            continue;
+    let data = opt("--data")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("rugen-server-data"));
+    let name = opt("--name").unwrap_or_else(|| "rugen server".into());
+
+    let store = store::Store::open(Some(&data))?;
+    log::info!(
+        "{} accounts, season {}",
+        store.state.accounts.len(),
+        store.state.season
+    );
+    let api = api::Api::new(store, port, name);
+    std::thread::spawn(move || {
+        if let Err(e) = udp::serve(port) {
+            log::error!("udp: {e}");
         }
-        let (Some(room), Some(side)) = (it.next(), it.next().and_then(|s| s.parse::<usize>().ok()))
-        else {
-            continue;
-        };
-        if !(1..=2).contains(&side) || room.len() > 64 {
-            continue;
-        }
-        let entry = rooms.entry(room.to_string()).or_default();
-        if entry[side - 1].map(|(a, _)| a) != Some(from) {
-            log::info!("room {room}: side {side} is {from}");
-        }
-        entry[side - 1] = Some((from, now));
-        if let [Some((a, _)), Some((b, _))] = *entry {
-            let _ = socket.send_to(format!("rugen1 peer {b}").as_bytes(), a);
-            let _ = socket.send_to(format!("rugen1 peer {a}").as_bytes(), b);
-        }
-    }
+    });
+    let handler: http::Handler = {
+        let api: Arc<api::Api> = api;
+        Arc::new(move |req| api.handle(req))
+    };
+    http::serve(port, handler)
 }
