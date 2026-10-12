@@ -1,7 +1,13 @@
-//! HTTP + WebSocket front end on axum. Everything speaks plain HTTP/1.1 so it
-//! runs behind a Cloudflare Tunnel (which carries HTTP and WebSocket only):
-//! the tunnel terminates TLS, `CF-Connecting-IP` / `CF-IPCountry` carry the
-//! client address and region.
+//! HTTP + WebSocket front end on axum. Plain HTTP/1.1, so it runs behind a
+//! Cloudflare Tunnel (which terminates TLS and carries HTTP / WebSocket):
+//!
+//! * JSON API → [`Api::handle`] on the blocking pool
+//! * `/ws` lobby WebSocket: presence pushes, server-side round-trip pings
+//! * `/relay` binary WebSocket: relayed match datagrams for clients whose UDP
+//!   is blocked (same framing as the UDP relay)
+//!
+//! Client addresses are used for rate limiting only: never logged at info
+//! level, never passed to the API, never sent to anyone.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -18,13 +24,15 @@ use axum::routing::get;
 use rugen_proto::{ClientMsg, ServerMsg};
 
 use crate::api::{Api, Request, Response};
+use crate::relay::Route;
 
-const MAX_BODY: usize = 64 * 1024;
+/// Result uploads carry input streams; everything else is tiny.
+const MAX_BODY: usize = 1024 * 1024;
 /// Requests allowed per IP per window.
 const RATE_LIMIT: u32 = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
-/// WebSocket keepalive (Cloudflare closes idle connections after ~100 s).
-const WS_PING: Duration = Duration::from_secs(30);
+/// Lobby WebSocket keepalive + RTT probe (Cloudflare closes idle sockets after ~100 s).
+const WS_PING: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct RateLimiter {
@@ -51,6 +59,7 @@ impl RateLimiter {
 struct AppState {
     api: Arc<Api>,
     limiter: Arc<Mutex<RateLimiter>>,
+    started: Instant,
 }
 
 /// The client address: the tunnel / proxy header when present, else the socket peer.
@@ -60,14 +69,6 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
         .or_else(|| h("x-forwarded-for").and_then(|v| v.split(',').next()))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(peer.ip())
-}
-
-fn country(headers: &HeaderMap) -> String {
-    headers
-        .get("cf-ipcountry")
-        .and_then(|v| v.to_str().ok())
-        .map(crate::store::clean_region)
-        .unwrap_or_default()
 }
 
 fn to_http(r: Response) -> HttpResponse {
@@ -83,13 +84,20 @@ fn json_error(status: u16, msg: &str) -> HttpResponse {
     to_http(Response::json(status, &serde_json::json!({ "error": msg })))
 }
 
+fn allowed(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> bool {
+    let ip = client_ip(headers, peer);
+    st.limiter.lock().map(|mut l| l.allow(ip)).unwrap_or(false)
+}
+
 pub fn router(api: Arc<Api>) -> Router {
     let state = AppState {
         api,
         limiter: Arc::new(Mutex::new(RateLimiter::default())),
+        started: Instant::now(),
     };
     Router::new()
-        .route("/ws", get(ws))
+        .route("/ws", get(lobby_ws))
+        .route("/relay", get(relay_ws))
         .fallback(any)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
@@ -117,13 +125,9 @@ async fn any(
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResponse {
-    let ip = client_ip(&headers, peer);
-    // health checks (docker, tunnel) are not rate limited
-    if uri.path() != "/health" {
-        let allowed = st.limiter.lock().map(|mut l| l.allow(ip)).unwrap_or(false);
-        if !allowed {
-            return json_error(429, "rate limited");
-        }
+    // health checks (docker, tunnel, server lists) are not rate limited
+    if uri.path() != "/health" && !allowed(&st, &headers, peer) {
+        return json_error(429, "rate limited");
     }
     let query = uri
         .query()
@@ -139,9 +143,7 @@ async fn any(
         path: uri.path().to_string(),
         query,
         body: body.to_vec(),
-        country: country(&headers),
     };
-    log::debug!("{ip} {} {}", req.method, req.path);
     let api = st.api.clone();
     match tokio::task::spawn_blocking(move || api.handle(req)).await {
         Ok(r) => to_http(r),
@@ -152,16 +154,14 @@ async fn any(
     }
 }
 
-async fn ws(
+async fn lobby_ws(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
     upgrade: WebSocketUpgrade,
 ) -> HttpResponse {
-    let ip = client_ip(&headers, peer);
-    let allowed = st.limiter.lock().map(|mut l| l.allow(ip)).unwrap_or(false);
-    if !allowed {
+    if !allowed(&st, &headers, peer) {
         return json_error(429, "rate limited");
     }
     let key = q.get("key").cloned().unwrap_or_default();
@@ -173,24 +173,28 @@ async fn ws(
     let Some(account) = account else {
         return json_error(401, "bad key");
     };
-    let api = st.api.clone();
+    let (api, started) = (st.api.clone(), st.started);
     upgrade
         .max_message_size(16 * 1024)
-        .on_upgrade(move |socket| session(api, account.id, account.name, socket))
+        .on_upgrade(move |socket| lobby_session(api, started, account.id, account.name, socket))
 }
 
-async fn session(api: Arc<Api>, account: u64, name: String, mut socket: WebSocket) {
+async fn lobby_session(
+    api: Arc<Api>,
+    started: Instant,
+    account: u64,
+    name: String,
+    mut socket: WebSocket,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
     let conn = api
         .hub
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .connect(account, tx.clone());
-    log::info!("ws: {account} connected");
+    log::debug!("ws: account {account} connected");
     let _ = tx.send(ServerMsg::Welcome { id: account, name });
     let mut ping = tokio::time::interval(WS_PING);
-    ping.tick().await;
-    // a burst limit per connection: signaling is a handful of messages
     let mut budget = (Instant::now(), 0u32);
     loop {
         tokio::select! {
@@ -202,13 +206,26 @@ async fn session(api: Arc<Api>, account: u64, name: String, mut socket: WebSocke
                 }
             }
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                // the payload is our clock: the pong tells the round trip
+                let t = started.elapsed().as_millis() as u64;
+                if socket.send(Message::Ping(Bytes::copy_from_slice(&t.to_be_bytes()))).await.is_err() {
                     break;
                 }
             }
             incoming = socket.recv() => {
                 let text = match incoming {
                     Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(Message::Pong(p))) => {
+                        if let Ok(b) = <[u8; 8]>::try_from(p.as_ref()) {
+                            let sent = u64::from_be_bytes(b);
+                            let now = started.elapsed().as_millis() as u64;
+                            if now >= sent {
+                                api.hub.lock().unwrap_or_else(|p| p.into_inner())
+                                    .record_rtt(account, (now - sent) as u32);
+                            }
+                        }
+                        continue;
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     Some(Ok(_)) => continue,
                 };
@@ -217,26 +234,13 @@ async fn session(api: Arc<Api>, account: u64, name: String, mut socket: WebSocke
                 }
                 budget.1 += 1;
                 if budget.1 > 60 {
-                    let _ = tx.send(ServerMsg::Error { error: "slow down".into() });
                     continue;
                 }
                 let reply = match serde_json::from_str::<ClientMsg>(&text) {
-                    Ok(ClientMsg::Ping) => Some(ServerMsg::Pong),
-                    Ok(ClientMsg::Signal { code, side, candidates }) => {
-                        let r = api.hub.lock().unwrap_or_else(|p| p.into_inner())
-                            .signal(account, conn, &code, side, &candidates);
-                        r.err().map(|error| ServerMsg::Error { error })
-                    }
-                    Ok(ClientMsg::Relay { code, addr }) => {
-                        let r = api.hub.lock().unwrap_or_else(|p| p.into_inner())
-                            .relay(conn, &code, addr);
-                        r.err().map(|error| ServerMsg::Error { error })
-                    }
-                    Err(e) => Some(ServerMsg::Error { error: format!("bad message: {e}") }),
+                    Ok(ClientMsg::Ping) => ServerMsg::Pong,
+                    Err(e) => ServerMsg::Error { error: format!("bad message: {e}") },
                 };
-                if let Some(r) = reply {
-                    let _ = tx.send(r);
-                }
+                let _ = tx.send(reply);
             }
         }
     }
@@ -244,17 +248,69 @@ async fn session(api: Arc<Api>, account: u64, name: String, mut socket: WebSocke
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .disconnect(conn);
-    log::info!("ws: {account} disconnected");
+    log::debug!("ws: account {account} disconnected");
+}
+
+/// Relayed match datagrams over a WebSocket (binary frames, same framing as
+/// UDP; every frame carries its slot token).
+async fn relay_ws(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> HttpResponse {
+    if !allowed(&st, &headers, peer) {
+        return json_error(429, "rate limited");
+    }
+    let api = st.api.clone();
+    upgrade
+        .max_message_size(4 * 1024)
+        .on_upgrade(move |socket| relay_session(api, socket))
+}
+
+async fn relay_session(api: Arc<Api>, mut socket: WebSocket) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let conn = api
+        .relay
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ws_connect(tx);
+    loop {
+        tokio::select! {
+            out = rx.recv() => {
+                let Some(bytes) = out else { break };
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Binary(b))) => {
+                        api.relay.lock().unwrap_or_else(|p| p.into_inner())
+                            .on_packet(&b, Route::Ws(conn), Instant::now());
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+    api.relay
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ws_disconnect(conn);
 }
 
 #[cfg(test)]
 mod tests {
-    //! The real server on 127.0.0.1 with two WebSocket clients.
+    //! The real server on 127.0.0.1 with WebSocket clients.
 
     use super::*;
     use crate::api::ApiConfig;
+    use crate::relay::Relay;
     use crate::store::Store;
     use futures_util::{SinkExt, StreamExt};
+    use rugen_proto::relay::{self as wire, Header};
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
     async fn start() -> (SocketAddr, Arc<Api>) {
@@ -264,6 +320,7 @@ mod tests {
                 name: "test".into(),
                 ..Default::default()
             },
+            Arc::new(Mutex::new(Relay::default())),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -272,25 +329,29 @@ mod tests {
         (addr, api)
     }
 
-    async fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> serde_json::Value {
+    /// Raw HTTP so the test can set proxy headers.
+    async fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nCF-Connecting-IP: 203.0.113.77\r\nX-Forwarded-For: 198.51.100.9\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         s.write_all(req.as_bytes()).await.unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
-        let body = out.split_once("\r\n\r\n").unwrap().1;
-        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+        out.split_once("\r\n\r\n").unwrap().1.to_string()
+    }
+
+    async fn json(addr: SocketAddr, method: &str, path: &str, body: &str) -> serde_json::Value {
+        serde_json::from_str(&http(addr, method, path, body).await).unwrap_or_default()
     }
 
     type Ws = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn next_msg(ws: &mut Ws) -> ServerMsg {
+    async fn next_text(ws: &mut Ws) -> String {
         loop {
             let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
                 .await
@@ -298,43 +359,45 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if let WsMsg::Text(t) = m {
-                return serde_json::from_str(&t).unwrap();
+                return t.to_string();
             }
         }
     }
 
-    async fn send(ws: &mut Ws, m: &ClientMsg) {
-        ws.send(WsMsg::Text(serde_json::to_string(m).unwrap().into()))
-            .await
-            .unwrap();
+    async fn next_bin(ws: &mut Ws, kind: u8) -> Vec<u8> {
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("timed out")
+                .unwrap()
+                .unwrap();
+            if let WsMsg::Binary(b) = m {
+                let (h, p) = wire::decode_server(&b).unwrap();
+                if h.kind == kind {
+                    return p.to_vec();
+                }
+            }
+        }
     }
 
     #[tokio::test]
-    async fn room_presence_and_signaling_over_websocket() {
+    async fn room_match_over_websocket_relay_without_leaking_ips() {
         let (addr, _api) = start().await;
-        assert_eq!(http(addr, "GET", "/health", "").await["ok"], true);
-        let a = http(addr, "POST", "/register", "{}").await;
-        let b = http(addr, "POST", "/register", "{}").await;
+        let mut seen = String::new();
+        let a = json(addr, "POST", "/register", "{}").await;
+        let b = json(addr, "POST", "/register", "{}").await;
         let (ka, kb) = (a["key"].as_str().unwrap(), b["key"].as_str().unwrap());
 
-        // bad keys never upgrade
+        // lobby presence: A hears about B joining, with its ticket
+        let (mut la, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key={ka}"))
+            .await
+            .unwrap();
+        seen += &next_text(&mut la).await;
         assert!(
             tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key=nope"))
                 .await
                 .is_err()
         );
-        let (mut wa, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key={ka}"))
-            .await
-            .unwrap();
-        let (mut wb, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key={kb}"))
-            .await
-            .unwrap();
-        assert!(matches!(next_msg(&mut wa).await, ServerMsg::Welcome { .. }));
-        assert!(matches!(next_msg(&mut wb).await, ServerMsg::Welcome { .. }));
-        send(&mut wa, &ClientMsg::Ping).await;
-        assert_eq!(next_msg(&mut wa).await, ServerMsg::Pong);
-
-        // A creates a room, B joins over HTTP: A is told over the WebSocket
         let room = http(
             addr,
             "POST",
@@ -342,93 +405,147 @@ mod tests {
             &format!(r#"{{"key":"{ka}","char":"kfm"}}"#),
         )
         .await;
-        let code = room["code"].as_str().unwrap().to_string();
-        http(
+        seen += &room;
+        let code = serde_json::from_str::<serde_json::Value>(&room).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        seen += &http(addr, "GET", "/rooms", "").await;
+        let joined = http(
             addr,
             "POST",
             &format!("/room/{code}/join"),
             &format!(r#"{{"key":"{kb}","char":"kfm"}}"#),
         )
         .await;
-        match next_msg(&mut wa).await {
-            ServerMsg::Room { room } => {
-                assert!(room.ready);
-                assert_eq!(room.code, code);
-            }
-            m => panic!("{m:?}"),
-        }
+        seen += &joined;
+        let pushed = next_text(&mut la).await;
+        seen += &pushed;
+        let pushed: ServerMsg = serde_json::from_str(&pushed).unwrap();
+        let ServerMsg::Room { room: ra } = pushed else {
+            panic!("{pushed:?}")
+        };
+        let rb: rugen_proto::RoomInfo = serde_json::from_str(&joined).unwrap();
+        let (ta, tb) = (ra.ticket.unwrap(), rb.ticket.unwrap());
+        assert_eq!(ta.session, tb.session);
 
-        // both signal their endpoints; each receives the other's
-        send(
-            &mut wb,
-            &ClientMsg::Signal {
-                code: code.clone(),
-                side: 0,
-                candidates: vec!["127.0.0.1:7002".into()],
-            },
-        )
-        .await;
-        send(
-            &mut wa,
-            &ClientMsg::Signal {
-                code: code.clone(),
-                side: 0,
-                candidates: vec!["127.0.0.1:7001".into()],
-            },
-        )
-        .await;
-        match next_msg(&mut wa).await {
-            ServerMsg::Peer {
-                side, candidates, ..
-            } => {
-                assert_eq!(side, 1);
-                assert_eq!(candidates, vec!["127.0.0.1:7002".to_string()]);
-            }
-            m => panic!("{m:?}"),
+        // both players relay over /relay WebSockets
+        let tok = |t: &rugen_proto::SessionTicket| -> [u8; 16] {
+            rugen_proto::from_hex(&t.token).unwrap().try_into().unwrap()
+        };
+        let (mut wa, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay"))
+            .await
+            .unwrap();
+        let (mut wb, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay"))
+            .await
+            .unwrap();
+        let frame = |kind, from: u8, to, t: &[u8; 16], p: &[u8]| {
+            WsMsg::Binary(
+                wire::encode_client(
+                    Header {
+                        kind,
+                        from,
+                        to,
+                        session: ta.session,
+                    },
+                    t,
+                    p,
+                )
+                .into(),
+            )
+        };
+        wa.send(frame(wire::HELLO, 0, 0, &tok(&ta), &[]))
+            .await
+            .unwrap();
+        assert_eq!(next_bin(&mut wa, wire::ACK).await, vec![0b01]);
+        wb.send(frame(wire::HELLO, 1, 0, &tok(&tb), &[]))
+            .await
+            .unwrap();
+        assert_eq!(next_bin(&mut wa, wire::PEERS).await, vec![0b11]);
+        wa.send(frame(wire::DATA, 0, 1, &tok(&ta), b"ggrs-a"))
+            .await
+            .unwrap();
+        assert_eq!(next_bin(&mut wb, wire::DATA).await, b"ggrs-a");
+        wb.send(frame(wire::DATA, 1, 0, &tok(&tb), b"ggrs-b"))
+            .await
+            .unwrap();
+        assert_eq!(next_bin(&mut wa, wire::DATA).await, b"ggrs-b");
+        // forged token: nothing arrives
+        wb.send(frame(wire::DATA, 1, 0, &[0u8; 16], b"evil"))
+            .await
+            .unwrap();
+        wb.send(frame(wire::DATA, 1, 0, &tok(&tb), b"ok"))
+            .await
+            .unwrap();
+        assert_eq!(next_bin(&mut wa, wire::DATA).await, b"ok");
+
+        let poll = http(addr, "GET", &format!("/room/{code}?key={ka}"), "").await;
+        seen += &poll;
+        seen += &http(addr, "GET", "/", "").await;
+        for ip in ["203.0.113.77", "198.51.100.9", "127.0.0.1"] {
+            assert!(!seen.contains(ip), "payload leaked {ip}: {seen}");
         }
-        match next_msg(&mut wb).await {
-            ServerMsg::Peer {
-                side, candidates, ..
-            } => {
-                assert_eq!(side, 2);
-                assert_eq!(candidates, vec!["127.0.0.1:7001".to_string()]);
-            }
-            m => panic!("{m:?}"),
+    }
+
+    #[tokio::test]
+    async fn lobby_websocket_measures_rtt() {
+        let (addr, api) = start().await;
+        let a = json(addr, "POST", "/register", "{}").await;
+        let ka = a["key"].as_str().unwrap();
+        let id = a["id"].as_u64().unwrap();
+        let (mut la, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key={ka}"))
+            .await
+            .unwrap();
+        // tungstenite answers pings automatically while we read
+        let t = Instant::now();
+        while api.hub.lock().unwrap().rtt(id).is_none() && t.elapsed() < Duration::from_secs(5) {
+            let _ = tokio::time::timeout(Duration::from_millis(100), la.next()).await;
         }
-        let info = http(addr, "GET", "/", "").await;
-        assert_eq!(info["online"], 2);
+        assert!(api.hub.lock().unwrap().rtt(id).is_some());
+        la.send(WsMsg::Text(r#"{"t":"ping"}"#.into()))
+            .await
+            .unwrap();
+        let mut got_pong = false;
+        for _ in 0..5 {
+            if next_text(&mut la).await.contains("pong") {
+                got_pong = true;
+                break;
+            }
+        }
+        assert!(got_pong);
     }
 
     #[tokio::test]
     async fn queue_match_is_pushed() {
         let (addr, _api) = start().await;
-        let a = http(addr, "POST", "/register", "{}").await;
-        let b = http(addr, "POST", "/register", "{}").await;
+        let a = json(addr, "POST", "/register", "{}").await;
+        let b = json(addr, "POST", "/register", "{}").await;
         let (ka, kb) = (a["key"].as_str().unwrap(), b["key"].as_str().unwrap());
         let (mut wa, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?key={ka}"))
             .await
             .unwrap();
-        next_msg(&mut wa).await;
-        http(
+        next_text(&mut wa).await;
+        json(
             addr,
             "POST",
             "/queue",
             &format!(r#"{{"key":"{ka}","char":"kfm"}}"#),
         )
         .await;
-        http(
+        json(
             addr,
             "POST",
             "/queue",
             &format!(r#"{{"key":"{kb}","char":"kfm"}}"#),
         )
         .await;
-        match next_msg(&mut wa).await {
-            ServerMsg::Found { found } => {
+        loop {
+            let m: ServerMsg = serde_json::from_str(&next_text(&mut wa).await).unwrap();
+            if let ServerMsg::Found { found } = m {
                 assert_eq!(found.side, 1);
-                assert_eq!(found.opponent.id, b["id"].as_u64().unwrap());
+                assert_eq!(found.ticket.unwrap().slot, 0);
+                break;
             }
-            m => panic!("{m:?}"),
         }
     }
 }

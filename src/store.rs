@@ -107,16 +107,64 @@ const MIGRATIONS: &[&str] = &[
          winner INTEGER NOT NULL,
          PRIMARY KEY (match_id, reporter)
      );",
-    // v2: region hints and measured latency between regions (ping-aware matchmaking)
-    "ALTER TABLE accounts ADD COLUMN region TEXT NOT NULL DEFAULT '';
-     CREATE TABLE region_ping (
-         a TEXT NOT NULL,
-         b TEXT NOT NULL,
-         avg_ms INTEGER NOT NULL,
-         samples INTEGER NOT NULL,
-         PRIMARY KEY (a, b)
+    // v2: result verification (inputs + checksum per report), disputes, ranked replays
+    "ALTER TABLE matches ADD COLUMN disputed INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE matches ADD COLUMN setup TEXT NOT NULL DEFAULT '{}';
+     ALTER TABLE reports ADD COLUMN frames INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE reports ADD COLUMN checksum INTEGER;
+     ALTER TABLE reports ADD COLUMN inputs BLOB;
+     CREATE TABLE replays (
+         match_id INTEGER PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+         created INTEGER NOT NULL,
+         inputs BLOB NOT NULL
      );",
 ];
+
+/// Ranked replays kept (oldest are deleted first).
+pub const REPLAY_RETENTION: i64 = 2000;
+/// Trailing frames a client may not have confirmed when it reports.
+const UNCONFIRMED_TAIL: usize = 16;
+
+/// What one side reports at the end of a match.
+#[derive(Clone, Debug, Default)]
+pub struct ReportData {
+    pub winner: u64,
+    /// Last simulated frame and the world checksum there.
+    pub frames: u32,
+    pub checksum: Option<u64>,
+    /// Confirmed inputs, 4 bytes per frame.
+    pub inputs: Vec<u8>,
+}
+
+/// Outcome of [`Store::report`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReportOutcome {
+    pub accepted: bool,
+    /// Rating change for the reporter once both sides agreed.
+    pub delta: Option<i32>,
+    pub disputed: bool,
+}
+
+/// Do two reports describe the same match? Inputs must agree on their
+/// common confirmed prefix, checksums when taken at the same frame.
+pub fn reports_agree(a: &ReportData, b: &ReportData) -> bool {
+    if a.winner != b.winner {
+        return false;
+    }
+    if !a.inputs.is_empty() && !b.inputs.is_empty() {
+        let frames = (a.inputs.len().min(b.inputs.len()) / 4).saturating_sub(UNCONFIRMED_TAIL);
+        if a.inputs[..frames * 4] != b.inputs[..frames * 4] {
+            return false;
+        }
+    }
+    if let (Some(x), Some(y)) = (a.checksum, b.checksum)
+        && a.frames == b.frames
+        && x != y
+    {
+        return false;
+    }
+    true
+}
 
 pub struct Store {
     conn: Connection,
@@ -434,32 +482,37 @@ impl Store {
         self.by_id(id)
     }
 
-    pub fn new_match(&mut self, players: [u64; 2], ranked: bool) -> DbResult<u64> {
+    /// A new match row. `setup` (JSON: characters, stage, rules) is kept for replays.
+    pub fn new_match(&mut self, players: [u64; 2], ranked: bool, setup: &str) -> DbResult<u64> {
         let id = self.fresh_id()?;
         self.conn.execute(
-            "INSERT INTO matches (id, p1, p2, ranked, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO matches (id, p1, p2, ranked, created, setup) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id as i64,
                 players[0] as i64,
                 players[1] as i64,
                 ranked,
-                now() as i64
+                now() as i64,
+                setup
             ],
         )?;
         Ok(id)
     }
 
-    /// Record one side's report. Returns `(accepted, resolved delta for reporter)`.
+    /// Record one side's report. The match resolves once both sides
+    /// reported: ratings move (ranked) only when the reports agree
+    /// ([`reports_agree`]); otherwise the match is marked disputed.
     pub fn report(
         &mut self,
         reporter: u64,
         match_id: u64,
-        winner: u64,
-    ) -> DbResult<(bool, Option<i32>)> {
+        data: &ReportData,
+    ) -> DbResult<ReportOutcome> {
+        let rejected = ReportOutcome::default();
         let tx = self.conn.transaction()?;
         let m = tx
             .query_row(
-                "SELECT p1, p2, ranked, resolved, delta1, delta2 FROM matches WHERE id = ?1",
+                "SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed FROM matches WHERE id = ?1",
                 [match_id as i64],
                 |r| {
                     Ok((
@@ -467,52 +520,80 @@ impl Store {
                         r.get::<_, bool>(2)?,
                         r.get::<_, bool>(3)?,
                         [r.get::<_, i32>(4)?, r.get::<_, i32>(5)?],
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, bool>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((players, ranked, resolved, deltas)) = m else {
-            return Ok((false, None));
+        let Some((players, ranked, resolved, deltas, winner_set, disputed)) = m else {
+            return Ok(rejected);
         };
-        if !players.contains(&reporter) || !players.contains(&winner) {
-            return Ok((false, None));
+        if !players.contains(&reporter) || !players.contains(&data.winner) {
+            return Ok(rejected);
         }
         let side = usize::from(players[1] == reporter);
         if resolved {
-            // a disagreement resolves without a winner: no delta to report
-            let winner_set: Option<i64> = tx.query_row(
-                "SELECT winner FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| r.get(0),
-            )?;
-            return Ok((true, winner_set.map(|_| deltas[side])));
+            return Ok(ReportOutcome {
+                accepted: true,
+                delta: winner_set.map(|_| deltas[side]),
+                disputed,
+            });
         }
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO reports (match_id, reporter, winner) VALUES (?1, ?2, ?3)",
-            params![match_id as i64, reporter as i64, winner as i64],
+            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                match_id as i64,
+                reporter as i64,
+                data.winner as i64,
+                data.frames,
+                data.checksum.map(|c| c as i64),
+                (!data.inputs.is_empty()).then_some(&data.inputs)
+            ],
         )?;
         if inserted == 0 {
             tx.commit()?;
-            return Ok((true, None));
+            return Ok(ReportOutcome {
+                accepted: true,
+                ..Default::default()
+            });
         }
-        let winners: Vec<u64> = {
-            let mut st = tx.prepare("SELECT winner FROM reports WHERE match_id = ?1")?;
-            st.query_map([match_id as i64], |r| r.get::<_, i64>(0).map(|w| w as u64))?
-                .collect::<DbResult<_>>()?
+        let reports: Vec<ReportData> = {
+            let mut st = tx.prepare(
+                "SELECT winner, frames, checksum, inputs FROM reports WHERE match_id = ?1 ORDER BY reporter",
+            )?;
+            st.query_map([match_id as i64], |r| {
+                Ok(ReportData {
+                    winner: r.get::<_, i64>(0)? as u64,
+                    frames: r.get(1)?,
+                    checksum: r.get::<_, Option<i64>>(2)?.map(|c| c as u64),
+                    inputs: r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<DbResult<_>>()?
         };
-        if winners.len() < 2 {
+        if reports.len() < 2 {
             tx.commit()?;
-            return Ok((true, None));
+            return Ok(ReportOutcome {
+                accepted: true,
+                ..Default::default()
+            });
         }
-        if winners[0] != winners[1] {
-            // disagreement: ignore this match
+        if !reports_agree(&reports[0], &reports[1]) {
             tx.execute(
-                "UPDATE matches SET resolved = 1 WHERE id = ?1",
+                "UPDATE matches SET resolved = 1, disputed = 1 WHERE id = ?1",
                 [match_id as i64],
             )?;
             tx.commit()?;
-            return Ok((true, None));
+            log::warn!("match {match_id}: reports disagree, marked disputed");
+            return Ok(ReportOutcome {
+                accepted: true,
+                delta: None,
+                disputed: true,
+            });
         }
+        let winner = data.winner;
         let loser = if players[0] == winner {
             players[1]
         } else {
@@ -545,13 +626,64 @@ impl Store {
                     [dl, dw]
                 };
             }
+            // keep the longer confirmed input stream as the replay
+            let inputs = if reports[0].inputs.len() >= reports[1].inputs.len() {
+                &reports[0].inputs
+            } else {
+                &reports[1].inputs
+            };
+            if !inputs.is_empty() {
+                tx.execute(
+                    "INSERT OR REPLACE INTO replays (match_id, created, inputs) VALUES (?1, ?2, ?3)",
+                    params![match_id as i64, now() as i64, inputs],
+                )?;
+                tx.execute(
+                    "DELETE FROM replays WHERE match_id NOT IN
+                     (SELECT match_id FROM replays ORDER BY created DESC, match_id DESC LIMIT ?1)",
+                    [REPLAY_RETENTION],
+                )?;
+            }
         }
         tx.execute(
             "UPDATE matches SET resolved = 1, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1",
             params![match_id as i64, winner as i64, deltas[0], deltas[1]],
         )?;
         tx.commit()?;
-        Ok((true, Some(deltas[side])))
+        Ok(ReportOutcome {
+            accepted: true,
+            delta: Some(deltas[side]),
+            disputed: false,
+        })
+    }
+
+    /// A stored replay: (players, setup JSON, winner, created, inputs).
+    #[allow(clippy::type_complexity)]
+    pub fn replay(
+        &self,
+        match_id: u64,
+    ) -> DbResult<Option<([u64; 2], String, Option<u64>, u64, Vec<u8>)>> {
+        self.conn
+            .query_row(
+                "SELECT m.p1, m.p2, m.setup, m.winner, r.created, r.inputs
+                 FROM replays r JOIN matches m ON m.id = r.match_id WHERE r.match_id = ?1",
+                [match_id as i64],
+                |r| {
+                    Ok((
+                        [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
+                        r.get(2)?,
+                        r.get::<_, Option<i64>>(3)?.map(|w| w as u64),
+                        r.get::<_, i64>(4)? as u64,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+    }
+
+    #[cfg(test)]
+    pub fn replay_count(&self) -> DbResult<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM replays", [], |r| r.get(0))
     }
 
     pub fn leaderboard(&self, limit: usize) -> DbResult<Vec<ProfileInfo>> {
@@ -581,99 +713,11 @@ impl Store {
         Ok(Some(ahead as usize + 1))
     }
 
-    /// The other player of a match.
-    pub fn opponent_of(&self, match_id: u64, me: u64) -> DbResult<Option<u64>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT p1, p2 FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()?
-            .and_then(|(a, b)| match (a == me, b == me) {
-                (true, _) => Some(b),
-                (_, true) => Some(a),
-                _ => None,
-            }))
-    }
-
-    pub fn region_of(&self, id: u64) -> DbResult<String> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT region FROM accounts WHERE id = ?1",
-                [id as i64],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or_default())
-    }
-
-    /// Region hint: two upper-case letters (Cloudflare country code) or empty.
-    pub fn set_region(&mut self, id: u64, region: &str) -> DbResult<()> {
-        let r = clean_region(region);
-        if !r.is_empty() {
-            self.conn.execute(
-                "UPDATE accounts SET region = ?2 WHERE id = ?1",
-                params![id as i64, r],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Average measured round trip between two regions (order-independent).
-    pub fn region_ping(&self, a: &str, b: &str) -> DbResult<Option<u32>> {
-        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        self.conn
-            .query_row(
-                "SELECT avg_ms FROM region_ping WHERE a = ?1 AND b = ?2",
-                params![a, b],
-                |r| r.get(0),
-            )
-            .optional()
-    }
-
-    /// Fold one measured round trip into the region pair's running average.
-    pub fn record_ping(&mut self, a: &str, b: &str, ms: u32) -> DbResult<()> {
-        let (a, b) = (clean_region(a), clean_region(b));
-        if a.is_empty() || b.is_empty() {
-            return Ok(());
-        }
-        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let ms = ms.min(2000);
-        // running mean over the last ~50 samples
-        self.conn.execute(
-            "INSERT INTO region_ping (a, b, avg_ms, samples) VALUES (?1, ?2, ?3, 1)
-             ON CONFLICT(a, b) DO UPDATE SET
-                 avg_ms = (avg_ms * MIN(samples, 49) + ?3) / (MIN(samples, 49) + 1),
-                 samples = samples + 1",
-            params![a, b, ms],
-        )?;
-        Ok(())
-    }
-
     /// Consistent online copy of the database (`VACUUM INTO`), for backups.
     pub fn backup_to(&self, path: &Path) -> DbResult<()> {
         self.conn
             .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
         Ok(())
-    }
-}
-
-pub fn clean_region(r: &str) -> String {
-    let r: String = r
-        .trim()
-        .chars()
-        .filter(char::is_ascii_alphabetic)
-        .take(2)
-        .collect::<String>()
-        .to_ascii_uppercase();
-    // Cloudflare uses XX for unknown
-    if r.len() == 2 && r != "XX" {
-        r
-    } else {
-        String::new()
     }
 }
 
@@ -703,18 +747,39 @@ mod tests {
         d
     }
 
+    fn win(w: u64) -> ReportData {
+        ReportData {
+            winner: w,
+            ..Default::default()
+        }
+    }
+
+    fn inputs(frames: usize, flip: Option<usize>) -> Vec<u8> {
+        (0..frames)
+            .flat_map(|f| {
+                let p1 = (f % 7) as u16 ^ if flip == Some(f) { 0x400 } else { 0 };
+                let p2 = (f % 5) as u16;
+                let mut v = p1.to_le_bytes().to_vec();
+                v.extend(p2.to_le_bytes());
+                v
+            })
+            .collect()
+    }
+
     #[test]
     fn agreed_result_moves_ratings_once() {
         let mut s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
-        let m = s.new_match([a, b], true).unwrap();
-        assert_eq!(s.report(a, m, a).unwrap(), (true, None));
-        assert_eq!(s.report(b, m, a).unwrap(), (true, Some(-16)));
+        let m = s.new_match([a, b], true, "{}").unwrap();
+        let r1 = s.report(a, m, &win(a)).unwrap();
+        assert!(r1.accepted && r1.delta.is_none());
+        let r2 = s.report(b, m, &win(a)).unwrap();
+        assert_eq!(r2.delta, Some(-16));
         assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
         assert_eq!(s.by_id(b).unwrap().unwrap().rating, 1184);
         // late duplicate report changes nothing
-        assert_eq!(s.report(a, m, a).unwrap(), (true, Some(16)));
+        assert_eq!(s.report(a, m, &win(a)).unwrap().delta, Some(16));
         assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
         assert_eq!(s.by_id(a).unwrap().unwrap().wins, 1);
         assert_eq!(s.rank_of(a).unwrap(), Some(1));
@@ -722,19 +787,80 @@ mod tests {
     }
 
     #[test]
-    fn disagreement_is_ignored_and_outsiders_rejected() {
+    fn disagreement_is_disputed_and_outsiders_rejected() {
         let mut s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         let c = s.register().unwrap().id;
-        let m = s.new_match([a, b], true).unwrap();
-        assert_eq!(s.report(c, m, a).unwrap(), (false, None));
-        assert_eq!(s.report(a, 999_999, a).unwrap(), (false, None));
-        s.report(a, m, a).unwrap();
-        s.report(b, m, b).unwrap();
+        let m = s.new_match([a, b], true, "{}").unwrap();
+        assert!(!s.report(c, m, &win(a)).unwrap().accepted);
+        assert!(!s.report(a, 999_999, &win(a)).unwrap().accepted);
+        s.report(a, m, &win(a)).unwrap();
+        let r = s.report(b, m, &win(b)).unwrap();
+        assert!(r.disputed);
         assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1200);
-        assert_eq!(s.report(a, m, a).unwrap(), (true, None));
+        assert!(s.report(a, m, &win(a)).unwrap().disputed);
         assert!(s.leaderboard(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn input_streams_verify_results_and_become_replays() {
+        let mut s = Store::open(None).unwrap();
+        let a = s.register().unwrap().id;
+        let b = s.register().unwrap().id;
+        // same inputs (one side a few unconfirmed frames short), same checksum
+        let m = s.new_match([a, b], true, r#"{"p1_char":"kfm"}"#).unwrap();
+        let ra = ReportData {
+            winner: a,
+            frames: 600,
+            checksum: Some(42),
+            inputs: inputs(600, None),
+        };
+        let rb = ReportData {
+            winner: a,
+            frames: 590,
+            checksum: Some(7),
+            inputs: inputs(590, None),
+        };
+        s.report(a, m, &ra).unwrap();
+        let out = s.report(b, m, &rb).unwrap();
+        assert!(!out.disputed);
+        assert_eq!(out.delta, Some(-16));
+        let (players, setup, winner, _, stored) = s.replay(m).unwrap().unwrap();
+        assert_eq!((players, winner), ([a, b], Some(a)));
+        assert!(setup.contains("kfm"));
+        assert_eq!(stored.len(), 600 * 4);
+
+        // tampered input stream: disputed, ratings untouched
+        let m2 = s.new_match([a, b], true, "{}").unwrap();
+        s.report(
+            a,
+            m2,
+            &ReportData {
+                inputs: inputs(600, Some(100)),
+                ..ra.clone()
+            },
+        )
+        .unwrap();
+        let out = s.report(b, m2, &rb).unwrap();
+        assert!(out.disputed);
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
+
+        // same frame, different checksum: disputed
+        let m3 = s.new_match([a, b], true, "{}").unwrap();
+        s.report(a, m3, &ra).unwrap();
+        let out = s
+            .report(
+                b,
+                m3,
+                &ReportData {
+                    checksum: Some(43),
+                    ..ra.clone()
+                },
+            )
+            .unwrap();
+        assert!(out.disputed);
+        assert_eq!(s.replay_count().unwrap(), 1);
     }
 
     #[test]
@@ -811,20 +937,6 @@ mod tests {
         assert_eq!(s.account_count().unwrap(), 2);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn region_pings_average() {
-        let mut s = Store::open(None).unwrap();
-        let id = s.register().unwrap().id;
-        s.set_region(id, "fr").unwrap();
-        assert_eq!(s.region_of(id).unwrap(), "FR");
-        s.set_region(id, "XX").unwrap();
-        assert_eq!(s.region_of(id).unwrap(), "FR");
-        assert_eq!(s.region_ping("FR", "DE").unwrap(), None);
-        s.record_ping("DE", "FR", 40).unwrap();
-        s.record_ping("FR", "DE", 20).unwrap();
-        assert_eq!(s.region_ping("FR", "DE").unwrap(), Some(30));
     }
 
     #[test]

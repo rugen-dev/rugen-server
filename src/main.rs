@@ -1,50 +1,52 @@
-//! `rugen-server`: accounts, rooms, ranked matchmaking with Elo and seasons,
-//! leaderboard, and WebSocket signaling for UDP hole punching. Match traffic
-//! itself is peer to peer (ggrs rollback); the server never sees it unless the
-//! optional UDP relay is enabled.
+//! `rugen-server`: a self-hostable hub for rugen online play — accounts,
+//! lobby with public / private rooms and spectators, quick match and ranked
+//! (Elo, seasons, leaderboard), and the **match relay**: players only ever
+//! connect to this server, which forwards their rollback (ggrs) datagrams to
+//! each other. Nobody learns anybody else's IP address.
 //!
 //! Configuration (environment, flags override):
 //!
 //! ```text
-//! RUGEN_BIND          --bind        HTTP/WebSocket listener      0.0.0.0:8080
-//! RUGEN_DATA          --data        directory of rugen.db        /data
-//! RUGEN_NAME          --name        server name shown in game    rugen server
-//! RUGEN_PUBLIC_URL                  public https URL (logged, UDP host fallback)
-//! RUGEN_UDP_RELAY     --udp-relay   bind addr of the UDP rendezvous/relay (off)
-//! RUGEN_UDP_PUBLIC                  public host:port of that relay for clients
-//! CF_TURN_KEY_ID + CF_TURN_API_TOKEN   Cloudflare Realtime TURN key (optional)
-//! RUST_LOG                          log filter                   info
+//! RUGEN_BIND        --bind      HTTP / WebSocket listener          0.0.0.0:8080
+//! RUGEN_UDP_BIND    --udp-bind  UDP relay (fast path), "off"       0.0.0.0:7001
+//! RUGEN_UDP_PUBLIC              host:port clients send UDP to      <public url host>:<udp port>
+//! RUGEN_PUBLIC_URL              public https URL (logged, UDP host fallback)
+//! RUGEN_DATA        --data      directory of rugen.db              /data
+//! RUGEN_NAME        --name      server name in server lists        rugen server
+//! RUGEN_MOTD                    message of the day
+//! RUST_LOG                      log filter                         info
 //! ```
 //!
 //! `rugen-server --backup out.db` writes a consistent copy of the database.
 //! `rugen-server --healthcheck` probes `GET /health` on the bind port and
-//! exits 0 / 1 (for container health checks without curl).
-//! Legacy: `rugen-server --port 7777` binds HTTP and the UDP relay on 7777.
+//! exits 0 / 1 (container health checks without curl).
 
 #![forbid(unsafe_code)]
 
 mod api;
-mod cfturn;
 mod elo;
 mod http;
+mod hub;
 mod matchmaking;
-mod signal;
+mod password;
+mod relay;
 mod store;
 mod udp;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Settings {
     bind: String,
+    udp_bind: Option<String>,
+    udp_public: Option<String>,
+    public_url: Option<String>,
     data: PathBuf,
     name: String,
-    public_url: Option<String>,
-    udp_relay: Option<String>,
-    udp_public: Option<String>,
-    turn: Option<(String, String)>,
+    motd: String,
 }
 
 fn settings() -> Settings {
@@ -55,23 +57,17 @@ fn settings() -> Settings {
             .and_then(|i| args.get(i + 1).cloned())
     };
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    // legacy: `--port n` or a bare number = HTTP and UDP on that port
-    let legacy_port = opt("--port")
-        .or_else(|| args.first().filter(|a| !a.starts_with("--")).cloned())
-        .and_then(|p| p.parse::<u16>().ok());
-    let bind = opt("--bind")
-        .or(legacy_port.map(|p| format!("0.0.0.0:{p}")))
-        .or_else(|| env("RUGEN_BIND"))
-        .unwrap_or_else(|| "0.0.0.0:8080".into());
-    let udp_relay = opt("--udp-relay")
-        .or(legacy_port.map(|p| format!("0.0.0.0:{p}")))
-        .or_else(|| env("RUGEN_UDP_RELAY"));
-    let turn = match (env("CF_TURN_KEY_ID"), env("CF_TURN_API_TOKEN")) {
-        (Some(k), Some(t)) => Some((k, t)),
-        _ => None,
-    };
+    let udp_bind = opt("--udp-bind")
+        .or_else(|| env("RUGEN_UDP_BIND"))
+        .unwrap_or_else(|| "0.0.0.0:7001".into());
     Settings {
-        bind,
+        bind: opt("--bind")
+            .or_else(|| env("RUGEN_BIND"))
+            .unwrap_or_else(|| "0.0.0.0:8080".into()),
+        udp_bind: (!matches!(udp_bind.as_str(), "off" | "0" | "false" | "none"))
+            .then_some(udp_bind),
+        udp_public: env("RUGEN_UDP_PUBLIC"),
+        public_url: env("RUGEN_PUBLIC_URL"),
         data: opt("--data")
             .or_else(|| env("RUGEN_DATA"))
             .map(PathBuf::from)
@@ -79,14 +75,11 @@ fn settings() -> Settings {
         name: opt("--name")
             .or_else(|| env("RUGEN_NAME"))
             .unwrap_or_else(|| "rugen server".into()),
-        public_url: env("RUGEN_PUBLIC_URL"),
-        udp_relay,
-        udp_public: env("RUGEN_UDP_PUBLIC"),
-        turn,
+        motd: env("RUGEN_MOTD").unwrap_or_default(),
     }
 }
 
-/// Public `host:port` clients should send relay traffic to.
+/// Public `host:port` clients send UDP relay traffic to (the server's own address).
 fn udp_public(s: &Settings, bound: SocketAddr) -> String {
     if let Some(p) = &s.udp_public {
         return p.clone();
@@ -110,7 +103,10 @@ fn healthcheck(bind: &str) -> i32 {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
     let probe = || -> std::io::Result<bool> {
-        let addr = ("127.0.0.1", port).to_socket_addrs()?.next().unwrap();
+        let addr = ("127.0.0.1", port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(std::io::ErrorKind::AddrNotAvailable)?;
         let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
         s.set_read_timeout(Some(Duration::from_secs(3)))?;
         s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
@@ -157,8 +153,8 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "rugen-server [--bind 0.0.0.0:8080] [--data /data] [--name NAME] [--udp-relay 0.0.0.0:7777] [--healthcheck] [--backup out.db]\n\
-             env: RUGEN_BIND RUGEN_DATA RUGEN_NAME RUGEN_PUBLIC_URL RUGEN_UDP_RELAY RUGEN_UDP_PUBLIC CF_TURN_KEY_ID CF_TURN_API_TOKEN RUST_LOG"
+            "rugen-server [--bind 0.0.0.0:8080] [--udp-bind 0.0.0.0:7001|off] [--data /data] [--name NAME] [--healthcheck] [--backup out.db]\n\
+             env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG"
         );
         return;
     }
@@ -187,34 +183,38 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         store.season()?.name.to_lowercase(),
         s.data.display()
     );
+    let relay = Arc::new(Mutex::new(relay::Relay::default()));
     let mut cfg = api::ApiConfig {
         name: s.name.clone(),
-        ..Default::default()
+        motd: s.motd.clone(),
+        udp_public: None,
     };
-    if let Some(bind) = &s.udp_relay {
-        let socket = std::net::UdpSocket::bind(bind.as_str())
-            .map_err(|e| format!("udp relay on {bind}: {e}"))?;
-        let bound = socket.local_addr()?;
-        cfg.udp_port = bound.port();
-        cfg.udp_relay = Some(udp_public(&s, bound));
-        log::info!(
-            "udp relay advertised as {}",
-            cfg.udp_relay.as_deref().unwrap_or("")
+    if let Some(bind) = &s.udp_bind {
+        let socket = Arc::new(
+            std::net::UdpSocket::bind(bind.as_str())
+                .map_err(|e| format!("udp relay on {bind}: {e}"))?,
         );
+        let bound = socket.local_addr()?;
+        let public = udp_public(&s, bound);
+        log::info!("udp relay advertised as {public}");
+        cfg.udp_public = Some(public);
+        relay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_udp(socket.clone());
+        let r = relay.clone();
         std::thread::spawn(move || {
-            if let Err(e) = udp::serve(socket) {
+            if let Err(e) = udp::serve(socket, r) {
                 log::error!("udp: {e}");
             }
         });
-    }
-    if let Some((key, token)) = s.turn.clone() {
-        log::info!("cloudflare TURN credentials enabled");
-        cfg.turn = Some(cfturn::CfTurn::new(key, token));
+    } else {
+        log::info!("udp relay off: matches relay over the /relay WebSocket only");
     }
     if let Some(u) = &s.public_url {
         log::info!("public url {u}");
     }
-    let api = api::Api::new(store, cfg);
+    let api = api::Api::new(store, cfg, relay);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(32)
@@ -238,16 +238,16 @@ mod tests {
     fn udp_public_address_falls_back_to_the_public_url_host() {
         let mut s = Settings {
             bind: String::new(),
+            udp_bind: None,
+            udp_public: None,
+            public_url: Some("https://rugen.example.com/".into()),
             data: PathBuf::new(),
             name: String::new(),
-            public_url: Some("https://rugen.example.com/".into()),
-            udp_relay: None,
-            udp_public: None,
-            turn: None,
+            motd: String::new(),
         };
-        let bound: SocketAddr = "0.0.0.0:7777".parse().unwrap();
-        assert_eq!(udp_public(&s, bound), "rugen.example.com:7777");
-        s.udp_public = Some("1.2.3.4:9999".into());
-        assert_eq!(udp_public(&s, bound), "1.2.3.4:9999");
+        let bound: SocketAddr = "0.0.0.0:7001".parse().unwrap();
+        assert_eq!(udp_public(&s, bound), "rugen.example.com:7001");
+        s.udp_public = Some("udp.example.com:7001".into());
+        assert_eq!(udp_public(&s, bound), "udp.example.com:7001");
     }
 }

@@ -1,30 +1,27 @@
-//! Ranked pairing: rating window (Elo) and ping window, both widening with
-//! the time spent in the queue. Pure and deterministic so it is easy to test.
-//!
-//! Latency between two players is estimated before they ever talk: the
-//! measured average for their pair of regions (fed by match reports), else
-//! [`SAME_REGION_MS`] when they share a region, [`NO_REGION_MS`] when a
-//! region is unknown, else [`UNKNOWN_MS`].
+//! Queue pairing: rating window (Elo, ranked only) and ping window, both
+//! widening with the time spent waiting. Match traffic goes through the
+//! server, so the round trip between two players is simply the sum of their
+//! server-measured round trips. Pure and deterministic.
 
 use crate::elo;
 
-pub const SAME_REGION_MS: u32 = 30;
-pub const UNKNOWN_MS: u32 = 150;
-/// Estimate when a region is missing: no information, so it fits the first window.
-pub const NO_REGION_MS: u32 = 60;
+/// Assumed round trip to the server when it has not been measured yet.
+pub const UNMEASURED_RTT: u32 = 60;
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub id: u64,
     pub rating: i32,
-    pub region: String,
+    /// Round trip player ↔ server.
+    pub rtt_ms: Option<u32>,
     pub waited_secs: u64,
-    /// "Accept only good connections": hard ping cap that never widens.
+    /// "Accept only good connections": hard cap that never widens.
     pub max_ping: Option<u32>,
+    /// Ranked entries respect the rating window; quick match ignores it.
+    pub ranked: bool,
 }
 
-/// Acceptable estimated round trip after waiting `secs`: 60 ms, 120 ms after
-/// 10 s, 200 ms after 20 s, anything after 30 s.
+/// Acceptable estimated round trip between the two players after waiting
+/// `secs`: 60 ms, 120 ms after 10 s, 200 ms after 20 s, anything after 30 s.
 pub fn ping_window(secs: u64) -> u32 {
     match secs {
         0..10 => 60,
@@ -34,23 +31,16 @@ pub fn ping_window(secs: u64) -> u32 {
     }
 }
 
-/// Estimated round trip from a measured region-pair average.
-pub fn estimate(a: &str, b: &str, measured: Option<u32>) -> u32 {
-    match measured {
-        Some(ms) => ms,
-        None if a.is_empty() || b.is_empty() => NO_REGION_MS,
-        None if a == b => SAME_REGION_MS,
-        None => UNKNOWN_MS,
-    }
+/// Estimated player ↔ player round trip through the server.
+pub fn estimate(a: Option<u32>, b: Option<u32>) -> u32 {
+    a.unwrap_or(UNMEASURED_RTT)
+        .saturating_add(b.unwrap_or(UNMEASURED_RTT))
 }
 
-/// Pairs to start, as indices into `queue` (oldest first). Each player is
-/// matched with the acceptable partner of lowest estimated ping, then
-/// smallest rating gap, then longest wait.
-pub fn pairs(
-    queue: &[Candidate],
-    est: impl Fn(&Candidate, &Candidate) -> u32,
-) -> Vec<(usize, usize)> {
+/// Pairs to start, as indices into `queue` (oldest first). Only entries of
+/// the same kind (ranked / quick) meet. Each player gets the acceptable
+/// partner of lowest estimated ping, then smallest rating gap, then longest wait.
+pub fn pairs(queue: &[Candidate]) -> Vec<(usize, usize)> {
     let mut taken = vec![false; queue.len()];
     let mut out = Vec::new();
     for i in 0..queue.len() {
@@ -60,13 +50,18 @@ pub fn pairs(
         let a = &queue[i];
         let mut best: Option<(u32, i32, usize)> = None;
         for (j, b) in queue.iter().enumerate() {
-            if j == i || taken[j] {
+            if j == i || taken[j] || a.ranked != b.ranked {
                 continue;
             }
             let gap = (a.rating - b.rating).abs();
-            let rating_ok = gap <= elo::window(a.waited_secs).max(elo::window(b.waited_secs));
-            let ping = est(a, b);
-            let window = ping_window(a.waited_secs).max(ping_window(b.waited_secs));
+            let rating_ok =
+                !a.ranked || gap <= elo::window(a.waited_secs).max(elo::window(b.waited_secs));
+            let ping = estimate(a.rtt_ms, b.rtt_ms);
+            let mut window = ping_window(a.waited_secs).max(ping_window(b.waited_secs));
+            // with no measurement at all the first window must still let people play
+            if a.rtt_ms.is_none() && b.rtt_ms.is_none() {
+                window = window.max(estimate(None, None));
+            }
             let cap = a
                 .max_ping
                 .unwrap_or(u32::MAX)
@@ -92,22 +87,14 @@ pub fn pairs(
 mod tests {
     use super::*;
 
-    fn c(id: u64, rating: i32, region: &str, waited: u64) -> Candidate {
+    fn c(_id: u64, rating: i32, rtt: Option<u32>, waited: u64) -> Candidate {
         Candidate {
-            id,
             rating,
-            region: region.into(),
+            rtt_ms: rtt,
             waited_secs: waited,
             max_ping: None,
+            ranked: true,
         }
-    }
-
-    fn est(a: &Candidate, b: &Candidate) -> u32 {
-        let measured = match (a.region.as_str(), b.region.as_str()) {
-            ("FR", "US") | ("US", "FR") => Some(110),
-            _ => None,
-        };
-        estimate(&a.region, &b.region, measured)
     }
 
     #[test]
@@ -119,41 +106,54 @@ mod tests {
     }
 
     #[test]
-    fn prefers_the_closest_player() {
+    fn prefers_the_lowest_combined_ping() {
         let q = [
-            c(1, 1200, "FR", 0),
-            c(2, 1200, "US", 0),
-            c(3, 1250, "FR", 0),
+            c(1, 1200, Some(20), 0),
+            c(2, 1200, Some(35), 0),
+            c(3, 1250, Some(15), 0),
         ];
-        assert_eq!(pairs(&q, est), vec![(0, 2)]);
+        assert_eq!(pairs(&q), vec![(0, 2)]);
     }
 
     #[test]
     fn far_players_wait_until_the_window_allows() {
-        let q = [c(1, 1200, "FR", 0), c(2, 1200, "US", 0)];
-        assert!(pairs(&q, est).is_empty());
-        let q = [c(1, 1200, "FR", 11), c(2, 1200, "US", 0)];
-        assert_eq!(pairs(&q, est), vec![(0, 1)]);
-        // unmeasured region pair: 150 ms estimate, accepted after 20 s
-        let q = [c(1, 1200, "DE", 15), c(2, 1200, "JP", 0)];
-        assert!(pairs(&q, est).is_empty());
-        let q = [c(1, 1200, "DE", 21), c(2, 1200, "JP", 0)];
-        assert_eq!(pairs(&q, est), vec![(0, 1)]);
+        let q = [c(1, 1200, Some(30), 0), c(2, 1200, Some(70), 0)];
+        assert!(pairs(&q).is_empty());
+        let q = [c(1, 1200, Some(30), 11), c(2, 1200, Some(70), 0)];
+        assert_eq!(pairs(&q), vec![(0, 1)]);
+        let q = [c(1, 1200, Some(120), 21), c(2, 1200, Some(70), 0)];
+        assert_eq!(pairs(&q), vec![(0, 1)]);
+        let q = [c(1, 1200, Some(300), 29), c(2, 1200, Some(70), 0)];
+        assert!(pairs(&q).is_empty());
+        let q = [c(1, 1200, Some(300), 31), c(2, 1200, Some(70), 0)];
+        assert_eq!(pairs(&q), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn unmeasured_players_still_meet() {
+        let q = [c(1, 1200, None, 0), c(2, 1200, None, 0)];
+        assert_eq!(pairs(&q), vec![(0, 1)]);
     }
 
     #[test]
     fn good_connections_only_never_widens() {
-        let mut a = c(1, 1200, "FR", 600);
+        let mut a = c(1, 1200, Some(60), 600);
         a.max_ping = Some(80);
-        let q = [a, c(2, 1200, "US", 600)];
-        assert!(pairs(&q, est).is_empty());
+        let q = [a, c(2, 1200, Some(60), 600)];
+        assert!(pairs(&q).is_empty());
     }
 
     #[test]
-    fn rating_window_still_applies() {
-        let q = [c(1, 1000, "FR", 0), c(2, 1500, "FR", 0)];
-        assert!(pairs(&q, est).is_empty());
-        let q = [c(1, 1000, "FR", 60), c(2, 1500, "FR", 0)];
-        assert_eq!(pairs(&q, est), vec![(0, 1)]);
+    fn rating_window_only_for_ranked() {
+        let q = [c(1, 1000, Some(10), 0), c(2, 1500, Some(10), 0)];
+        assert!(pairs(&q).is_empty());
+        let q = [c(1, 1000, Some(10), 60), c(2, 1500, Some(10), 0)];
+        assert_eq!(pairs(&q), vec![(0, 1)]);
+        let mut quick = [c(1, 1000, Some(10), 0), c(2, 1500, Some(10), 0)];
+        quick.iter_mut().for_each(|q| q.ranked = false);
+        assert_eq!(pairs(&quick), vec![(0, 1)]);
+        // ranked and quick never meet
+        let mixed = [c(1, 1200, Some(10), 0), quick[1].clone()];
+        assert!(pairs(&mixed).is_empty());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rugen-relay"
-description = "rugen-server: accounts, rooms, ranked matchmaking (Elo), WebSocket signaling, SQLite"
+description = "rugen-server: lobby, rooms, ranked (Elo), match relay over UDP / WebSocket, SQLite"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,7 +21,7 @@ getrandom = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+argon2 = "0.5"
 
 [dev-dependencies]
 tokio-tungstenite = "0.27"
