@@ -450,6 +450,12 @@ again (it is at least the current Unix time).
 | `RUGEN_TURN_RATE_ESTIMATE` | `8000`     | budgeted bytes / s per player and direction (measured ≈ 3,500) |
 | `RUGEN_TURN_SAFETY` | `2.0`             | factor on estimates and client reports |
 | `RUGEN_TURN_TTL_MAX` | `1800`           | longest credential in seconds |
+| `RUGEN_WORKERS`    | CPU quota / cores  | async worker threads; default = the container's CPU quota (cgroup `cpu.max`, i.e. `cpus:`), else the cores; at least 2 |
+| `RUGEN_RATE_ACCOUNT` | `120`            | API calls per account (its key) per 10 s |
+| `RUGEN_RATE_IP`    | `2000`             | API calls per client IP per 10 s, all accounts together (abuse ceiling; mobile carriers put many players behind one IP) |
+| `RUGEN_RATE_ANON`  | `300`              | calls without a key per client IP per 10 s |
+| `RUGEN_RATE_REGISTER` | `30`            | registrations per client IP per minute |
+| `RUGEN_RATE_RELAY` | `300`              | `/relay` WebSocket upgrades per client IP per 10 s (not charged to the API budgets) |
 
 ## Backups
 
@@ -503,9 +509,13 @@ proxy with TLS works too; it must pass WebSocket upgrades for `/ws` and
   can only talk to the host.
 - Room passwords are hashed with Argon2id (per-room salt) and checked in
   constant time; nothing stores or returns them in clear.
-- Rate limits: 120 HTTP requests / 10 s per IP, 600 relay datagrams / s per
-  slot, 2000 UDP datagrams / s per source IP, bounded rooms, sessions and
-  queue sizes. The container runs as non-root on a read-only root fs with
+- Rate limits: 120 API calls / 10 s per account, with a 2000 / 10 s ceiling
+  per IP (players behind carrier NAT share addresses), 300 / 10 s per IP for
+  calls without a key, 30 registrations / min per IP, 300 `/relay` upgrades /
+  10 s per IP, 600 relay datagrams / s per slot, 2000 UDP datagrams / s per
+  source IP, bounded rooms, sessions, queue sizes and per-connection relay
+  queues (256 frames; overflow is dropped like lost UDP and counted in
+  `/health` → `relay.queue_drops`). The container runs as non-root on a read-only root fs with
   all capabilities dropped.
 - Accounts are anonymous: the key in the player's `profile.json` *is* the
   account. Keep backups of the database if rankings matter.

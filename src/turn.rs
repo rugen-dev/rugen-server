@@ -477,18 +477,16 @@ impl Turn {
     /// per-credential ceilings, drop stale prepared credentials, store
     /// Cloudflare's analytics, log the month. Never holds the relay lock
     /// together with the state lock.
-    pub fn sweep(self: &Arc<Self>, store: &Store, relay: &Mutex<Relay>) {
+    pub fn sweep(self: &Arc<Self>, store: &Store, relay: &Relay) {
         let keys: Vec<(u32, u8)> = lock(&self.state)
             .issued
             .iter()
             .map(|i| (i.session, i.slot))
             .collect();
-        let bytes: Vec<Option<(u64, u64)>> = {
-            let r = relay.lock().unwrap_or_else(|p| p.into_inner());
-            keys.iter()
-                .map(|&(id, slot)| r.turn_bytes(id, slot))
-                .collect()
-        };
+        let bytes: Vec<Option<(u64, u64)>> = keys
+            .iter()
+            .map(|&(id, slot)| relay.turn_bytes(id, slot))
+            .collect();
         let mut revoke = Vec::new();
         {
             let mut s = lock(&self.state);
@@ -956,7 +954,7 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(*cf.revoked.lock().unwrap(), vec![a.username.clone()]);
         // the relay session is gone: P2's credential ends too
-        let relay = Mutex::new(Relay::default());
+        let relay = Relay::default();
         t.sweep(&store, &relay);
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(cf.revoked.lock().unwrap().len(), 2);
@@ -971,8 +969,8 @@ pub(crate) mod tests {
         let t = Turn::new(config(&cf.url, &[]));
         let mut store = Store::open(None).unwrap();
         let p = players(&mut store);
-        let relay = Mutex::new(Relay::default());
-        let (session, tokens) = relay.lock().unwrap().create(&p).unwrap();
+        let relay = Relay::default();
+        let (session, tokens) = relay.create(&p).unwrap();
         t.prepare(&store, 8, p, true, &Rules::default());
         wait_ready(&t, 8);
         assert_eq!(t.take(&store, 8, session).len(), 2);
@@ -992,11 +990,8 @@ pub(crate) mod tests {
             &tokens[1],
             &hello,
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut r = relay.lock().unwrap();
-        let c = r.ws_connect(tx);
-        r.on_packet(&pkt, crate::relay::Route::Ws(c), Instant::now());
-        drop(r);
+        let (c, _rx) = relay.ws_connect();
+        relay.on_packet(&pkt, &crate::relay::Route::Ws(c), Instant::now());
         t.sweep(&store, &relay);
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(cf.revoked.lock().unwrap().len(), 1, "P2 revoked");
@@ -1114,7 +1109,7 @@ pub(crate) mod tests {
             ],
         ));
         assert_eq!(t.cloudflare_usage(&month).unwrap(), 9_000_000);
-        let relay = Mutex::new(Relay::default());
+        let relay = Relay::default();
         t.sweep(&s, &relay); // starts the poll
         let start = Instant::now();
         while lock(&t.state).cf_usage.is_none() && start.elapsed() < Duration::from_secs(5) {

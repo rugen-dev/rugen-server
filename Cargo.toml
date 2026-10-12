@@ -25,6 +25,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
 argon2 = "0.5"
+# split + batched writes of the /relay WebSocket
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # HTTPS client: pulls the official truth feed and calls the Cloudflare TURN
 # API (rustls + bundled webpki roots: the scratch image has no CA store)
 ureq = { version = "3", default-features = false, features = ["rustls"] }
@@ -39,7 +41,6 @@ rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.4
 rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.4.0" }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [lints.rust]
 unsafe_code = "warn"

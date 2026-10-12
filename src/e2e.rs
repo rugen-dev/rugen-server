@@ -6,7 +6,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rugen_content::Library;
@@ -67,10 +67,10 @@ fn server(data: &Path) -> Server {
 /// but not advertised then (like a tunnel-only server: WebSocket relay).
 fn server_with(data: &Path, turn: Option<crate::turn::TurnConfig>) -> Server {
     let tunnel = turn.is_some();
-    let relay = Arc::new(Mutex::new(Relay::default()));
+    let relay = Arc::new(Relay::default());
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
     let udp = socket.local_addr().unwrap();
-    relay.lock().unwrap().set_udp(socket.clone());
+    relay.set_udp(socket.clone());
     let r = relay.clone();
     std::thread::spawn(move || crate::udp::serve(socket, r));
     let api = Api::new(

@@ -671,15 +671,13 @@ impl Store {
         Ok((accounts, matches))
     }
 
-    /// Accounts seen within the last `secs` seconds.
-    pub fn online_count(&self, secs: u64) -> DbResult<usize> {
+    /// Both sides reported (or the match was otherwise settled).
+    pub fn match_resolved(&self, match_id: u64) -> DbResult<bool> {
         self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM accounts WHERE last_seen >= ?1",
-                [now().saturating_sub(secs) as i64],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n as usize)
+            .prepare_cached("SELECT resolved FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| r.get::<_, bool>(0))
+            .optional()
+            .map(|r| r.unwrap_or(false))
     }
 
     pub fn register(&mut self) -> DbResult<Account> {
@@ -707,26 +705,33 @@ impl Store {
         Ok(a)
     }
 
-    /// The account owning `key`; refreshes its `last_seen`.
+    /// The account owning `key`; refreshes its `last_seen` (written at
+    /// most once a minute: this runs on every authenticated call).
     pub fn by_key(&mut self, key: &str) -> DbResult<Option<Account>> {
-        self.conn
-            .query_row(
-                &format!(
-                    "UPDATE accounts SET last_seen = ?2 WHERE key = ?1 RETURNING {ACCOUNT_COLS}"
-                ),
-                params![key, now() as i64],
-                Account::from_row,
-            )
-            .optional()
+        let a = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {ACCOUNT_COLS} FROM accounts WHERE key = ?1"
+            ))?
+            .query_row([key], Account::from_row)
+            .optional()?;
+        let Some(mut a) = a else { return Ok(None) };
+        let t = now();
+        if a.last_seen + 60 <= t {
+            self.conn
+                .prepare_cached("UPDATE accounts SET last_seen = ?2 WHERE id = ?1")?
+                .execute(params![a.id as i64, t as i64])?;
+            a.last_seen = t;
+        }
+        Ok(Some(a))
     }
 
     pub fn by_id(&self, id: u64) -> DbResult<Option<Account>> {
         self.conn
-            .query_row(
-                &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE id = ?1"),
-                [id as i64],
-                Account::from_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {ACCOUNT_COLS} FROM accounts WHERE id = ?1"
+            ))?
+            .query_row([id as i64], Account::from_row)
             .optional()
     }
 

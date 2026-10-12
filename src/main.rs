@@ -49,6 +49,14 @@
 //! RUGEN_TURN_SAFETY             factor on estimates and reports     2.0
 //! RUGEN_TURN_TTL_MAX            longest credential, seconds         1800
 //! RUGEN_CF_ACCOUNT_ID + RUGEN_CF_ANALYTICS_TOKEN  cross-check usage with Cloudflare analytics
+//!
+//! capacity and abuse limits
+//! RUGEN_WORKERS                 async worker threads               CPU quota (cgroup cpu.max) or cores, min 2
+//! RUGEN_RATE_ACCOUNT            API calls per account per 10 s     120
+//! RUGEN_RATE_IP                 API calls per client IP per 10 s   2000 (ceiling; CGNAT shares IPs)
+//! RUGEN_RATE_ANON               calls without a key per IP / 10 s  300
+//! RUGEN_RATE_REGISTER           registrations per IP per minute    30
+//! RUGEN_RATE_RELAY              /relay upgrades per IP per 10 s    300 (never charged to the API)
 //! ```
 //!
 //! A server is **official** when its signing key is the official key;
@@ -88,7 +96,7 @@ mod udp;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 struct Settings {
@@ -213,7 +221,8 @@ fn main() {
              rugen-server --delete-accounts <name prefix> [--yes]\n\
              env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
              \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
-             \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS"
+             \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS\n\
+             \x20    RUGEN_WORKERS RUGEN_RATE_ACCOUNT RUGEN_RATE_IP RUGEN_RATE_ANON RUGEN_RATE_REGISTER RUGEN_RATE_RELAY"
         );
         return;
     }
@@ -317,6 +326,64 @@ fn delete_accounts_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::er
     Ok(true)
 }
 
+/// Async worker threads: `RUGEN_WORKERS`, else the CPU quota of this
+/// process's cgroup (containers: `--cpus`), else the cores available; at
+/// least two.
+fn worker_threads() -> usize {
+    if let Some(n) = std::env::var("RUGEN_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // at least two: with a single worker, socket readiness is only picked up
+    // between task batches and relay latency climbs long before the CPU
+    // quota is used up (measured under `--cpus 1`)
+    cgroup_cpus().map_or(cores, |q| q.min(cores)).max(2)
+}
+
+/// CPUs allowed by the cgroup v2 `cpu.max` of this process (the tightest
+/// along its path, rounded up), or v1 `cpu.cfs_quota_us`; `None` = no quota.
+fn cgroup_cpus() -> Option<usize> {
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let quota = |text: &str| -> Option<f64> {
+        let mut it = text.split_whitespace();
+        let (q, p) = (it.next()?, it.next().unwrap_or("100000"));
+        let (q, p) = (q.parse::<f64>().ok()?, p.parse::<f64>().ok()?);
+        (q > 0.0 && p > 0.0).then_some(q / p)
+    };
+    let mut best: Option<f64> = None;
+    let mut take = |v: Option<f64>| {
+        if let Some(v) = v {
+            best = Some(best.map_or(v, |b| b.min(v)));
+        }
+    };
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let own = read(std::path::Path::new("/proc/self/cgroup")).and_then(|c| {
+        c.lines()
+            .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()))
+    });
+    if let Some(path) = own {
+        let mut dir = root.join(path.trim_start_matches('/'));
+        loop {
+            take(read(&dir.join("cpu.max")).and_then(|t| quota(&t)));
+            if dir == root || !dir.pop() {
+                break;
+            }
+        }
+    }
+    // cgroup v1
+    if let (Some(q), Some(p)) = (
+        read(&root.join("cpu/cpu.cfs_quota_us")),
+        read(&root.join("cpu/cpu.cfs_period_us")),
+    ) {
+        take(quota(&format!("{} {}", q.trim(), p.trim())));
+    }
+    best.map(|c| c.ceil() as usize)
+}
+
 fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = store::Store::open(Some(&s.data))
         .map_err(|e| format!("database in {}: {e}", s.data.display()))?;
@@ -361,7 +428,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         store.season()?.name.to_lowercase(),
         s.data.display()
     );
-    let relay = Arc::new(Mutex::new(relay::Relay::default()));
+    let relay = Arc::new(relay::Relay::default());
     let env_f = |k: &str| {
         std::env::var(k)
             .ok()
@@ -408,10 +475,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         let public = udp_public(&s, bound);
         log::info!("udp relay advertised as {public}");
         cfg.udp_public = Some(public);
-        relay
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_udp(socket.clone());
+        relay.set_udp(socket.clone());
         let r = relay.clone();
         std::thread::spawn(move || {
             if let Err(e) = udp::serve(socket, r) {
@@ -432,8 +496,13 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         Some(t) => t.log_startup(&api.store_lock()),
         None => log::info!("turn: off (set RUGEN_CF_TURN_KEY_ID + RUGEN_CF_TURN_TOKEN)"),
     }
+    let workers = worker_threads();
+    log::info!(
+        "{workers} worker threads; limits {:?}",
+        http::Limits::from_env()
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .max_blocking_threads(32)
         .enable_all()
         .build()?;
@@ -442,6 +511,15 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("bind {}: {e}", s.bind))?;
         log::info!("http + websocket on {}", listener.local_addr()?);
+        // relay sessions: idle ones expire (whether UDP is on or not)
+        let r = api.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                every.tick().await;
+                r.sweep_relay();
+            }
+        });
         // package retention: TTL + LRU size cap
         let sweeper = api.clone();
         tokio::spawn(async move {
@@ -510,5 +588,15 @@ mod tests {
         assert_eq!(udp_public(&s, bound), "rugen.example.com:7001");
         s.udp_public = Some("udp.example.com:7001".into());
         assert_eq!(udp_public(&s, bound), "udp.example.com:7001");
+    }
+
+    #[test]
+    fn worker_threads_respect_the_override_and_the_cores() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let n = worker_threads();
+        assert!(n >= 2 && n <= cores.max(2));
+        if let Some(q) = cgroup_cpus() {
+            assert!(n <= q.max(2));
+        }
     }
 }
