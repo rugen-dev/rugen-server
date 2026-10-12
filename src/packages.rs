@@ -348,8 +348,17 @@ impl Packages {
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
+                // a just-verified upload is renamed in before its row is
+                // written (outside the store lock): leave young files alone
+                let young = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_none_or(|age| age.as_secs() < 600);
                 if let Some(fp) = name.strip_suffix(".rgpk")
                     && !known.contains(fp)
+                    && !young
                 {
                     let _ = std::fs::remove_file(e.path());
                 }

@@ -35,6 +35,8 @@
 #![forbid(unsafe_code)]
 
 mod api;
+#[cfg(test)]
+mod e2e;
 mod elo;
 mod http;
 mod hub;

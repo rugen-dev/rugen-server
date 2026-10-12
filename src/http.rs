@@ -151,7 +151,10 @@ async fn any(
     body: Bytes,
 ) -> HttpResponse {
     // health checks (docker, tunnel, server lists) are not rate limited
-    if uri.path() != "/health" && !allowed(&st, &headers, peer) {
+    // package transfers have their own byte budget (below / per account)
+    let transfer = uri.path().starts_with("/pkg/")
+        && (uri.path().ends_with("/upload") || uri.path().ends_with("/data"));
+    if uri.path() != "/health" && !transfer && !allowed(&st, &headers, peer) {
         return json_error(429, "rate limited");
     }
     if method == Method::POST && uri.path().starts_with("/pkg/") && uri.path().ends_with("/upload")

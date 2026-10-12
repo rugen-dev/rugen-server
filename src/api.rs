@@ -2025,8 +2025,17 @@ pub(crate) mod tests {
             })
             .unwrap();
         }
-        // a stray file without a row is an orphan
+        // a stray file without a row is an orphan (once it is not brand new:
+        // a fresh one may be an upload whose row is being written)
+        let young = api.packages.path(&"ef".repeat(32));
+        std::fs::write(&young, b"x").unwrap();
         std::fs::write(api.packages.path(&"cd".repeat(32)), b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(api.packages.path(&"cd".repeat(32)))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
         let mut pk = PkgConfig {
             ttl_secs: 3600,
             max_total: 10 << 20,
@@ -2038,6 +2047,7 @@ pub(crate) mod tests {
         assert_eq!(gone, vec![kit.a.0.fingerprint.clone()]);
         assert!(!pkgs.has(&kit.a.0.fingerprint) && pkgs.has(&kit.b.0.fingerprint));
         assert!(!pkgs.path(&"cd".repeat(32)).exists(), "orphan removed");
+        assert!(young.exists(), "a fresh upload is not an orphan");
         // size cap 0: LRU eviction, replay-kept last
         pk.max_total = kit.stage.1.len() as u64;
         let pkgs = Packages::at(api.packages.dir(), pk);
