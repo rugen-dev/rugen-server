@@ -620,6 +620,57 @@ impl Store {
             .map(|n| n as usize)
     }
 
+    /// Accounts whose name starts with `prefix` (load-test leftovers) and
+    /// their unranked matches (reports / replays cascade): counted only when
+    /// `dry_run`, deleted otherwise. Ranked matches are kept (they moved
+    /// other players' ratings). Returns (accounts, matches).
+    pub fn delete_accounts_by_prefix(
+        &mut self,
+        prefix: &str,
+        dry_run: bool,
+    ) -> DbResult<(usize, usize)> {
+        let esc: String = prefix
+            .chars()
+            .flat_map(|c| match c {
+                '%' | '_' | '\\' => vec!['\\', c],
+                c => vec![c],
+            })
+            .collect();
+        let pattern = format!("{esc}%");
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS doomed (id INTEGER PRIMARY KEY); DELETE FROM doomed;",
+        )?;
+        let accounts = tx.execute(
+            "INSERT INTO doomed (id) SELECT id FROM accounts WHERE name LIKE ?1 ESCAPE '\\'",
+            [&pattern],
+        )?;
+        let matches: usize = tx.query_row(
+            "SELECT COUNT(*) FROM matches WHERE ranked = 0
+               AND (p1 IN (SELECT id FROM doomed) OR p2 IN (SELECT id FROM doomed))",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+        if !dry_run {
+            tx.execute(
+                "DELETE FROM matches WHERE ranked = 0
+                   AND (p1 IN (SELECT id FROM doomed) OR p2 IN (SELECT id FROM doomed))",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM flags WHERE account IN (SELECT id FROM doomed)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM accounts WHERE id IN (SELECT id FROM doomed)",
+                [],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE doomed;")?;
+        tx.commit()?;
+        Ok((accounts, matches))
+    }
+
     /// Accounts seen within the last `secs` seconds.
     pub fn online_count(&self, secs: u64) -> DbResult<usize> {
         self.conn
@@ -1701,5 +1752,42 @@ mod tests {
         assert_eq!(s.season().unwrap().number, 2);
         let acc = s.by_id(a).unwrap().unwrap();
         assert_eq!((acc.rating, acc.wins), (1400, 0));
+    }
+
+    #[test]
+    fn accounts_are_deleted_by_name_prefix() {
+        let mut s = Store::open(None).unwrap();
+        let mut ids = Vec::new();
+        for name in [
+            "loadtest-a1",
+            "loadtest-b2",
+            "loadtester",
+            "PLAYER1",
+            "load_test-x",
+        ] {
+            let a = s.register().unwrap();
+            s.set_profile(a.id, Some(name.into()), None).unwrap();
+            ids.push(a.id);
+        }
+        s.new_match([ids[0], ids[1]], false, "{}").unwrap();
+        s.new_match([ids[0], ids[3]], false, "{}").unwrap();
+        let ranked = s.new_match([ids[1], ids[3]], true, "{}").unwrap();
+        assert_eq!(
+            s.delete_accounts_by_prefix("loadtest-", true).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(s.account_count().unwrap(), 5, "dry run");
+        assert_eq!(
+            s.delete_accounts_by_prefix("loadtest-", false).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(s.account_count().unwrap(), 3);
+        assert!(s.by_id(ids[2]).unwrap().is_some(), "no dash: kept");
+        assert!(s.by_id(ids[4]).unwrap().is_some(), "_ is not a wildcard");
+        assert!(s.match_players(ranked).unwrap().is_some(), "ranked kept");
+        assert_eq!(
+            s.delete_accounts_by_prefix("loadtest-", false).unwrap(),
+            (0, 0)
+        );
     }
 }

@@ -60,6 +60,9 @@
 //! `rugen-server --gen-key` prints a new signing key pair.
 //! `rugen-server --block <fp> [--reason text] | --unblock <fp> | --blocklist`
 //! edit / show this server's blocklist (works while the server runs).
+//! `rugen-server --delete-accounts <name prefix> [--yes]` deletes the
+//! accounts whose name starts with the prefix (e.g. `loadtest-`) and their
+//! unranked matches; without `--yes` it only counts them.
 
 #![forbid(unsafe_code)]
 
@@ -207,6 +210,7 @@ fn main() {
         println!(
             "rugen-server [--bind 0.0.0.0:8080] [--udp-bind 0.0.0.0:7001|off] [--data /data] [--name NAME] [--healthcheck] [--backup out.db]\n\
              rugen-server --gen-key | --block <fingerprint> [--reason text] | --unblock <fingerprint> | --blocklist\n\
+             rugen-server --delete-accounts <name prefix> [--yes]\n\
              env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
              \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
              \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS"
@@ -286,6 +290,33 @@ fn blocklist_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::E
     Ok(true)
 }
 
+/// `--delete-accounts <prefix> [--yes]`: remove accounts by name prefix
+/// (load-test leftovers) and exit. True when it ran.
+fn delete_accounts_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(i) = args.iter().position(|a| a == "--delete-accounts") else {
+        return Ok(false);
+    };
+    let prefix = args
+        .get(i + 1)
+        .filter(|p| !p.starts_with("--"))
+        .ok_or("--delete-accounts needs a name prefix")?;
+    // a short prefix would sweep real players
+    if prefix.chars().count() < 4 {
+        return Err("--delete-accounts: the prefix needs at least 4 characters".into());
+    }
+    let yes = args.iter().any(|a| a == "--yes");
+    let (accounts, matches) = store.delete_accounts_by_prefix(prefix, !yes)?;
+    if yes {
+        println!("deleted {accounts} accounts named {prefix}* and {matches} of their matches");
+    } else {
+        println!(
+            "{accounts} accounts named {prefix}* ({matches} unranked matches); run again with --yes to delete them"
+        );
+    }
+    Ok(true)
+}
+
 fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = store::Store::open(Some(&s.data))
         .map_err(|e| format!("database in {}: {e}", s.data.display()))?;
@@ -297,7 +328,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("backup written to {out}");
         return Ok(());
     }
-    if blocklist_cli(&mut store)? {
+    if blocklist_cli(&mut store)? || delete_accounts_cli(&mut store)? {
         return Ok(());
     }
     let (key, key_from) = truth::load_key(&s.data)?;
