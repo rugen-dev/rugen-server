@@ -82,6 +82,8 @@ struct Args {
     /// Measured uplink of this machine (bytes/s); 0 = no saturation rule.
     uplink: f64,
     work: PathBuf,
+    /// Local server process to sample (CPU %, RSS) into the results.
+    server_pid: Option<u32>,
 }
 
 const HELP: &str = "loadtest [--server URL] [--steps 5,20,50] [--hold 60] [--rate 11.5]
@@ -89,7 +91,7 @@ const HELP: &str = "loadtest [--server URL] [--steps 5,20,50] [--hold 60] [--rat
   [--upload-fraction 0.0 --upload-mb 50   (loopback servers only)]
   [--report] [--match-secs 0 (0 = until the test ends)] [--input-bytes 12]
   [--stop-rtt 250] [--stop-err 0.02] [--uplink-bps BYTES_PER_S] [--out FILE.json] [--timeline FILE.jsonl]
-  [--work DIR]";
+  [--work DIR] [--server-pid PID (local server: sample its CPU / RSS)]";
 
 fn args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -140,6 +142,7 @@ fn args() -> Args {
         work: get("--work")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("rugen-loadtest")),
+        server_pid: get("--server-pid").and_then(|x| x.parse().ok()),
     }
 }
 
@@ -293,6 +296,27 @@ fn cpu_secs() -> f64 {
     let t = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
     // fields 14 / 15 of stat; index 11 / 12 after the ')' split
     (t(11) + t(12)) / 100.0
+}
+
+/// CPU seconds (user + system) of another local process.
+fn proc_cpu_secs(pid: Option<u32>) -> f64 {
+    let Some(pid) = pid else { return 0.0 };
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let after = s.rsplit_once(')').map(|x| x.1).unwrap_or("");
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let t = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    (t(11) + t(12)) / 100.0
+}
+
+/// Resident memory of another local process, MB.
+fn proc_rss_mb(pid: Option<u32>) -> f64 {
+    let Some(pid) = pid else { return 0.0 };
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+        .map_or(0.0, |kb| kb / 1024.0)
 }
 
 // ---------------------------------------------------------------- context
@@ -1097,6 +1121,10 @@ struct StepResult {
     health_p95: Option<u32>,
     health_matches_max: u64,
     health_online_max: u64,
+    /// `--server-pid`: the server's CPU over the hold (100 = one core) and
+    /// its resident memory at the end of the hold.
+    server_cpu_pct: f64,
+    server_rss_mb: f64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1251,6 +1279,7 @@ async fn main() {
             let mut prev = ctx.ctr.snap();
             let mut prev_nic = nic();
             let mut prev_cpu = cpu_secs();
+            let mut prev_server_cpu = proc_cpu_secs(ctx.a.server_pid);
             let mut window: Vec<Vec<u64>> = Vec::new();
             let mut slow = 0;
             let mut full = 0;
@@ -1264,6 +1293,7 @@ async fn main() {
                 let now = ctx.ctr.snap();
                 let n = nic();
                 let cpu = cpu_secs();
+                let server_cpu = proc_cpu_secs(ctx.a.server_pid);
                 let d = |i: usize| now[i].saturating_sub(prev[i]);
                 let h = ctx.rtt_sec.take();
                 window.push(h.clone());
@@ -1301,6 +1331,8 @@ async fn main() {
                     "api_calls": d(c::API_CALLS), "api_errors": d(c::API_ERRORS),
                     "drops": d(c::RELAY_DROPS), "slow_sends": d(c::SLOW_SENDS),
                     "cpu_pct": (cpu - prev_cpu) * 100.0,
+                    "server_cpu_pct": (server_cpu - prev_server_cpu) * 100.0,
+                    "server_rss_mb": proc_rss_mb(ctx.a.server_pid),
                     "health": health,
                 });
                 eprintln!(
@@ -1378,6 +1410,7 @@ async fn main() {
                 prev = now;
                 prev_nic = n;
                 prev_cpu = cpu;
+                prev_server_cpu = server_cpu;
             }
         });
     }
@@ -1447,6 +1480,7 @@ async fn main() {
         let s0 = ctx.ctr.snap();
         let n0 = nic();
         let c0 = cpu_secs();
+        let sc0 = proc_cpu_secs(ctx.a.server_pid);
         let _ = ctx.rtt_step.take();
         let health_from = ctx.health.lock().unwrap().len();
         hold_flag.store(true, Relaxed);
@@ -1459,6 +1493,7 @@ async fn main() {
         let s1 = ctx.ctr.snap();
         let n1 = nic();
         let c1 = cpu_secs();
+        let sc1 = proc_cpu_secs(ctx.a.server_pid);
         let h = ctx.rtt_step.take();
         let d = |k: usize| s1[k].saturating_sub(s0[k]) as f64;
         let players = s1[c::PLAYERS].max(1);
@@ -1503,6 +1538,8 @@ async fn main() {
             relay_drops: s1[c::RELAY_DROPS] - base[c::RELAY_DROPS],
             peer_lost: s1[c::PEER_LOST] - base[c::PEER_LOST],
             client_cpu_pct: (c1 - c0) / secs * 100.0,
+            server_cpu_pct: (sc1 - sc0) / secs * 100.0,
+            server_rss_mb: proc_rss_mb(ctx.a.server_pid),
             ..Default::default()
         };
         r.nic_tx_per_player_s = r.nic_tx_bytes_s / players as f64;
@@ -1552,7 +1589,7 @@ async fn main() {
                 .unwrap_or(0);
         }
         eprintln!(
-            "== step {i} done: {} matches, rtt p50/p95/p99 {:?}/{:?}/{:?} ms, loss {:.4}, api p95 {:?} ms, up {:.0} B/s/player (app), nic tx {:.0} B/s/player",
+            "== step {i} done: {} matches, rtt p50/p95/p99 {:?}/{:?}/{:?} ms, loss {:.4}, api p95 {:?} ms, up {:.0} B/s/player (app), nic tx {:.0} B/s/player, server cpu {:.0}% rss {:.0} MB",
             r.matches,
             r.rtt_p50,
             r.rtt_p95,
@@ -1560,7 +1597,9 @@ async fn main() {
             r.input_loss,
             r.api_p95,
             r.app_up_bytes_per_player_s,
-            r.nic_tx_per_player_s
+            r.nic_tx_per_player_s,
+            r.server_cpu_pct,
+            r.server_rss_mb
         );
         results.push(r);
         if let Some(why) = ctx.aborted() {
