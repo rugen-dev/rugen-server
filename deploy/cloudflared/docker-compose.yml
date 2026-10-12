@@ -1,0 +1,25 @@
+# Optional add-on: Cloudflare Tunnel in front of rugen-server.
+# Deploy it as a second, separate Compose app after deploy/docker-compose.yml
+# (it joins that stack's "rugen" network).
+#
+#   CF_TUNNEL_TOKEN=... docker compose up -d
+#
+# Zero Trust dashboard > Networks > Tunnels > Create a tunnel (cloudflared),
+# public hostname -> service HTTP, URL rugen-server:8080. The tunnel carries
+# HTTP/WebSocket only: keep 7001/udp published by the main stack (clients
+# fall back to the WebSocket relay through the tunnel when UDP is blocked).
+
+name: rugen-tunnel
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.0
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - rugen
+
+networks:
+  rugen:
+    name: rugen
+    external: true

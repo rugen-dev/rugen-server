@@ -1,12 +1,11 @@
-# rugen-server + Cloudflare Tunnel. Works as a Dokploy "Compose" app.
-# See deploy/README.md. Variables come from .env (Dokploy: Environment tab).
+# rugen-server: lobby, accounts, rooms, ranked and the match relay.
+# Works as a Dokploy "Compose" app. See deploy/README.md.
 #
-#   cp .env.example .env   # fill CF_TUNNEL_TOKEN, RUGEN_PUBLIC_URL, ...
-#   docker compose up -d
+#   docker compose up -d        # optional: cp .env.example .env first
 #
-# Lobby / accounts / WebSocket relay go through the tunnel (HTTPS).
-# Match traffic prefers UDP 7001, published directly (a tunnel cannot carry
-# UDP); without it clients fall back to the WebSocket relay automatically.
+# Exposes 8080/tcp (HTTP + WebSocket) and 7001/udp (match relay fast path).
+# Put HTTPS in front however you like: a reverse proxy, Dokploy's domains,
+# or the optional Cloudflare Tunnel in deploy/cloudflared/.
 
 name: rugen
 
@@ -17,20 +16,21 @@ services:
     # build:
     #   context: ..
     #   dockerfile: deploy/Dockerfile
+    container_name: rugen-server
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       RUGEN_BIND: 0.0.0.0:8080
-      RUGEN_UDP_BIND: 0.0.0.0:7001
+      RUGEN_UDP_BIND: ${RUGEN_UDP_BIND:-0.0.0.0:7001}
       RUGEN_DATA: /data
     volumes:
       - rugen-data:/data
     ports:
-      # UDP relay fast path: open 7001/udp in the host / VPS firewall too
-      - "7001:7001/udp"
-      # only when serving without the tunnel (plain HTTP on the host):
-      # - "8080:8080"
+      - "${RUGEN_HTTP_PORT:-8080}:8080"
+      # match relay fast path: open it in the host / VPS firewall too
+      - "${RUGEN_UDP_PORT:-7001}:7001/udp"
     healthcheck:
       test: ["CMD", "/rugen-server", "--healthcheck"]
       interval: 30s
@@ -45,18 +45,10 @@ services:
     cap_drop:
       - ALL
 
-  cloudflared:
-    image: cloudflare/cloudflared:2026.10.0
-    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
-    restart: unless-stopped
-    depends_on:
-      rugen-server:
-        condition: service_healthy
-    networks:
-      - rugen
-
 networks:
-  rugen: {}
+  # fixed name so optional add-ons (deploy/cloudflared) can join it
+  rugen:
+    name: rugen
 
 volumes:
   rugen-data: {}

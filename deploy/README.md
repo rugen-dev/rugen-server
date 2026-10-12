@@ -12,56 +12,51 @@ gives rugen players a place to meet:
   so players never learn each other's IP address
 - ranked result verification and stored ranked replays
 
-This folder runs it with Docker Compose next to a Cloudflare Tunnel, which
-is exactly what a Dokploy "Compose" app wants.
+`deploy/docker-compose.yml` runs only `rugen-server` and publishes its two
+ports. HTTPS in front is your choice: Dokploy's domains (Traefik), any
+reverse proxy, or the optional Cloudflare Tunnel add-on in
+`deploy/cloudflared/` (a separate compose).
 
-```
-                 HTTPS (lobby, /ws presence, /relay WebSocket)
- players ──► Cloudflare edge ──► cloudflared ──► rugen-server:8080
-    │                                                 ▲
-    └──────────── UDP 7001 (match relay fast path) ───┘  (published port)
-```
+| Port      | What                                              | Notes |
+|-----------|---------------------------------------------------|-------|
+| 8080/tcp  | HTTP API, `/ws` lobby presence, `/relay` fallback | put HTTPS in front |
+| 7001/udp  | match relay, fast path                            | open it in the firewall |
 
-| Port      | What                                              | Through the tunnel? |
-|-----------|---------------------------------------------------|---------------------|
-| 8080/tcp  | HTTP API, `/ws` lobby presence, `/relay` fallback | yes (keep it private) |
-| 7001/udp  | match relay, fast path                            | **no**: publish it   |
+Without 7001/udp reachable, clients fall back to the WebSocket relay on
+8080 after a 1.5 s UDP probe (works everywhere, a bit slower). Host ports
+can be changed with `RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
 
-The tunnel only carries HTTP/WebSocket. Opening 7001/udp gives the lowest
-latency; without it every client automatically falls back to the WebSocket
-relay through the tunnel after a 1.5 s UDP probe (works everywhere, a bit
-slower).
-
-## 1. Cloudflare Tunnel
-
-1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a
-   tunnel** → *Cloudflared* → name it `rugen`.
-2. On the "Install connector" page pick *Docker* and copy the token after
-   `--token` (a long `eyJ...` string). That is `CF_TUNNEL_TOKEN`.
-3. **Public hostname** tab → add `rugen.example.com` → service type `HTTP`,
-   URL `rugen-server:8080` (the compose service name; both containers share
-   the `rugen` network). WebSockets are on by default.
-4. Optional, for the UDP fast path: add a **DNS-only** (grey cloud) `A`
-   record, e.g. `udp.example.com` → your server's public IP, and set
-   `RUGEN_UDP_PUBLIC=udp.example.com:7001`. (A proxied, orange-cloud name
-   cannot carry UDP.)
-
-## 2. Dokploy
+## 1. Dokploy
 
 1. **Create Project → Create Service → Compose**. Source: this Git
    repository, compose path `deploy/docker-compose.yml` (or paste the file
    in the *Raw* editor).
-2. **Environment** tab: paste `deploy/.env.example` and fill in at least
-   `CF_TUNNEL_TOKEN` and `RUGEN_PUBLIC_URL`. Dokploy writes them to `.env`
-   next to the compose file, which `env_file: .env` reads.
-3. No domain needs to be configured in Dokploy (the tunnel is the ingress).
-   If you prefer Dokploy's Traefik instead of the tunnel, remove the
-   `cloudflared` service and add a domain pointing at `rugen-server:8080`.
-4. Open **7001/udp** in the VPS firewall / security group (the compose file
-   already publishes it).
-5. **Deploy**. Logs should show `http + websocket on 0.0.0.0:8080` and
+2. **Environment** tab (optional): paste `deploy/.env.example` and set
+   `RUGEN_PUBLIC_URL`, `RUGEN_NAME`, `RUGEN_MOTD`. Dokploy writes `.env` next
+   to the compose file; without it the defaults are used.
+3. **Domains** tab: add `rugen.example.com` → service `rugen-server`, port
+   `8080`, HTTPS on (WebSocket upgrades pass through Traefik). Skip this if
+   you use the Cloudflare Tunnel add-on instead.
+4. Open **7001/udp** in the VPS firewall / security group.
+5. **Deploy**. Logs show `http + websocket on 0.0.0.0:8080` and
    `udp relay advertised as ...`; `https://rugen.example.com/health` answers
    with the server name, version and players online.
+
+## 2. Optional: Cloudflare Tunnel (separate compose)
+
+1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a
+   tunnel** → *Cloudflared*. Copy the token after `--token` (`eyJ...`).
+2. **Public hostname**: `rugen.example.com` → service `HTTP`, URL
+   `rugen-server:8080`.
+3. In Dokploy create a **second** Compose service with compose path
+   `deploy/cloudflared/docker-compose.yml`, set `CF_TUNNEL_TOKEN` in its
+   Environment tab and deploy it after the server (it joins the server's
+   `rugen` network; no ports needed).
+4. For the UDP fast path add a **DNS-only** (grey cloud) record such as
+   `udp.example.com` → the server's public IP and set
+   `RUGEN_UDP_PUBLIC=udp.example.com:7001` on the server (a proxied name
+   cannot carry UDP). With the tunnel you may also drop the `8080` port
+   mapping from the server compose.
 
 The image is pulled from `ghcr.io/diary-axel-rakotoarivao/rugen-server:latest`
 (published by `.github/workflows/server-image.yml` on `v*` tags). To build
@@ -98,7 +93,6 @@ purpose.
 
 | Variable           | Default            | Meaning |
 |--------------------|--------------------|---------|
-| `CF_TUNNEL_TOKEN`  | –                  | cloudflared connector token (compose only) |
 | `RUGEN_PUBLIC_URL` | –                  | public https URL; logged, and its host is the UDP fallback host |
 | `RUGEN_NAME`       | `rugen server`     | name in the server list |
 | `RUGEN_MOTD`       | empty              | message of the day |
@@ -108,6 +102,9 @@ purpose.
 | `RUGEN_DATA`       | `/data`            | directory of `rugen.db` |
 | `RUST_LOG`         | `info`             | `error` … `debug` |
 | `RUGEN_IMAGE`      | GHCR `latest`      | image tag used by the compose file |
+| `RUGEN_HTTP_PORT`  | `8080`             | host port for HTTP (compose only) |
+| `RUGEN_UDP_PORT`   | `7001`             | host port for the UDP relay (compose only) |
+| `CF_TUNNEL_TOKEN`  | –                  | tunnel token, `deploy/cloudflared/` only |
 
 ## Backups
 
@@ -139,12 +136,12 @@ docker compose pull && docker compose up -d
 Releases: pushing a `v*` tag builds and pushes the image (amd64; run the
 workflow manually with *arm64* ticked for ARM servers).
 
-## Without Cloudflare
+## Without a proxy
 
-Delete the `cloudflared` service, publish `8080:8080` as well, and give
-players `http://your-ip:8080` (or put any reverse proxy with TLS in front;
-it must pass WebSocket upgrades for `/ws` and `/relay`). Set
-`RUGEN_UDP_PUBLIC=your-ip:7001`.
+The compose already publishes 8080 and 7001/udp: give players
+`http://your-ip:8080` and set `RUGEN_UDP_PUBLIC=your-ip:7001`. Any reverse
+proxy with TLS works too; it must pass WebSocket upgrades for `/ws` and
+`/relay`.
 
 ## Security notes
 
