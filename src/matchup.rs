@@ -17,10 +17,11 @@ use std::time::Instant;
 use rugen_fair::verdict::{Thresholds, verdict};
 use rugen_proto::{
     CharRating, FairnessProfile, FighterCard, FighterDecl, MatchupView, ReadyReport, Rules,
-    Verdict, VerdictKind,
+    SignedBlob, TRUST_VERSION, Verdict, VerdictKind, VerdictStatement,
 };
 
 use crate::store::{PackageRow, Store};
+use crate::truth::Truth;
 
 /// Accounts by relay slot and their tokens once the match runs.
 #[derive(Clone, Debug)]
@@ -43,6 +44,8 @@ pub struct Matchup {
     pub picks: [Option<FighterDecl>; 2],
     pub stage: Option<FighterDecl>,
     pub verdict: Option<Verdict>,
+    /// The verdict signed by this server ([`VerdictStatement`]).
+    pub signed: Option<SignedBlob>,
     pub accepted: [bool; 2],
     pub ready: [Option<ReadyReport>; 2],
     pub failed: Option<String>,
@@ -70,6 +73,7 @@ impl Matchup {
             picks: [None, None],
             stage: None,
             verdict: None,
+            signed: None,
             accepted: [false, false],
             ready: [None, None],
             failed: None,
@@ -179,14 +183,18 @@ impl Matchup {
         Some(p)
     }
 
-    pub fn recompute_verdict(&mut self, store: &Store, t: &Thresholds) {
+    /// Judge the matchup: fairness profiles and community ratings
+    /// ([`verdict`]), then the blocklists (this server's and the official
+    /// feed); the result is signed with the server's key.
+    pub fn recompute_verdict(&mut self, store: &Store, t: &Thresholds, truth: &Truth) {
         let (Some(a), Some(b)) = (self.profile(0, store), self.profile(1, store)) else {
             self.verdict = None;
+            self.signed = None;
             return;
         };
         let rating = |i: usize| {
             self.fighter(i)
-                .and_then(|d| store.char_rating(&d.fingerprint).ok().flatten())
+                .and_then(|d| truth.rating(store, &d.fingerprint))
         };
         let (ra, rb) = (rating(0), rating(1));
         let name = |i: usize| {
@@ -195,10 +203,53 @@ impl Matchup {
                 .unwrap_or_default()
         };
         let (na, nb) = (name(0), name(1));
-        let v = verdict([&a, &b], [ra.as_ref(), rb.as_ref()], [&na, &nb], t);
+        let mut v = verdict([&a, &b], [ra.as_ref(), rb.as_ref()], [&na, &nb], t);
+        let mut blocked = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, n) in [(0, &na), (1, &nb)] {
+            if let Some(d) = self.fighter(i)
+                && !seen.contains(&d.fingerprint.as_str())
+            {
+                seen.push(&d.fingerprint);
+                if let Some(why) = truth.block_reason(store, &d.fingerprint) {
+                    blocked.push(format!("{n}: {why}"));
+                }
+            }
+        }
+        if let Some(st) = &self.stage
+            && let Some(why) = truth.block_reason(store, &st.fingerprint)
+        {
+            blocked.push(format!("STAGE {}: {why}", st.name.to_uppercase()));
+        }
+        if !blocked.is_empty() {
+            if v.kind == VerdictKind::Blocked {
+                blocked.extend(v.reasons);
+            }
+            v = Verdict {
+                kind: VerdictKind::Blocked,
+                reasons: blocked,
+                ratio: v.ratio,
+            };
+        }
         if self.verdict.as_ref() != Some(&v) {
             self.accepted = [false, false];
         }
+        let mut fingerprints: Vec<String> = (0..2)
+            .filter_map(|i| self.fighter(i).map(|d| d.fingerprint.clone()))
+            .collect();
+        fingerprints.extend(self.stage.as_ref().map(|s| s.fingerprint.clone()));
+        self.signed = truth.sign(
+            rugen_proto::purpose::VERDICT,
+            &VerdictStatement {
+                v: TRUST_VERSION,
+                match_id: self.id,
+                ranked: self.ranked,
+                fingerprints,
+                verdict: v.kind,
+                reasons: v.reasons.clone(),
+                issued_at: rugen_fair::trust::now(),
+            },
+        );
         self.verdict = Some(v);
     }
 
@@ -307,6 +358,7 @@ impl Matchup {
             error: self.failed.clone().unwrap_or_default(),
             mirror: self.mirror,
             ticket,
+            signed: self.verdict.as_ref().and(self.signed.clone()),
         }
     }
 }

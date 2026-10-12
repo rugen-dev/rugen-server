@@ -26,11 +26,28 @@
 //! RUGEN_FAIR_MIN_GAMES          games before a rating counts       10
 //! RUGEN_RESIM_DATA              engine data/ for re-simulation (--features resim)
 //! RUGEN_RESIM_MOTIF             motif for re-simulation            RUGEN_RESIM_DATA
+//!
+//! official server / truth feed (see `truth`)
+//! RUGEN_SIGNING_KEY             this server's Ed25519 seed (hex)   <data>/signing.key (generated)
+//! RUGEN_SIGNING_KEY_FILE        file holding the seed instead
+//! RUGEN_OFFICIAL_KEY            public key that is official        baked into the build
+//! RUGEN_OFFICIAL_URL            official feed source, "off"        baked official address
+//! RUGEN_OFFICIAL_PULL           seconds between feed pulls         900
+//! RUGEN_ADMIN_TOKEN             enables POST /v1/admin/*           (off)
+//! RUGEN_AUTO_BLOCK_LIARS        players lying about a fingerprint  3 (0 = off)
+//! RUGEN_AUTO_BLOCK_DESYNCS      desynced matches of a fingerprint  10 (0 = off)
+//! RUGEN_AUTO_BLOCK_ANALYSIS     block on server-side cheat flags   on
 //! ```
+//!
+//! A server is **official** when its signing key is the official key;
+//! otherwise it is a community server that enforces the official feed.
 //!
 //! `rugen-server --backup out.db` writes a consistent copy of the database.
 //! `rugen-server --healthcheck` probes `GET /health` on the bind port and
 //! exits 0 / 1 (container health checks without curl).
+//! `rugen-server --gen-key` prints a new signing key pair.
+//! `rugen-server --block <fp> [--reason text] | --unblock <fp> | --blocklist`
+//! edit / show this server's blocklist (works while the server runs).
 
 #![forbid(unsafe_code)]
 
@@ -49,6 +66,7 @@ mod resim;
 mod store;
 #[cfg(test)]
 mod testkit;
+mod truth;
 mod udp;
 
 use std::io::{Read, Write};
@@ -172,8 +190,15 @@ fn main() {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
             "rugen-server [--bind 0.0.0.0:8080] [--udp-bind 0.0.0.0:7001|off] [--data /data] [--name NAME] [--healthcheck] [--backup out.db]\n\
-             env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG"
+             rugen-server --gen-key | --block <fingerprint> [--reason text] | --unblock <fingerprint> | --blocklist\n\
+             env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
+             \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
+             \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS"
         );
+        return;
+    }
+    if std::env::args().any(|a| a == "--gen-key") {
+        gen_key();
         return;
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -183,8 +208,70 @@ fn main() {
     }
 }
 
+/// `--gen-key`: a fresh key pair and where each half goes.
+fn gen_key() {
+    match rugen_fair::trust::SigningKey::generate() {
+        Ok(k) => println!(
+            "# private: the official server only (secret env / file, never commit)\n\
+             RUGEN_SIGNING_KEY={}\n\
+             # public: bake into game builds and pass to community servers if needed\n\
+             RUGEN_OFFICIAL_KEY={}\n\
+             # key fingerprint shown in game: {}",
+            k.seed_hex(),
+            k.public().hex(),
+            k.public().fingerprint()
+        ),
+        Err(e) => {
+            eprintln!("--gen-key: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `--block` / `--unblock` / `--blocklist`: edit the blocklist and exit.
+/// True when one of them ran.
+fn blocklist_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
+    let fp_of = |v: Option<String>, flag: &str| -> Result<String, String> {
+        let fp = v
+            .ok_or(format!("{flag} needs a fingerprint"))?
+            .to_ascii_lowercase();
+        if rugen_proto::is_fingerprint(&fp) {
+            Ok(fp)
+        } else {
+            Err(format!("{flag}: a fingerprint is 64 hex digits"))
+        }
+    };
+    if args.iter().any(|a| a == "--block") {
+        let fp = fp_of(arg("--block"), "--block")?;
+        let reason = arg("--reason").unwrap_or_else(|| "blocked by the operator".into());
+        store.block(&fp, &reason, "admin")?;
+        println!("blocked {fp} ({reason})");
+    } else if args.iter().any(|a| a == "--unblock") {
+        let fp = fp_of(arg("--unblock"), "--unblock")?;
+        let was = store.unblock(&fp)?;
+        println!(
+            "{} {fp}",
+            if was { "unblocked" } else { "was not blocked:" }
+        );
+    } else if !args.iter().any(|a| a == "--blocklist") {
+        return Ok(false);
+    }
+    let list = store.blocklist()?;
+    println!("blocklist #{}: {} entries", store.truth_seq()?, list.len());
+    for b in list {
+        println!("  {}  {:<5}  {}", b.fingerprint, b.source, b.reason);
+    }
+    Ok(true)
+}
+
 fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
-    let store = store::Store::open(Some(&s.data))
+    let mut store = store::Store::open(Some(&s.data))
         .map_err(|e| format!("database in {}: {e}", s.data.display()))?;
     if let Some(i) = std::env::args().position(|a| a == "--backup") {
         let out = std::env::args()
@@ -193,6 +280,32 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         store.backup_to(std::path::Path::new(&out))?;
         log::info!("backup written to {out}");
         return Ok(());
+    }
+    if blocklist_cli(&mut store)? {
+        return Ok(());
+    }
+    let (key, key_from) = truth::load_key(&s.data)?;
+    let truth_cfg = truth::TruthConfig::from_env(Some(key))?;
+    let public = truth_cfg.key.as_ref().map(|k| k.public());
+    if truth_cfg.is_official() {
+        log::info!(
+            "OFFICIAL server: signing key {} from {key_from}",
+            public.map(|k| k.fingerprint()).unwrap_or_default()
+        );
+    } else {
+        log::info!(
+            "community server: signing key {} from {key_from}; official feed from {}",
+            public.map(|k| k.fingerprint()).unwrap_or_default(),
+            truth_cfg.official_url.as_deref().unwrap_or("nowhere (off)")
+        );
+    }
+    if public.is_some_and(|k| k.hex() == rugen_fair::trust::DEV_PUBLIC_KEY) {
+        log::warn!(
+            "signing with the PUBLIC development key: anybody can forge this server's signatures (local testing only)"
+        );
+    }
+    if truth_cfg.admin_token.is_some() {
+        log::info!("admin api enabled (/v1/admin/*)");
     }
     log::info!(
         "schema v{}, {} accounts, {}, data in {}",
@@ -236,6 +349,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         pkg,
         thresholds,
         resim,
+        truth: truth_cfg,
     };
     if let Some(bind) = &s.udp_bind {
         let socket = Arc::new(
@@ -284,6 +398,28 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = tokio::task::spawn_blocking(move || a.sweep_packages()).await;
             }
         });
+        // community servers: keep the official feed fresh
+        if api.truth.cfg.official_url.is_some() {
+            let puller = api.clone();
+            let every = Duration::from_secs(api.truth.cfg.pull_secs);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                loop {
+                    tick.tick().await;
+                    let a = puller.clone();
+                    match tokio::task::spawn_blocking(move || a.pull_official()).await {
+                        Ok(Ok(f)) => log::info!(
+                            "official feed #{}: {} blocked, {} ratings",
+                            f.sequence,
+                            f.blocked.len(),
+                            f.ratings.len()
+                        ),
+                        Ok(Err(e)) => log::warn!("official feed: {e}"),
+                        Err(e) => log::error!("official feed task: {e}"),
+                    }
+                }
+            });
+        }
         http::serve(listener, api, shutdown_signal()).await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })

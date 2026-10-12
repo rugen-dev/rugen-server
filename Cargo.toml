@@ -25,6 +25,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
 argon2 = "0.5"
+# pulls the official truth feed over HTTPS (ring + bundled webpki roots: no
+# system certificates needed on the scratch image)
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [features]
 # re-simulate disputed ranked matches from stored packages (needs RUGEN_RESIM_DATA)

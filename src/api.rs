@@ -34,6 +34,15 @@
 //! GET  /pkg/{fp}/data?key=&offset=&len=       raw bytes, resumable
 //! GET  /char/{fp}               community rating of a character fingerprint
 //! POST /match/{id}/desync       {key, frame}    a client saw a desync
+//! GET  /match/{id}/result?key=  ResultAck (signed once settled)
+//!
+//! official server, truth feed, moderation (see crate::truth)
+//! GET  /v1/truth                this server's blocklist + ratings, signed
+//! GET  /v1/truth/official       the verified official feed this server holds
+//! GET  /v1/identity?nonce=      IdentityStatement signed (proves the key)
+//! POST /v1/admin/block          {token, fingerprint, reason}   RUGEN_ADMIN_TOKEN
+//! POST /v1/admin/unblock        {token, fingerprint}
+//! GET  /v1/admin/blocklist?token=
 //! ```
 //!
 //! Privacy: requests carry no client address at all (the HTTP layer keeps
@@ -62,6 +71,7 @@ use crate::password;
 use crate::relay::Relay;
 use crate::resim::ResimConfig;
 use crate::store::{Account, DbResult, ReportData, Store, random_code, setup_fingerprints};
+use crate::truth::{Truth, TruthConfig};
 
 pub struct Request {
     pub method: String,
@@ -160,6 +170,8 @@ pub struct ApiConfig {
     pub pkg: PkgConfig,
     pub thresholds: Thresholds,
     pub resim: Option<ResimConfig>,
+    /// Signing key, official key, feed source, admin token, auto-block rules.
+    pub truth: TruthConfig,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -181,6 +193,8 @@ pub struct Api {
     pub packages: Packages,
     /// Upload bytes per account in the current hour.
     upload_budget: Mutex<HashMap<u64, (Instant, u64)>>,
+    /// Signatures, official feed, blocklist rules.
+    pub truth: Truth,
     me: Weak<Api>,
     cfg: ApiConfig,
 }
@@ -265,7 +279,12 @@ fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
 }
 
 impl Api {
-    pub fn new(store: Store, cfg: ApiConfig, relay: Arc<Mutex<Relay>>) -> Arc<Self> {
+    pub fn new(store: Store, mut cfg: ApiConfig, relay: Arc<Mutex<Relay>>) -> Arc<Self> {
+        let truth = Truth::new(
+            std::mem::take(&mut cfg.truth),
+            &cfg.name,
+            cfg.data.as_deref(),
+        );
         let packages = Packages::open(cfg.data.as_deref(), cfg.pkg.clone())
             .or_else(|e| {
                 log::error!("packages directory: {e}; using a temporary one");
@@ -282,6 +301,7 @@ impl Api {
             matchups: Mutex::new(HashMap::new()),
             packages,
             upload_budget: Mutex::new(HashMap::new()),
+            truth,
             me: me.clone(),
             cfg,
         })
@@ -339,6 +359,8 @@ impl Api {
             rooms,
             matches: lock(&self.relay).session_count(),
             udp: self.cfg.udp_public.clone(),
+            key: self.truth.public_key().map(|k| k.hex()),
+            official: self.truth.is_official(),
         })
     }
 
@@ -413,6 +435,30 @@ impl Api {
                 ok(&r)
             }
             ("POST", ["match", id, "desync"]) => self.desync(&req, &v, id),
+            ("GET", ["match", id, "result"]) => {
+                let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
+                let mut s = lock(&self.store);
+                let me = self.auth(&mut s, &req, &v)?.id;
+                ok(&self.result_ack(&s, id, me)?)
+            }
+            ("GET", ["v1", "truth"]) => {
+                let s = lock(&self.store);
+                match db(self.truth.own_feed(&s))? {
+                    Some(b) => ok(&b),
+                    None => Err(err(404, "this server does not sign")),
+                }
+            }
+            ("GET", ["v1", "truth", "official"]) => {
+                let blob = if self.truth.is_official() {
+                    db(self.truth.own_feed(&lock(&self.store)))?
+                } else {
+                    self.truth.official_blob()
+                };
+                blob.map_or_else(|| Err(err(404, "no official feed held")), |b| ok(&b))
+            }
+            ("GET", ["v1", "identity"]) => self.identity(&req),
+            ("POST", ["v1", "admin", op]) => self.admin(&req, &v, op),
+            ("GET", ["v1", "admin", "blocklist"]) => self.admin(&req, &v, "blocklist"),
             _ => Err(err(404, "no such route")),
         }
     }
@@ -973,12 +1019,184 @@ impl Api {
             Some(_) => db(s.by_id(me))?.map(|a| a.rating),
             None => None,
         };
+        let signed = match out.delta {
+            Some(_) => self.result_ack(&s, match_id, me)?.signed,
+            None => None,
+        };
         ok(&ResultAck {
             accepted: true,
             rating,
             delta: out.delta,
             disputed: out.disputed,
+            signed,
         })
+    }
+
+    /// A match's outcome for `me`, signed once settled (`GET /match/{id}/result`).
+    fn result_ack(&self, s: &Store, match_id: u64, me: u64) -> Result<ResultAck, Response> {
+        let (ranked, players, winner, delta, disputed) =
+            db(s.match_result(match_id, me))?.ok_or_else(|| err(404, "not your match"))?;
+        let Some(winner) = winner else {
+            return Ok(ResultAck {
+                accepted: true,
+                rating: None,
+                delta: None,
+                disputed,
+                signed: None,
+            });
+        };
+        let rating = if ranked {
+            db(s.by_id(me))?.map(|a| a.rating)
+        } else {
+            None
+        };
+        let signed = self.truth.sign(
+            rugen_proto::purpose::RESULT,
+            &rugen_proto::ResultStatement {
+                v: rugen_proto::TRUST_VERSION,
+                match_id,
+                ranked,
+                account: me,
+                players,
+                winner,
+                rating,
+                delta: ranked.then_some(delta),
+                season: db(s.season())?.number,
+                issued_at: rugen_fair::trust::now(),
+            },
+        );
+        Ok(ResultAck {
+            accepted: true,
+            rating,
+            delta: Some(delta),
+            disputed,
+            signed,
+        })
+    }
+
+    // ---- official server: identity, admin
+
+    /// `GET /v1/identity?nonce=`: sign the caller's challenge.
+    fn identity(&self, req: &Request) -> Res {
+        let nonce = req.query.get("nonce").cloned().unwrap_or_default();
+        if !(16..=128).contains(&nonce.len()) || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(err(400, "nonce: 16 to 128 hex digits"));
+        }
+        let st = rugen_proto::IdentityStatement {
+            v: rugen_proto::TRUST_VERSION,
+            nonce,
+            name: self.cfg.name.clone(),
+            official: self.truth.is_official(),
+            issued_at: rugen_fair::trust::now(),
+        };
+        match self.truth.sign(rugen_proto::purpose::IDENTITY, &st) {
+            Some(b) => ok(&b),
+            None => Err(err(404, "this server does not sign")),
+        }
+    }
+
+    /// Admin API (`RUGEN_ADMIN_TOKEN`): block / unblock / list fingerprints.
+    fn admin(&self, req: &Request, v: &Value, op: &str) -> Res {
+        if self.truth.cfg.admin_token.is_none() {
+            return Err(err(404, "admin api disabled (set RUGEN_ADMIN_TOKEN)"));
+        }
+        let token = v
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| req.query.get("token").cloned())
+            .unwrap_or_default();
+        if !self.truth.admin_ok(&token) {
+            return Err(err(403, "bad admin token"));
+        }
+        let fp = || -> Result<String, Response> {
+            let fp = v
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if is_fingerprint(&fp) {
+                Ok(fp)
+            } else {
+                Err(err(400, "fingerprint: 64 hex digits"))
+            }
+        };
+        let mut s = lock(&self.store);
+        let changed = match op {
+            "block" => {
+                let fp = fp()?;
+                let reason =
+                    str_field(v, "reason", 200).unwrap_or_else(|| "blocked by the operator".into());
+                db(s.block(&fp, &reason, "admin"))?;
+                log::warn!("admin: blocked {} ({reason})", rugen_fair::short(&fp));
+                true
+            }
+            "unblock" => {
+                let fp = fp()?;
+                let was = db(s.unblock(&fp))?;
+                log::warn!("admin: unblocked {}", rugen_fair::short(&fp));
+                was
+            }
+            "blocklist" => false,
+            _ => return Err(err(404, "no such admin action")),
+        };
+        if changed {
+            self.refresh_verdicts(&s);
+        }
+        let official = self.truth.official_feed();
+        ok(&json!({
+            "official": self.truth.is_official(),
+            "key": self.truth.public_key().map(|k| k.hex()),
+            "sequence": db(s.truth_seq())?,
+            "blocked": db(s.blocklist())?,
+            "official_feed": official.map(|f| json!({
+                "sequence": f.sequence, "issued_at": f.issued_at, "blocked": f.blocked.len(),
+            })),
+        }))
+    }
+
+    /// Re-judge every matchup still being decided (the blocklist or the
+    /// official feed changed) and push the new views.
+    pub fn refresh_verdicts(&self, s: &Store) {
+        let mut ms = lock(&self.matchups);
+        for m in ms.values_mut() {
+            if m.failed.is_none() && m.started.is_none() && m.verdict.is_some() {
+                let before = m.verdict.clone();
+                m.recompute_verdict(s, &self.cfg.thresholds, &self.truth);
+                if m.verdict != before {
+                    self.push_matchup(s, m);
+                }
+            }
+        }
+    }
+
+    /// Pull the official feed now (community servers), then re-judge.
+    pub fn pull_official(&self) -> Result<rugen_proto::TruthFeed, String> {
+        let f = self.truth.pull_official()?;
+        let s = lock(&self.store);
+        self.refresh_verdicts(&s);
+        Ok(f)
+    }
+
+    /// Automatic blocklist rules after a flagged lie / desync / analysis.
+    fn auto_block(&self, s: &mut Store, fp: &str, cause: AutoCause) -> Result<(), Response> {
+        let rules = &self.truth.cfg.auto;
+        let reason = match cause {
+            AutoCause::Liar if rules.liars > 0 => {
+                let n = db(s.liars_for(fp))?;
+                (n >= rules.liars).then(|| format!("auto: {n} players declared a false profile"))
+            }
+            AutoCause::Desync if rules.desyncs > 0 => {
+                let n = db(s.desyncs_for(fp))?;
+                (n >= rules.desyncs).then(|| format!("auto: desynced in {n} matches"))
+            }
+            AutoCause::Analysis(detail) if rules.analysis => Some(format!("auto: {detail}")),
+            _ => None,
+        };
+        if let Some(r) = reason {
+            db(s.auto_block(fp, &r))?;
+        }
+        Ok(())
     }
 
     fn replay(&self, id: &str) -> Res {
@@ -1014,6 +1232,13 @@ impl Api {
 }
 
 // ---- matchup phase, packages, desync, re-simulation
+
+/// What may put a fingerprint on the blocklist automatically.
+enum AutoCause<'a> {
+    Liar,
+    Desync,
+    Analysis(&'a str),
+}
 
 /// The profile as declared by a client, for a "did it lie" comparison.
 fn comparable(p: &rugen_proto::FairnessProfile) -> rugen_proto::FairnessProfile {
@@ -1140,7 +1365,8 @@ impl Api {
                     {
                         let why =
                             format!("P{}'s fighter profile does not match its files", side + 1);
-                        db(s.flag(me.id, Some(id), &why))?;
+                        db(s.flag(me.id, Some(id), &why, Some(&d.fingerprint)))?;
+                        self.auto_block(&mut s, &d.fingerprint, AutoCause::Liar)?;
                         m.fail(why);
                         self.push_matchup(&s, m);
                         return ok(&self.matchup_view(&s, m, me.id));
@@ -1156,7 +1382,7 @@ impl Api {
                 let refs: Vec<&str> = fps.iter().map(String::as_str).collect();
                 db(s.touch_packages(&refs))?;
                 m.reset_progress();
-                m.recompute_verdict(&s, &self.cfg.thresholds);
+                m.recompute_verdict(&s, &self.cfg.thresholds, &self.truth);
             }
             "accept" => {
                 let unbalanced = v
@@ -1381,6 +1607,15 @@ impl Api {
         let failure = match &verified {
             Verified::Stored(row) => {
                 db(s.put_package(row))?;
+                // the server's own analysis finds a block-level cheat
+                if let Some(f) = row.profile.as_ref().and_then(|p| {
+                    p.flags
+                        .iter()
+                        .find(|f| f.severity == rugen_proto::Severity::Block)
+                }) {
+                    let detail = format!("{}: {}", f.code, f.detail);
+                    self.auto_block(&mut s, fp, AutoCause::Analysis(&detail))?;
+                }
                 log::info!(
                     "package {} stored ({} KB, {})",
                     rugen_fair::short(fp),
@@ -1406,7 +1641,7 @@ impl Api {
                 if m.side_of(uploader)
                     .is_some_and(|side| m.declarers(fp).contains(&side))
                 {
-                    db(s.flag(uploader, Some(m.id), why))?;
+                    db(s.flag(uploader, Some(m.id), why, None))?;
                     m.fail(why.clone());
                     touched.push(m.id);
                 }
@@ -1424,12 +1659,13 @@ impl Api {
                     && comparable(sp) != comparable(cp)
                 {
                     let why = format!("P{}'s fighter profile does not match its files", side + 1);
-                    db(s.flag(m.players[side], Some(m.id), &why))?;
+                    db(s.flag(m.players[side], Some(m.id), &why, Some(fp)))?;
+                    self.auto_block(&mut s, fp, AutoCause::Liar)?;
                     m.fail(why);
                 }
             }
             if m.failed.is_none() {
-                m.recompute_verdict(&s, &self.cfg.thresholds);
+                m.recompute_verdict(&s, &self.cfg.thresholds, &self.truth);
                 self.try_start(&mut s, &mut rooms, m)?;
             }
             touched.push(m.id);
@@ -1484,6 +1720,11 @@ impl Api {
         let frame = v.get("frame").and_then(Value::as_u64).unwrap_or(0) as u32;
         if !db(s.report_desync(me.id, id, frame))? {
             return Err(err(404, "not your match"));
+        }
+        if let Some((setup, ..)) = db(s.match_evidence(id))? {
+            for fp in setup_fingerprints(&setup).iter().take(2) {
+                self.auto_block(&mut s, fp, AutoCause::Desync)?;
+            }
         }
         drop(s);
         self.spawn_resim(id);
@@ -2351,5 +2592,344 @@ pub(crate) mod tests {
         let a = lock(&api.store).by_id(aid).unwrap().unwrap();
         assert_eq!(a.wins, 1);
         assert!(a.rating > 1200);
+    }
+
+    // ---- official vs community servers
+
+    use rugen_fair::trust::{PublicKey, SigningKey};
+    use rugen_proto::{IdentityStatement, ResultStatement, SignedBlob, VerdictStatement, purpose};
+
+    fn api_truth(name: &str, truth: TruthConfig) -> Arc<Api> {
+        Api::new(
+            Store::open(None).unwrap(),
+            ApiConfig {
+                name: name.into(),
+                truth,
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(Relay::default())),
+        )
+    }
+
+    fn official_api() -> Arc<Api> {
+        api_truth(
+            "official",
+            TruthConfig {
+                key: Some(SigningKey::dev()),
+                official_key: Some(SigningKey::dev().public()),
+                admin_token: Some("tok".into()),
+                ..TruthConfig::default()
+            },
+        )
+    }
+
+    /// Serve `api` over HTTP on loopback (another server pulls from it).
+    fn serve(api: Arc<Api>) -> (String, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        rt.spawn(async move { crate::http::serve(listener, api, std::future::pending()).await });
+        (format!("http://{addr}"), rt)
+    }
+
+    fn blob(v: &Value) -> SignedBlob {
+        serde_json::from_value(v.clone()).unwrap()
+    }
+
+    #[test]
+    fn official_mode_signs_identity_verdicts_and_results() {
+        let dev = SigningKey::dev().public();
+        let kit = Kit::new();
+        let api = official_api();
+        let info = json_of(api.handle(req("GET", "/", Value::Null)));
+        assert_eq!(info["official"], true);
+        assert_eq!(info["key"], dev.hex());
+        // identity: the caller's nonce, signed by the official key
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let id = json_of(api.handle(req(
+            "GET",
+            &format!("/v1/identity?nonce={nonce}"),
+            Value::Null,
+        )));
+        let (st, _) =
+            rugen_fair::trust::open::<IdentityStatement>(&blob(&id), purpose::IDENTITY, Some(&dev))
+                .unwrap();
+        assert!(st.official && st.nonce == nonce);
+        let r = api.handle(req("GET", "/v1/identity?nonce=xyz", Value::Null));
+        assert_eq!(r.status, 400);
+        // a ranked match: signed verdict, then a signed result
+        let (aid, ka) = register(&api);
+        let (bid, kb) = register(&api);
+        json_of(api.handle(req("POST", "/queue", json!({"key": ka, "ranked": true}))));
+        let f = json_of(api.handle(req("POST", "/queue", json!({"key": kb, "ranked": true}))));
+        let mid = f["found"]["match_id"].as_u64().unwrap();
+        let [va, _] = play_matchup(&api, mid, [&ka, &kb], &kit);
+        let (vs, _) = rugen_fair::trust::open::<VerdictStatement>(
+            &blob(&va["signed"]),
+            purpose::VERDICT,
+            Some(&dev),
+        )
+        .unwrap();
+        assert_eq!(vs.match_id, mid);
+        assert!(vs.ranked);
+        assert_eq!(vs.verdict, rugen_proto::VerdictKind::Fair);
+        assert_eq!(vs.fingerprints[0], kit.a.0.fingerprint);
+        let inputs = "01000200".repeat(100);
+        let mut acks = Vec::new();
+        for k in [&ka, &kb] {
+            acks.push(json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": mid, "winner": aid, "inputs": inputs, "frames": 100, "checksum": 9}),
+            ))));
+        }
+        assert!(acks[0]["signed"].is_null(), "first report: not settled yet");
+        let (rs, _) = rugen_fair::trust::open::<ResultStatement>(
+            &blob(&acks[1]["signed"]),
+            purpose::RESULT,
+            Some(&dev),
+        )
+        .unwrap();
+        assert_eq!((rs.account, rs.winner, rs.players), (bid, aid, [aid, bid]));
+        assert_eq!(rs.delta, acks[1]["delta"].as_i64().map(|d| d as i32));
+        // the first reporter fetches its signed result later
+        let late = json_of(api.handle(req(
+            "GET",
+            &format!("/match/{mid}/result?key={ka}"),
+            Value::Null,
+        )));
+        let (rs, _) = rugen_fair::trust::open::<ResultStatement>(
+            &blob(&late["signed"]),
+            purpose::RESULT,
+            Some(&dev),
+        )
+        .unwrap();
+        assert_eq!(rs.account, aid);
+        assert!(rs.rating.unwrap() > 1200 && rs.delta.unwrap() > 0);
+        let r = api.handle(req(
+            "GET",
+            &format!("/match/{mid}/result?key={}", register(&api).1),
+            Value::Null,
+        ));
+        assert_eq!(r.status, 404, "only the players");
+    }
+
+    #[test]
+    fn admin_blocks_and_unblocks_with_a_token() {
+        let kit = Kit::new();
+        let fp = kit.b.0.fingerprint.clone();
+        let api = official_api();
+        let block = |token: &str| {
+            api.handle(req(
+                "POST",
+                "/v1/admin/block",
+                json!({"token": token, "fingerprint": fp, "reason": "infinite regen"}),
+            ))
+        };
+        assert_eq!(block("wrong").status, 403);
+        assert_eq!(block("").status, 403);
+        let r = json_of(block("tok"));
+        assert_eq!(r["blocked"][0]["fingerprint"], fp.as_str());
+        assert_eq!(r["blocked"][0]["source"], "admin");
+        // the feed carries it, signed by the official key
+        let feed = json_of(api.handle(req("GET", "/v1/truth", Value::Null)));
+        let f = rugen_fair::trust::open_feed(
+            &blob(&feed),
+            &SigningKey::dev().public(),
+            rugen_fair::trust::now(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(f.blocked.len(), 1);
+        assert_eq!(f.blocked[0].reason, "infinite regen");
+        // a matchup on the official server is BLOCKED with the official reason
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        json_of(api.handle(req("POST", "/queue", json!({"key": ka}))));
+        let q = json_of(api.handle(req("POST", "/queue", json!({"key": kb}))));
+        let id = q["found"]["match_id"].as_u64().unwrap();
+        pick(&api, id, &ka, &kit.a.0, Some(&kit.stage.0));
+        let v = pick(&api, id, &kb, &kit.b.0, None);
+        assert_eq!(v["verdict"]["kind"], "blocked", "{v}");
+        assert_eq!(
+            v["verdict"]["reasons"][0],
+            "BETA: blocked by the official server (infinite regen)"
+        );
+        // unblock: the live matchup is judged again
+        let r = json_of(api.handle(req(
+            "POST",
+            "/v1/admin/unblock",
+            json!({"token": "tok", "fingerprint": fp}),
+        )));
+        assert!(r["blocked"].as_array().unwrap().is_empty());
+        let v = json_of(api.handle(req("GET", &format!("/matchup/{id}?key={ka}"), Value::Null)));
+        assert_eq!(v["verdict"]["kind"], "fair", "{v}");
+        let list = json_of(api.handle(req("GET", "/v1/admin/blocklist?token=tok", Value::Null)));
+        assert_eq!(list["official"], true);
+        // no token configured: the admin API does not exist
+        let community = api_truth("c", TruthConfig::default());
+        let r = community.handle(req(
+            "POST",
+            "/v1/admin/block",
+            json!({"token": "", "fingerprint": fp}),
+        ));
+        assert_eq!(r.status, 404);
+    }
+
+    /// Two servers in process: the official one blocks a fingerprint, the
+    /// community one pulls the signed feed over HTTP and enforces it.
+    #[test]
+    fn community_server_enforces_the_pulled_official_blocklist() {
+        let kit = Kit::new();
+        let official = official_api();
+        json_of(official.handle(req(
+            "POST",
+            "/v1/admin/block",
+            json!({"token": "tok", "fingerprint": kit.b.0.fingerprint, "reason": "wallhack"}),
+        )));
+        let (url, _rt) = serve(official.clone());
+        let community = api_truth(
+            "community",
+            TruthConfig {
+                key: Some(SigningKey::generate().unwrap()),
+                official_key: Some(SigningKey::dev().public()),
+                official_url: Some(url.clone()),
+                ..TruthConfig::default()
+            },
+        );
+        let info = json_of(community.handle(req("GET", "/", Value::Null)));
+        assert_eq!(info["official"], false);
+        assert_ne!(info["key"], SigningKey::dev().public().hex());
+        // nothing held yet: the matchup is fair
+        let (_, ka) = register(&community);
+        let (_, kb) = register(&community);
+        let room = json_of(community.handle(req("POST", "/room", json!({"key": ka}))));
+        let code = room["code"].as_str().unwrap().to_string();
+        let joined = json_of(community.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kb}),
+        )));
+        let id = joined["matchup"]["id"].as_u64().unwrap();
+        pick(&community, id, &ka, &kit.a.0, Some(&kit.stage.0));
+        let v = pick(&community, id, &kb, &kit.b.0, None);
+        assert_eq!(v["verdict"]["kind"], "fair");
+        // pull: the live matchup turns BLOCKED, signed by the community key
+        let f = community.pull_official().unwrap();
+        assert_eq!(f.blocked.len(), 1);
+        let v =
+            json_of(community.handle(req("GET", &format!("/matchup/{id}?key={ka}"), Value::Null)));
+        assert_eq!(v["verdict"]["kind"], "blocked", "{v}");
+        assert_eq!(
+            v["verdict"]["reasons"][0],
+            "BETA: blocked by the official server (wallhack)"
+        );
+        let signed = blob(&v["signed"]);
+        let community_key = PublicKey::parse(info["key"].as_str().unwrap()).unwrap();
+        assert!(rugen_fair::trust::verify(&signed, purpose::VERDICT, Some(&community_key)).is_ok());
+        assert!(
+            rugen_fair::trust::verify(&signed, purpose::VERDICT, Some(&SigningKey::dev().public()))
+                .is_err(),
+            "a community verdict never passes as official"
+        );
+        let r = community.handle(req(
+            "POST",
+            &format!("/matchup/{id}/accept"),
+            json!({"key": ka}),
+        ));
+        assert_eq!(r.status, 409);
+        // the community server mirrors the verified official blob verbatim
+        let mirror = json_of(community.handle(req("GET", "/v1/truth/official", Value::Null)));
+        assert!(
+            rugen_fair::trust::open_feed(
+                &blob(&mirror),
+                &SigningKey::dev().public(),
+                rugen_fair::trust::now(),
+                0
+            )
+            .is_ok()
+        );
+        // a server pretending to be official (own key) is rejected
+        let rogue = api_truth(
+            "rogue",
+            TruthConfig {
+                key: Some(SigningKey::generate().unwrap()),
+                official_key: Some(SigningKey::dev().public()),
+                ..TruthConfig::default()
+            },
+        );
+        let (rogue_url, _rt2) = serve(rogue);
+        let victim = api_truth(
+            "victim",
+            TruthConfig {
+                key: Some(SigningKey::generate().unwrap()),
+                official_key: Some(SigningKey::dev().public()),
+                official_url: Some(rogue_url),
+                ..TruthConfig::default()
+            },
+        );
+        let e = victim.pull_official().unwrap_err();
+        assert!(e.contains("rejected"), "{e}");
+        assert!(victim.truth.official_feed().is_none());
+    }
+
+    #[test]
+    fn automatic_blocks_from_analysis_and_liars() {
+        let root = tmp("auto");
+        let cheat = declare(
+            &tiny_char(
+                &root.join("cheat"),
+                "Cheater",
+                "[Statedef -2]\n[State -2, regen]\ntype = LifeAdd\ntrigger1 = Life < LifeMax\nvalue = 10\n",
+            ),
+            Kind::Char,
+        );
+        let fair = declare(&tiny_char(&root.join("fair"), "Fair", ""), Kind::Char);
+        let stage = declare(&tiny_stage(&root.join("s")), Kind::Stage);
+        let api = official_api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let room = json_of(api.handle(req("POST", "/room", json!({"key": ka}))));
+        let code = room["code"].as_str().unwrap().to_string();
+        let joined = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kb}),
+        )));
+        let id = joined["matchup"]["id"].as_u64().unwrap();
+        pick(&api, id, &ka, &fair.0, Some(&stage.0));
+        pick(&api, id, &kb, &cheat.0, None);
+        // the cheater's package reaches the server: its own analysis blocks it
+        let _ = upload(&api, &kb, &cheat.0, &cheat.1, 1 << 20);
+        let b = lock(&api.store)
+            .blocked(&cheat.0.fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.source, "auto");
+        assert!(b.reason.starts_with("auto: regen"), "{}", b.reason);
+        // three different players lying about the same fighter
+        let mut s = lock(&api.store);
+        for acc in [11, 12, 13] {
+            s.flag(acc, None, "lie", Some(&fair.0.fingerprint)).unwrap();
+            assert!(
+                api.auto_block(&mut s, &fair.0.fingerprint, AutoCause::Liar)
+                    .is_ok()
+            );
+        }
+        assert!(
+            s.blocked(&fair.0.fingerprint)
+                .unwrap()
+                .unwrap()
+                .reason
+                .contains("3 players")
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
