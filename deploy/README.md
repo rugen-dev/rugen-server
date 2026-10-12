@@ -81,9 +81,74 @@ Command line (two machines, or two terminals for testing):
 
 ```sh
 rugen play kfm --server https://rugen.example.com --room new        # prints ROOM CODE
-rugen play kfm --server https://rugen.example.com --room ABCDE      # joins
+rugen play G6_Naruto --server https://rugen.example.com --room ABCDE   # joins, brings Naruto
 rugen play kfm --server https://rugen.example.com --room ABCDE --spectate
 ```
+
+Each command line player brings the character it names, goes through the
+matchup screen on its own (confirms unless BLOCKED, prints the verdict),
+syncs the files, fights and quits; `--shot out.png` saves a picture of the
+matchup screen instead.
+
+## Bring your own character
+
+Players do not need the same characters installed. Every match (rooms,
+quick match, ranked) starts with a **matchup**:
+
+1. Each player picks a fighter from their own `chars/` (P1 also the stage).
+   The client sends its **fingerprint** (sha256 of the gameplay files) and
+   **fairness profile** (static analysis of the CNS: life, attack, damage,
+   supers, projectiles, invulnerability windows, cheat flags, a power score
+   where Kung Fu Man ≈ 100) plus a small card portrait.
+2. The server answers at once:
+   - **BLOCKED**: a cheat-level flag on either side (life / power regen in
+     state -2, permanent invulnerability, setting the opponent's life or
+     state, custom-state kills, pause loops, round stalling, extreme
+     constants…) or a character that fails `rugen verify`. Never playable;
+     that player changes fighter.
+   - **UNBALANCED**: power-score ratio above `RUGEN_FAIR_RATIO` (1.6), or
+     life / attack / defence twice the other's, or (once both have
+     `RUGEN_FAIR_MIN_GAMES` verified games) a community rating gap above
+     `RUGEN_FAIR_COMMUNITY_GAP`. Ranked refuses it; casual rooms and quick
+     match play it only when **both** players accept it explicitly.
+   - **FAIR** otherwise (a small community gap also clears a score-only
+     UNBALANCED: real matches showed the fight is even).
+3. Both see the other's card and the verdict and confirm (or change fighter;
+   any change resets confirmations, and so does a verdict that changes once
+   the server has checked the files).
+4. From pick time each client uploads its optimised package (zstd, only the
+   files the character uses) **if the server does not already hold that
+   fingerprint**, resumably, in 2 MB chunks. The server unpacks it into
+   scratch space, recomputes fingerprint and profile, and fails the match
+   (and flags the account) when they differ from what the client claimed.
+5. Each client downloads what it lacks into `cache/net/` (never into
+   `chars/`), reports ready with the fingerprints, rules and game version,
+   and the server hands out the relay tickets once both agree.
+
+Packages are **temporary caches**: they expire `RUGEN_PKG_TTL` after their
+last use, the oldest go first above `RUGEN_PKG_MAX_TOTAL`, and only packages
+of stored ranked replays are kept longer (`RUGEN_PKG_REPLAY_TTL`). Uploads
+are only accepted for a fighter the account declared in a live matchup,
+capped per package and per hour (account and IP). Every verified result
+moves a **community Elo per fingerprint**, shown on the cards.
+
+**Legal note.** Characters are third-party content. The server stores
+uploaded packages only to pass them between the two players of a match and
+deletes them on expiry; it does not list or publish them. As the operator
+you are responsible for what your server hosts: set the caps and TTL to
+what you are willing to keep, remove content on request (delete
+`packages/<fingerprint>.rgpk` from the data volume; the server drops its
+record on the next sweep), and
+do not run a public server if you cannot answer takedown requests.
+
+### Re-simulating disputed matches
+
+Built with `--features resim` (`cargo build --release -p rugen-relay
+--features resim`, or `docker build --build-arg FEATURES=resim ...`) and
+given the engine data (`RUGEN_RESIM_DATA=/path/to/data`, the folder with
+`common1.cns` / `fight.def`), the server re-plays a disputed match from
+both input streams with the stored packages, headless, and settles the
+result when one report matches the simulation.
 
 LAN / direct-IP matches (`--net ip:port`, HOST / JOIN DIRECT MATCH) still
 work without any server; there the players type each other's address on
@@ -101,6 +166,17 @@ purpose.
 | `RUGEN_UDP_PUBLIC` | public URL host + port | `host:port` clients send UDP to (must not be Cloudflare-proxied) |
 | `RUGEN_DATA`       | `/data`            | directory of `rugen.db` |
 | `RUST_LOG`         | `info`             | `error` … `debug` |
+| `RUGEN_PKG_TTL`    | `24h`              | a package expires this long after its last use (`90m`, `2d`, seconds) |
+| `RUGEN_PKG_MAX_TOTAL` | `5GB`           | all packages together; least recently used evicted above it |
+| `RUGEN_PKG_MAX`    | `150MB`            | largest single package accepted |
+| `RUGEN_PKG_RATE_ACCOUNT` | `1GB`        | upload bytes per account per hour |
+| `RUGEN_PKG_RATE_IP` | `2GB`             | upload bytes per client IP per hour |
+| `RUGEN_PKG_REPLAY_TTL` | `720`          | hours the packages of a stored ranked replay are kept |
+| `RUGEN_FAIR_RATIO` | `1.6`              | power-score ratio above which a matchup is UNBALANCED |
+| `RUGEN_FAIR_COMMUNITY_GAP` | `200`      | community rating gap that is UNBALANCED |
+| `RUGEN_FAIR_MIN_GAMES` | `10`           | verified games before a character's community rating counts |
+| `RUGEN_RESIM_DATA` | –                  | engine `data/` for re-simulating disputed matches (`--features resim`) |
+| `RUGEN_RESIM_MOTIF` | `RUGEN_RESIM_DATA` | motif for re-simulation |
 | `RUGEN_IMAGE`      | GHCR `latest`      | image tag used by the compose file |
 | `RUGEN_HTTP_PORT`  | `8080`             | host port for HTTP (compose only) |
 | `RUGEN_UDP_PORT`   | `7001`             | host port for the UDP relay (compose only) |
@@ -109,6 +185,8 @@ purpose.
 ## Backups
 
 All state is one SQLite database (WAL mode) in the `rugen-data` volume.
+Character packages live next to it in `packages/`; they are caches and need
+no backup (size the volume for `RUGEN_PKG_MAX_TOTAL`).
 
 ```sh
 # consistent online copy, from inside the container (no sqlite3 needed)
@@ -191,7 +269,10 @@ What the client does to keep online play feeling local:
 - **Result verification**: both clients report winner, last frame, world
   checksum and the confirmed input stream; disagreement marks the match
   *disputed* (no rating change). Ranked input streams are stored as
-  replays (latest 2000). Re-simulating disputed matches on the server is
-  possible later (the simulation crate has no GPU dependency) but not done.
+  replays (latest 2000). With `--features resim` the server re-simulates
+  disputed matches headless and settles them (see above).
+- **Same files on both sides**: the matchup syncs both fighters and the
+  stage by fingerprint before the relay session exists, and both clients
+  confirm the fingerprints, rules and game version they will run.
 - **Spectators** join a room before the match starts and receive the host's
   confirmed inputs through the relay (ggrs spectator session).
