@@ -15,6 +15,17 @@
 //! RUGEN_NAME        --name      server name in server lists        rugen server
 //! RUGEN_MOTD                    message of the day
 //! RUST_LOG                      log filter                         info
+//! RUGEN_PKG_TTL                 package expiry after last use      24h
+//! RUGEN_PKG_MAX_TOTAL           all packages (LRU eviction)        5GB
+//! RUGEN_PKG_MAX                 one package                        150MB
+//! RUGEN_PKG_RATE_ACCOUNT        uploads per account per hour       1GB
+//! RUGEN_PKG_RATE_IP             uploads per client IP per hour     2GB
+//! RUGEN_PKG_REPLAY_TTL          hours packages of ranked replays stay  720
+//! RUGEN_FAIR_RATIO              power ratio that is UNBALANCED     1.6
+//! RUGEN_FAIR_COMMUNITY_GAP      community rating gap, UNBALANCED   200
+//! RUGEN_FAIR_MIN_GAMES          games before a rating counts       10
+//! RUGEN_RESIM_DATA              engine data/ for re-simulation (--features resim)
+//! RUGEN_RESIM_MOTIF             motif for re-simulation            RUGEN_RESIM_DATA
 //! ```
 //!
 //! `rugen-server --backup out.db` writes a consistent copy of the database.
@@ -28,9 +39,14 @@ mod elo;
 mod http;
 mod hub;
 mod matchmaking;
+mod matchup;
+mod packages;
 mod password;
 mod relay;
+mod resim;
 mod store;
+#[cfg(test)]
+mod testkit;
 mod udp;
 
 use std::io::{Read, Write};
@@ -184,10 +200,40 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         s.data.display()
     );
     let relay = Arc::new(Mutex::new(relay::Relay::default()));
+    let env_f = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    };
+    let dt = rugen_fair::verdict::Thresholds::default();
+    let thresholds = rugen_fair::verdict::Thresholds {
+        ratio: env_f("RUGEN_FAIR_RATIO").map_or(dt.ratio, |v| v.max(1.0) as f32),
+        community_gap: env_f("RUGEN_FAIR_COMMUNITY_GAP").map_or(dt.community_gap, |v| v as i32),
+        min_games: env_f("RUGEN_FAIR_MIN_GAMES").map_or(dt.min_games, |v| v as u32),
+    };
+    let pkg = packages::PkgConfig::from_env();
+    log::info!(
+        "packages: ttl {} h, max {} MB each, {} MB total; fair ratio {}",
+        pkg.ttl_secs / 3600,
+        pkg.max_pkg >> 20,
+        pkg.max_total >> 20,
+        thresholds.ratio
+    );
+    let resim = resim::ResimConfig::from_env();
+    if let Some(r) = &resim {
+        log::info!(
+            "disputed matches are re-simulated with {}",
+            r.data.display()
+        );
+    }
     let mut cfg = api::ApiConfig {
         name: s.name.clone(),
         motd: s.motd.clone(),
         udp_public: None,
+        data: Some(s.data.clone()),
+        pkg,
+        thresholds,
+        resim,
     };
     if let Some(bind) = &s.udp_bind {
         let socket = Arc::new(
@@ -215,6 +261,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("public url {u}");
     }
     let api = api::Api::new(store, cfg, relay);
+    api.sweep_packages();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(32)
@@ -225,6 +272,16 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("bind {}: {e}", s.bind))?;
         log::info!("http + websocket on {}", listener.local_addr()?);
+        // package retention: TTL + LRU size cap
+        let sweeper = api.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(600));
+            loop {
+                every.tick().await;
+                let a = sweeper.clone();
+                let _ = tokio::task::spawn_blocking(move || a.sweep_packages()).await;
+            }
+        });
         http::serve(listener, api, shutdown_signal()).await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })

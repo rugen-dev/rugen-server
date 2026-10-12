@@ -5,10 +5,15 @@ pub const START_RATING: i32 = 1200;
 
 /// New ratings `(winner, loser)` after a decisive result.
 pub fn update(winner: i32, loser: i32) -> (i32, i32) {
+    update_k(winner, loser, K)
+}
+
+/// [`update`] with another K (community ratings of characters use 16).
+pub fn update_k(winner: i32, loser: i32, k: f64) -> (i32, i32) {
     let ew = 1.0 / (1.0 + 10f64.powf((loser - winner) as f64 / 400.0));
     let el = 1.0 - ew;
-    let dw = (K * (1.0 - ew)).round() as i32;
-    let dl = (K * (0.0 - el)).round() as i32;
+    let dw = (k * (1.0 - ew)).round() as i32;
+    let dl = (k * (0.0 - el)).round() as i32;
     (winner + dw, loser + dl)
 }
 

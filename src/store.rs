@@ -118,7 +118,104 @@ const MIGRATIONS: &[&str] = &[
          created INTEGER NOT NULL,
          inputs BLOB NOT NULL
      );",
+    // v3: bring-your-own-character: temporary content packages, community
+    // ratings per character fingerprint, anti-cheat flags, desync reports
+    "CREATE TABLE packages (
+         fingerprint TEXT PRIMARY KEY,
+         kind TEXT NOT NULL,
+         size INTEGER NOT NULL,
+         name TEXT NOT NULL DEFAULT '',
+         author TEXT NOT NULL DEFAULT '',
+         def TEXT NOT NULL,
+         profile TEXT,
+         uploader INTEGER NOT NULL DEFAULT 0,
+         created INTEGER NOT NULL,
+         last_used INTEGER NOT NULL,
+         keep_until INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE INDEX packages_lru ON packages(last_used);
+     CREATE TABLE char_ratings (
+         fingerprint TEXT PRIMARY KEY,
+         name TEXT NOT NULL DEFAULT '',
+         rating INTEGER NOT NULL,
+         games INTEGER NOT NULL DEFAULT 0,
+         wins INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE TABLE flags (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         account INTEGER NOT NULL,
+         match_id INTEGER,
+         reason TEXT NOT NULL,
+         created INTEGER NOT NULL
+     );
+     ALTER TABLE matches ADD COLUMN desync INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE matches ADD COLUMN resim TEXT;",
 ];
+
+/// Rating every character fingerprint starts from.
+pub const CHAR_START_RATING: i32 = 1500;
+/// Elo K of community character ratings.
+pub const CHAR_K: f64 = 16.0;
+
+/// A stored content package (metadata; the bytes live in `packages/`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PackageRow {
+    pub fingerprint: String,
+    pub kind: String,
+    pub size: u64,
+    pub name: String,
+    pub author: String,
+    pub def: String,
+    /// Server-computed fairness profile (characters).
+    pub profile: Option<rugen_proto::FairnessProfile>,
+    pub uploader: u64,
+    pub created: u64,
+    pub last_used: u64,
+    /// Kept at least until then (ranked replays), Unix seconds.
+    pub keep_until: u64,
+}
+
+impl PackageRow {
+    fn from_row(r: &Row<'_>) -> DbResult<Self> {
+        let profile: Option<String> = r.get(6)?;
+        Ok(Self {
+            fingerprint: r.get(0)?,
+            kind: r.get(1)?,
+            size: r.get::<_, i64>(2)? as u64,
+            name: r.get(3)?,
+            author: r.get(4)?,
+            def: r.get(5)?,
+            profile: profile.and_then(|p| serde_json::from_str(&p).ok()),
+            uploader: r.get::<_, i64>(7)? as u64,
+            created: r.get::<_, i64>(8)? as u64,
+            last_used: r.get::<_, i64>(9)? as u64,
+            keep_until: r.get::<_, i64>(10)? as u64,
+        })
+    }
+}
+
+const PACKAGE_COLS: &str =
+    "fingerprint, kind, size, name, author, def, profile, uploader, created, last_used, keep_until";
+
+/// The character / stage fingerprints a match was set up with (`setup` JSON).
+pub fn setup_fingerprints(setup: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(setup).unwrap_or_default();
+    ["p1_fp", "p2_fp", "stage_fp"]
+        .iter()
+        .filter_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .filter(|s| rugen_proto::is_fingerprint(s))
+        .map(str::to_string)
+        .collect()
+}
+
+/// How long packages of a stored ranked replay are kept (`RUGEN_PKG_REPLAY_TTL`
+/// hours, default 30 days).
+pub fn replay_keep_secs() -> u64 {
+    std::env::var("RUGEN_PKG_REPLAY_TTL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(30 * 24 * 3600, |h| h * 3600)
+}
 
 /// Ranked replays kept (oldest are deleted first).
 pub const REPLAY_RETENTION: i64 = 2000;
@@ -499,6 +596,15 @@ impl Store {
         Ok(id)
     }
 
+    /// Replace a match's setup JSON (fingerprints become known at start).
+    pub fn set_setup(&mut self, match_id: u64, setup: &str) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE matches SET setup = ?2 WHERE id = ?1",
+            params![match_id as i64, setup],
+        )?;
+        Ok(())
+    }
+
     /// Record one side's report. The match resolves once both sides
     /// reported: ratings move (ranked) only when the reports agree
     /// ([`reports_agree`]); otherwise the match is marked disputed.
@@ -512,7 +618,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let m = tx
             .query_row(
-                "SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed FROM matches WHERE id = ?1",
+                "SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed, desync, setup FROM matches WHERE id = ?1",
                 [match_id as i64],
                 |r| {
                     Ok((
@@ -522,11 +628,14 @@ impl Store {
                         [r.get::<_, i32>(4)?, r.get::<_, i32>(5)?],
                         r.get::<_, Option<i64>>(6)?,
                         r.get::<_, bool>(7)?,
+                        r.get::<_, bool>(8)?,
+                        r.get::<_, String>(9)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((players, ranked, resolved, deltas, winner_set, disputed)) = m else {
+        let Some((players, ranked, resolved, deltas, winner_set, disputed, desync, setup)) = m
+        else {
             return Ok(rejected);
         };
         if !players.contains(&reporter) || !players.contains(&data.winner) {
@@ -580,7 +689,7 @@ impl Store {
                 ..Default::default()
             });
         }
-        if !reports_agree(&reports[0], &reports[1]) {
+        if desync || !reports_agree(&reports[0], &reports[1]) {
             tx.execute(
                 "UPDATE matches SET resolved = 1, disputed = 1 WHERE id = ?1",
                 [match_id as i64],
@@ -593,12 +702,77 @@ impl Store {
                 disputed: true,
             });
         }
-        let winner = data.winner;
+        let inputs = if reports[0].inputs.len() >= reports[1].inputs.len() {
+            reports[0].inputs.clone()
+        } else {
+            reports[1].inputs.clone()
+        };
+        let deltas = Self::settle(&tx, match_id, players, ranked, &setup, data.winner, &inputs)?;
+        tx.commit()?;
+        Ok(ReportOutcome {
+            accepted: true,
+            delta: Some(deltas[side]),
+            disputed: false,
+        })
+    }
+
+    /// Apply a decided result: player ratings (ranked), the community
+    /// ratings of both character fingerprints, the replay (ranked, keeping
+    /// its packages longer) and the resolved flag.
+    fn settle(
+        tx: &rusqlite::Transaction<'_>,
+        match_id: u64,
+        players: [u64; 2],
+        ranked: bool,
+        setup: &str,
+        winner: u64,
+        inputs: &[u8],
+    ) -> DbResult<[i32; 2]> {
         let loser = if players[0] == winner {
             players[1]
         } else {
             players[0]
         };
+        let fps = setup_fingerprints(setup);
+        let v: serde_json::Value = serde_json::from_str(setup).unwrap_or_default();
+        let fp = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .filter(|s| rugen_proto::is_fingerprint(s))
+                .map(str::to_string)
+        };
+        if let (Some(f1), Some(f2)) = (fp("p1_fp"), fp("p2_fp"))
+            && f1 != f2
+        {
+            let name = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let ((fw, nw), (fl, nl)) = if players[0] == winner {
+                ((f1, name("p1_char")), (f2, name("p2_char")))
+            } else {
+                ((f2, name("p2_char")), (f1, name("p1_char")))
+            };
+            for (f, n) in [(&fw, &nw), (&fl, &nl)] {
+                tx.execute(
+                    "INSERT OR IGNORE INTO char_ratings (fingerprint, name, rating) VALUES (?1, ?2, ?3)",
+                    params![f, n, CHAR_START_RATING],
+                )?;
+            }
+            let get = |f: &str| -> DbResult<i32> {
+                tx.query_row(
+                    "SELECT rating FROM char_ratings WHERE fingerprint = ?1",
+                    [f],
+                    |r| r.get(0),
+                )
+            };
+            let (rw, rl) = elo::update_k(get(&fw)?, get(&fl)?, CHAR_K);
+            tx.execute(
+                "UPDATE char_ratings SET rating = ?2, games = games + 1, wins = wins + 1 WHERE fingerprint = ?1",
+                params![fw, rw],
+            )?;
+            tx.execute(
+                "UPDATE char_ratings SET rating = ?2, games = games + 1 WHERE fingerprint = ?1",
+                params![fl, rl],
+            )?;
+        }
         let mut deltas = [0, 0];
         if ranked {
             let rating = |id: u64| -> DbResult<Option<i32>> {
@@ -626,12 +800,6 @@ impl Store {
                     [dl, dw]
                 };
             }
-            // keep the longer confirmed input stream as the replay
-            let inputs = if reports[0].inputs.len() >= reports[1].inputs.len() {
-                &reports[0].inputs
-            } else {
-                &reports[1].inputs
-            };
             if !inputs.is_empty() {
                 tx.execute(
                     "INSERT OR REPLACE INTO replays (match_id, created, inputs) VALUES (?1, ?2, ?3)",
@@ -642,18 +810,244 @@ impl Store {
                      (SELECT match_id FROM replays ORDER BY created DESC, match_id DESC LIMIT ?1)",
                     [REPLAY_RETENTION],
                 )?;
+                // the replay's files stay on the server longer
+                for f in &fps {
+                    tx.execute(
+                        "UPDATE packages SET keep_until = MAX(keep_until, ?2) WHERE fingerprint = ?1",
+                        params![f, (now() + replay_keep_secs()) as i64],
+                    )?;
+                }
             }
         }
         tx.execute(
-            "UPDATE matches SET resolved = 1, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1",
+            "UPDATE matches SET resolved = 1, disputed = 0, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1",
             params![match_id as i64, winner as i64, deltas[0], deltas[1]],
         )?;
+        Ok(deltas)
+    }
+
+    /// A client saw a desync (ggrs checksum mismatch): the match can no
+    /// longer resolve by agreement.
+    pub fn report_desync(&mut self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE matches SET desync = 1 WHERE id = ?1 AND (p1 = ?2 OR p2 = ?2)",
+            params![match_id as i64, reporter as i64],
+        )?;
+        if n > 0 {
+            self.conn.execute(
+                "UPDATE matches SET disputed = 1 WHERE id = ?1 AND resolved = 1 AND winner IS NULL",
+                [match_id as i64],
+            )?;
+            log::warn!("match {match_id}: desync reported by {reporter} at frame {frame}");
+        }
+        Ok(n > 0)
+    }
+
+    /// A disputed match the server re-simulated: settle it with the
+    /// simulated winner (`None` = undecidable, stays disputed).
+    pub fn resolve_dispute(
+        &mut self,
+        match_id: u64,
+        winner: Option<u64>,
+        note: &str,
+    ) -> DbResult<bool> {
+        let tx = self.conn.transaction()?;
+        let m = tx
+            .query_row(
+                "SELECT p1, p2, ranked, setup, disputed, winner FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| {
+                    Ok((
+                        [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, bool>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((players, ranked, setup, disputed, set)) = m else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE matches SET resim = ?2 WHERE id = ?1",
+            params![match_id as i64, note],
+        )?;
+        let settled = match winner {
+            Some(w) if disputed && set.is_none() && players.contains(&w) => {
+                let inputs: Vec<u8> = tx
+                    .query_row(
+                        "SELECT inputs FROM reports WHERE match_id = ?1 AND inputs IS NOT NULL
+                         ORDER BY length(inputs) DESC LIMIT 1",
+                        [match_id as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+                Self::settle(&tx, match_id, players, ranked, &setup, w, &inputs)?;
+                true
+            }
+            _ => false,
+        };
         tx.commit()?;
-        Ok(ReportOutcome {
-            accepted: true,
-            delta: Some(deltas[side]),
-            disputed: false,
-        })
+        Ok(settled)
+    }
+
+    /// Setup JSON, ranked flag, players and the reports (reporter, data) of a match.
+    #[allow(clippy::type_complexity)]
+    pub fn match_evidence(
+        &self,
+        match_id: u64,
+    ) -> DbResult<Option<(String, bool, [u64; 2], Vec<(u64, ReportData)>)>> {
+        let Some((setup, ranked, players)) = self
+            .conn
+            .query_row(
+                "SELECT setup, ranked, p1, p2 FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, bool>(1)?,
+                        [r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64],
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut st = self.conn.prepare(
+            "SELECT reporter, winner, frames, checksum, inputs FROM reports WHERE match_id = ?1 ORDER BY reporter",
+        )?;
+        let reports = st
+            .query_map([match_id as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    ReportData {
+                        winner: r.get::<_, i64>(1)? as u64,
+                        frames: r.get(2)?,
+                        checksum: r.get::<_, Option<i64>>(3)?.map(|c| c as u64),
+                        inputs: r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                    },
+                ))
+            })?
+            .collect::<DbResult<Vec<_>>>()?;
+        Ok(Some((setup, ranked, players, reports)))
+    }
+
+    /// Is a match disputed (and unresolved by agreement)?
+    pub fn is_disputed(&self, match_id: u64) -> DbResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT disputed FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|d| d.unwrap_or(false))
+    }
+
+    // ---- packages, community ratings, flags
+
+    pub fn package(&self, fp: &str) -> DbResult<Option<PackageRow>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {PACKAGE_COLS} FROM packages WHERE fingerprint = ?1"),
+                [fp],
+                PackageRow::from_row,
+            )
+            .optional()
+    }
+
+    pub fn put_package(&mut self, p: &PackageRow) -> DbResult<()> {
+        let profile = p
+            .profile
+            .as_ref()
+            .and_then(|p| serde_json::to_string(p).ok());
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO packages ({PACKAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ),
+            params![
+                p.fingerprint,
+                p.kind,
+                p.size as i64,
+                p.name,
+                p.author,
+                p.def,
+                profile,
+                p.uploader as i64,
+                p.created as i64,
+                p.last_used as i64,
+                p.keep_until as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark packages as used now (TTL / LRU bookkeeping).
+    pub fn touch_packages(&mut self, fps: &[&str]) -> DbResult<()> {
+        for f in fps {
+            self.conn.execute(
+                "UPDATE packages SET last_used = ?2 WHERE fingerprint = ?1",
+                params![f, now() as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All packages, least recently used first.
+    pub fn packages_lru(&self) -> DbResult<Vec<PackageRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {PACKAGE_COLS} FROM packages ORDER BY last_used ASC, fingerprint"
+        ))?;
+        st.query_map([], PackageRow::from_row)?.collect()
+    }
+
+    pub fn delete_package(&mut self, fp: &str) -> DbResult<()> {
+        self.conn
+            .execute("DELETE FROM packages WHERE fingerprint = ?1", [fp])?;
+        Ok(())
+    }
+
+    pub fn char_rating(&self, fp: &str) -> DbResult<Option<rugen_proto::CharRating>> {
+        self.conn
+            .query_row(
+                "SELECT rating, games, wins FROM char_ratings WHERE fingerprint = ?1",
+                [fp],
+                |r| {
+                    Ok(rugen_proto::CharRating {
+                        rating: r.get(0)?,
+                        games: r.get(1)?,
+                        wins: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Record an anti-cheat finding against an account.
+    pub fn flag(&mut self, account: u64, match_id: Option<u64>, reason: &str) -> DbResult<()> {
+        log::warn!("flag: account {account}: {reason}");
+        self.conn.execute(
+            "INSERT INTO flags (account, match_id, reason, created) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                account as i64,
+                match_id.map(|m| m as i64),
+                reason,
+                now() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn flags_of(&self, account: u64) -> DbResult<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT reason FROM flags WHERE account = ?1 ORDER BY id")?;
+        st.query_map([account as i64], |r| r.get(0))?.collect()
     }
 
     /// A stored replay: (players, setup JSON, winner, created, inputs).

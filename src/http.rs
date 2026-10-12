@@ -26,8 +26,9 @@ use rugen_proto::{ClientMsg, ServerMsg};
 use crate::api::{Api, Request, Response};
 use crate::relay::Route;
 
-/// Result uploads carry input streams; everything else is tiny.
-const MAX_BODY: usize = 1024 * 1024;
+/// Package upload chunks (4 MB) are the largest bodies; results carry input
+/// streams; everything else is tiny.
+const MAX_BODY: usize = 4 * 1024 * 1024 + 64 * 1024;
 /// Requests allowed per IP per window.
 const RATE_LIMIT: u32 = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -55,10 +56,33 @@ impl RateLimiter {
     }
 }
 
+/// Package upload bytes per client IP per hour.
+#[derive(Default)]
+struct UploadLimiter {
+    bytes: HashMap<IpAddr, (Instant, u64)>,
+}
+
+impl UploadLimiter {
+    fn allow(&mut self, ip: IpAddr, n: u64, cap: u64) -> bool {
+        let now = Instant::now();
+        if self.bytes.len() > 50_000 {
+            self.bytes
+                .retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(3600));
+        }
+        let e = self.bytes.entry(ip).or_insert((now, 0));
+        if now.duration_since(e.0) >= Duration::from_secs(3600) {
+            *e = (now, 0);
+        }
+        e.1 += n;
+        e.1 <= cap
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     api: Arc<Api>,
     limiter: Arc<Mutex<RateLimiter>>,
+    uploads: Arc<Mutex<UploadLimiter>>,
     started: Instant,
 }
 
@@ -74,7 +98,7 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
 fn to_http(r: Response) -> HttpResponse {
     (
         StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        [(header::CONTENT_TYPE, "application/json")],
+        [(header::CONTENT_TYPE, r.content_type)],
         Body::from(r.body),
     )
         .into_response()
@@ -93,6 +117,7 @@ pub fn router(api: Arc<Api>) -> Router {
     let state = AppState {
         api,
         limiter: Arc::new(Mutex::new(RateLimiter::default())),
+        uploads: Arc::new(Mutex::new(UploadLimiter::default())),
         started: Instant::now(),
     };
     Router::new()
@@ -128,6 +153,19 @@ async fn any(
     // health checks (docker, tunnel, server lists) are not rate limited
     if uri.path() != "/health" && !allowed(&st, &headers, peer) {
         return json_error(429, "rate limited");
+    }
+    if method == Method::POST && uri.path().starts_with("/pkg/") && uri.path().ends_with("/upload")
+    {
+        let ip = client_ip(&headers, peer);
+        let cap = st.api.packages.cfg.ip_rate;
+        let ok = st
+            .uploads
+            .lock()
+            .map(|mut u| u.allow(ip, body.len() as u64, cap))
+            .unwrap_or(false);
+        if !ok {
+            return json_error(429, "upload limit reached, try again later");
+        }
     }
     let query = uri
         .query()
@@ -426,6 +464,23 @@ mod tests {
             panic!("{pushed:?}")
         };
         let rb: rugen_proto::RoomInfo = serde_json::from_str(&joined).unwrap();
+        assert!(ra.ticket.is_none() && rb.ticket.is_none(), "matchup first");
+        let id = rb.matchup.as_ref().unwrap().id;
+        // pick / verdict / confirm / upload / ready (see api tests)
+        let kit = crate::api::tests::Kit::new();
+        let api2 = _api.clone();
+        let (ka2, kb2) = (ka.to_string(), kb.to_string());
+        tokio::task::spawn_blocking(move || {
+            crate::api::tests::play_matchup(&api2, id, [&ka2, &kb2], &kit);
+        })
+        .await
+        .unwrap();
+        let ra = http(addr, "GET", &format!("/room/{code}?key={ka}"), "").await;
+        let rb = http(addr, "GET", &format!("/room/{code}?key={kb}"), "").await;
+        seen += &ra;
+        seen += &rb;
+        let ra: rugen_proto::RoomInfo = serde_json::from_str(&ra).unwrap();
+        let rb: rugen_proto::RoomInfo = serde_json::from_str(&rb).unwrap();
         let (ta, tb) = (ra.ticket.unwrap(), rb.ticket.unwrap());
         assert_eq!(ta.session, tb.session);
 
@@ -539,11 +594,29 @@ mod tests {
             &format!(r#"{{"key":"{kb}","char":"kfm"}}"#),
         )
         .await;
-        loop {
+        let id = loop {
             let m: ServerMsg = serde_json::from_str(&next_text(&mut wa).await).unwrap();
             if let ServerMsg::Found { found } = m {
                 assert_eq!(found.side, 1);
-                assert_eq!(found.ticket.unwrap().slot, 0);
+                assert!(found.ticket.is_none());
+                break found.matchup.unwrap().id;
+            }
+        };
+        let kit = crate::api::tests::Kit::new();
+        let (ka2, kb2) = (ka.to_string(), kb.to_string());
+        tokio::task::spawn_blocking(move || {
+            crate::api::tests::play_matchup(&_api, id, [&ka2, &kb2], &kit);
+        })
+        .await
+        .unwrap();
+        // the start is pushed with this player's ticket
+        loop {
+            let m: ServerMsg = serde_json::from_str(&next_text(&mut wa).await).unwrap();
+            if let ServerMsg::Matchup { matchup } = m
+                && let Some(t) = matchup.ticket
+            {
+                assert_eq!(matchup.phase, "started");
+                assert_eq!(t.slot, 0);
                 break;
             }
         }
