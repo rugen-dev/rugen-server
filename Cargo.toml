@@ -1,6 +1,6 @@
 [package]
 name = "rugen-relay"
-description = "rugen-server: UDP rendezvous + JSON API (accounts, rooms, ranked matchmaking, Elo)"
+description = "rugen-server: lobby, rooms, ranked (Elo), match relay over UDP / WebSocket, SQLite"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,6 +18,14 @@ env_logger.workspace = true
 serde.workspace = true
 serde_json = "1"
 getrandom = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
+argon2 = "0.5"
+
+[dev-dependencies]
+tokio-tungstenite = "0.27"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [lints]
 workspace = true
