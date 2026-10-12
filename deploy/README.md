@@ -74,6 +74,94 @@ The image is pulled from `ghcr.io/rugen-dev/rugen-server:latest`
 on the server instead, uncomment the `build:` block in the compose file
 (and drop `image:` or point `RUGEN_IMAGE` at a local tag).
 
+## 2b. Optional: Cloudflare Realtime TURN (real UDP behind a tunnel)
+
+Behind a Cloudflare Tunnel (no open ports) matches use the WebSocket relay,
+which works everywhere but rides TCP through the tunnel twice. With
+**Cloudflare Realtime TURN** the server hands each player a short-lived TURN
+credential and the two clients relay their match datagrams through
+Cloudflare's anycast TURN servers over **UDP** instead (TCP / TLS 443 when UDP
+is blocked). The server still signals and verifies, but never sees the match
+packets, and nobody learns an IP address: each player only learns the other's
+*relayed* address, which belongs to Cloudflare. If TURN does not work for a
+player the match silently stays on the server relay (the clients wait at most
+1.5 s for it).
+
+### Set it up
+
+1. Cloudflare dashboard → **Realtime** (formerly *Calls*) → **TURN Server**
+   → **Create** (name it e.g. `rugen`). Copy the **Turn Token ID** and the
+   **API Token** shown once.
+2. Dokploy → your rugen-server compose → **Environment** tab, add:
+
+   ```env
+   RUGEN_CF_TURN_KEY_ID=<Turn Token ID>
+   RUGEN_CF_TURN_TOKEN=<API Token>
+   ```
+
+   and **Redeploy**. The log shows `turn: Cloudflare TURN on (key abc123…),
+   2026-10: 0.00 of 500 GB used`; `/health` gains a `turn` object (month,
+   `used_gb`, `cap_gb`, `issuing`, `ranked_only`, `matches`).
+3. Optional, recommended: let the server cross-check its own count with
+   Cloudflare's analytics. **My Profile → API Tokens → Create Token →
+   Custom**, permission *Account → Account Analytics → Read* for your account,
+   then add `RUGEN_CF_ACCOUNT_ID=<account id>` (dashboard URL / overview
+   sidebar) and `RUGEN_CF_ANALYTICS_TOKEN=<that token>`. Every 15 minutes the
+   server reads this month's TURN bytes for its key and counts whichever is
+   higher, its estimate or Cloudflare's number.
+
+The secrets are only read from the environment and never logged. Nothing else
+changes: no ports, the tunnel stays the only way in (the TURN traffic goes
+from the players to Cloudflare, not to your server).
+
+### Never pay: the budget
+
+Cloudflare bills Realtime (SFU + TURN together) by **egress, $0.05 per GB,
+with the first 1,000 GB each month free**
+([pricing](https://developers.cloudflare.com/realtime/pricing/)). The server
+keeps TURN far below that with a hard monthly cap, tracked per **UTC calendar
+month** in SQLite (survives restarts):
+
+- Each credential **reserves** `ttl × RUGEN_TURN_RATE_ESTIMATE × 2 directions
+  × RUGEN_TURN_SAFETY` bytes when it is handed out (both directions are
+  counted although Cloudflare only bills egress). The TTL is the longest the
+  match can last with its rules (every round to the time limit + 25 s,
+  infinite rounds count as 4 min, + 90 s), at most `RUGEN_TURN_TTL_MAX`; a
+  rematch gets fresh credentials.
+- When the credential ends (the player reported the result, the relay
+  session closed, or the TTL passed) the reservation is **settled** to
+  `max(bytes the client reported × safety, a quarter of the reservation)`.
+  Clients report their TURN byte counters in relay keep-alives and in the
+  result.
+- `used = max(estimate, client reports, Cloudflare analytics)`. At
+  `RUGEN_TURN_SOFT_PERCENT` (80 %) of `RUGEN_TURN_BUDGET_GB` only ranked
+  matches still get TURN (and a warning is logged); at the cap no credential
+  is issued until the month rolls over, so matches use the WebSocket relay.
+- Per credential: one per player per match, never for spectators, revoked at
+  Cloudflare as soon as it is no longer needed, and revoked early if its
+  reported traffic passes `ttl × rate × 8` (a ceiling far above a real match).
+  Cloudflare itself stops a credential at its TTL.
+- Per account / per client IP: at most `RUGEN_TURN_MAX_MATCHES_PER_HOUR` /
+  `_PER_DAY` (12 / 60) and `..._HOUR_IP` / `..._DAY_IP` (24 / 120) TURN
+  matches.
+
+The math with the defaults (500 GB cap = half the free tier, rules 2 rounds
+to win / 99 s, so ttl = 3 × 124 + 90 = 462 s):
+
+| | per player | per match (2 players) |
+|---|---|---|
+| reserved at start: 462 s × 8,000 B/s × 2 × 2.0 | 14.8 MB | 29.6 MB |
+| settled floor (a quarter) | 3.7 MB | 7.4 MB |
+| measured real traffic, 99-second match, both directions | ≈ 0.7 MB | ≈ 1.4 MB |
+
+So the cap is reached after at most 500 GB / 29.6 MB ≈ **16,900 matches in
+flight**, and after about 500 GB / 7.4 MB ≈ **67,500 settled matches** a month
+— while those matches really move only ≈ 95 GB through Cloudflare. Even a
+month where every one of those matches never reported back stays at 500 GB,
+half the free 1,000 GB. Raising `RUGEN_TURN_BUDGET_GB` above 1000 logs a
+warning; keep it at or below 1000 and the free tier cannot be exceeded by
+rugen (other Realtime / SFU use on the same account shares the allowance).
+
 ## 3. Players
 
 In the game: **ONLINE → ADD SERVER** → `https://rugen.example.com`, or in
@@ -192,6 +280,17 @@ purpose.
 | `RUGEN_HTTP_PORT`  | `8080`             | host port for HTTP (compose only) |
 | `RUGEN_UDP_PORT`   | `7001`             | host port for the UDP relay (compose only) |
 | `CF_TUNNEL_TOKEN`  | –                  | tunnel token, `deploy/cloudflared/` only |
+| `RUGEN_CF_TURN_KEY_ID` | –              | Cloudflare Realtime TURN key id (TURN is off without it) |
+| `RUGEN_CF_TURN_TOKEN` | –               | that key's API token (secret) |
+| `RUGEN_CF_ACCOUNT_ID` | –               | optional: account id for the usage cross-check |
+| `RUGEN_CF_ANALYTICS_TOKEN` | –          | optional: API token with *Account Analytics: Read* |
+| `RUGEN_TURN_BUDGET_GB` | `500`          | hard monthly TURN cap (decimal GB; free tier is 1000) |
+| `RUGEN_TURN_SOFT_PERCENT` | `80`        | above this share of the cap only ranked matches get TURN |
+| `RUGEN_TURN_MAX_MATCHES_PER_HOUR` / `_PER_DAY` | `12` / `60` | TURN matches per account |
+| `RUGEN_TURN_MAX_MATCHES_PER_HOUR_IP` / `_PER_DAY_IP` | `24` / `120` | TURN matches per client IP |
+| `RUGEN_TURN_RATE_ESTIMATE` | `8000`     | budgeted bytes / s per player and direction (measured ≈ 3,500) |
+| `RUGEN_TURN_SAFETY` | `2.0`             | factor on estimates and client reports |
+| `RUGEN_TURN_TTL_MAX` | `1800`           | longest credential in seconds |
 
 ## Backups
 
@@ -235,8 +334,9 @@ proxy with TLS works too; it must pass WebSocket upgrades for `/ws` and
 ## Security notes
 
 - **IP addresses are never shared.** Match traffic is relayed by the
-  server; no API or WebSocket payload contains a client address (tests
-  assert it). Client IPs are used only for rate limiting and are not
+  server (or by Cloudflare TURN, where each player only learns the other's
+  Cloudflare relayed address); no API or WebSocket payload contains a client
+  address (tests assert it). Client IPs are used only for rate limiting and are not
   logged at `info`.
 - Relay datagrams are authenticated per session and slot with a random
   128-bit token handed out over HTTPS only to that player; a slot may move
@@ -278,8 +378,10 @@ What the client does to keep online play feeling local:
   same game settings (room round time / mode), whatever their local
   options say.
 - **Result verification**: both clients report winner, last frame, world
-  checksum and the confirmed input stream; disagreement marks the match
-  *disputed* (no rating change). Ranked input streams are stored as
+  checksum, a world checksum every 60 frames and the confirmed input stream
+  (run-length encoded for TURN-capable servers); disagreement on the frames
+  both confirmed marks the match *disputed* (no rating change). This does
+  not need the server to see the match traffic, so it covers TURN matches. Ranked input streams are stored as
   replays (latest 2000). With `--features resim` the server re-simulates
   disputed matches headless and settles them (see above).
 - **Same files on both sides**: the matchup syncs both fighters and the
