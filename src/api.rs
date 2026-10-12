@@ -275,6 +275,7 @@ fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
         token: to_hex(&r.tokens[slot]),
         spectators: r.slots.len().saturating_sub(2) as u8,
         udp: udp.clone(),
+        transports: rugen_proto::relay_transports(udp.as_deref()),
     }
 }
 
@@ -359,6 +360,7 @@ impl Api {
             rooms,
             matches: lock(&self.relay).session_count(),
             udp: self.cfg.udp_public.clone(),
+            transports: rugen_proto::relay_transports(self.cfg.udp_public.as_deref()),
             key: self.truth.public_key().map(|k| k.hex()),
             official: self.truth.is_official(),
         })

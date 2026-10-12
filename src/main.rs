@@ -9,7 +9,9 @@
 //! ```text
 //! RUGEN_BIND        --bind      HTTP / WebSocket listener          0.0.0.0:8080
 //! RUGEN_UDP_BIND    --udp-bind  UDP relay (fast path), "off"       0.0.0.0:7001
-//! RUGEN_UDP_PUBLIC              host:port clients send UDP to      <public url host>:<udp port>
+//! RUGEN_UDP_PUBLIC              host:port clients send UDP to,     <public url host>:<udp port>
+//!                               "off" = no UDP relay at all (tunnel-only: nothing bound,
+//!                               nothing advertised, clients use the /relay WebSocket at once)
 //! RUGEN_PUBLIC_URL              public https URL (logged, UDP host fallback)
 //! RUGEN_DATA        --data      directory of rugen.db              /data
 //! RUGEN_NAME        --name      server name in server lists        rugen server
@@ -96,13 +98,16 @@ fn settings() -> Settings {
     let udp_bind = opt("--udp-bind")
         .or_else(|| env("RUGEN_UDP_BIND"))
         .unwrap_or_else(|| "0.0.0.0:7001".into());
+    let off = |v: &str| matches!(v, "off" | "0" | "false" | "none");
+    let udp_public = env("RUGEN_UDP_PUBLIC");
+    // RUGEN_UDP_PUBLIC=off: tunnel-only server, no UDP socket at all
+    let udp_off = off(&udp_bind) || udp_public.as_deref().is_some_and(off);
     Settings {
         bind: opt("--bind")
             .or_else(|| env("RUGEN_BIND"))
             .unwrap_or_else(|| "0.0.0.0:8080".into()),
-        udp_bind: (!matches!(udp_bind.as_str(), "off" | "0" | "false" | "none"))
-            .then_some(udp_bind),
-        udp_public: env("RUGEN_UDP_PUBLIC"),
+        udp_bind: (!udp_off).then_some(udp_bind),
+        udp_public: udp_public.filter(|v| !off(v)),
         public_url: env("RUGEN_PUBLIC_URL"),
         data: opt("--data")
             .or_else(|| env("RUGEN_DATA"))
@@ -371,7 +376,9 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     } else {
-        log::info!("udp relay off: matches relay over the /relay WebSocket only");
+        log::info!(
+            "udp relay off: nothing bound or advertised, matches relay over the /relay WebSocket only"
+        );
     }
     if let Some(u) = &s.public_url {
         log::info!("public url {u}");
