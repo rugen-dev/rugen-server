@@ -20,8 +20,22 @@ use crate::store::Store;
 
 const ENGINE: &str = "rugen e2e";
 
+/// The rugen-engine checkout holding `reference/` and `chars/`:
+/// `RUGEN_ENGINE_DIR`, else a sibling `../rugen-engine` (or `../rugen`).
+fn engine_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RUGEN_ENGINE_DIR") {
+        return dir.into();
+    }
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    ["../rugen-engine", "../rugen"]
+        .iter()
+        .map(|d| here.join(d))
+        .find(|d| d.join("reference").is_dir())
+        .unwrap_or_else(|| here.join("../rugen-engine"))
+}
+
 fn reference() -> Option<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference/mugen-1.1b1");
+    let root = engine_dir().join("reference/mugen-1.1b1");
     root.join("chars/kfm/kfm.def").exists().then_some(root)
 }
 
@@ -361,16 +375,16 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// Naruto vs Sasuke (the real RAR characters in `chars/`, ~80 MB each):
+/// Naruto vs Sasuke (the real RAR characters in the engine's `chars/`, ~80 MB each):
 /// fingerprints, profiles, verdict, upload, download and a synced relay
-/// match. Slow (packaging); run with `cargo test -p rugen-relay -- --ignored`.
+/// match. Slow (packaging); run with `cargo test --release -- --ignored`.
 #[test]
 #[ignore]
 fn naruto_vs_sasuke_real_characters() {
     let Some(reference) = reference() else {
         return;
     };
-    let chars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../chars");
+    let chars = engine_dir().join("chars");
     let (naruto, sasuke) = (
         chars.join("G6_Naruto.rar"),
         chars.join("G6_Sasuke_Rinnegan.rar"),

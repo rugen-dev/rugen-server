@@ -2,8 +2,9 @@
 #
 #   docker build -f deploy/Dockerfile -t rugen-server .
 #
-# Only the server crate is compiled (no game, no wgpu); the workspace
-# manifests are copied because Cargo resolves the whole workspace.
+# The engine crates it shares with the game (rugen-proto, rugen-fair,
+# rugen-formats, …) come from github.com/rugen-dev/rugen-engine as pinned
+# in Cargo.lock; no game, no wgpu.
 
 FROM rust:1.90-alpine3.22 AS build
 # `--build-arg FEATURES=resim` re-simulates disputed matches (needs RUGEN_RESIM_DATA)
@@ -11,10 +12,11 @@ ARG FEATURES=""
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates crates
+COPY src src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p rugen-relay --bin rugen-server \
+    cargo build --release --locked --bin rugen-server \
       ${FEATURES:+--features "$FEATURES"} \
  && cp target/release/rugen-server /rugen-server \
  && strip /rugen-server \

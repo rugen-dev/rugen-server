@@ -1,0 +1,62 @@
+# Standalone rugen-server binaries for people who don't use Docker.
+# Tags only (free tier); the container image is server-image.yml.
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin rugen-server
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/
+          cp -r deploy dist/
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/rugen-server.exe dist/
+            7z a rugen-server-${{ matrix.name }}.zip ./dist/*
+          else
+            cp target/release/rugen-server dist/
+            tar -C dist -czf rugen-server-${{ matrix.name }}.tar.gz .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rugen-server-${{ matrix.name }}
+          path: |
+            rugen-server-*.zip
+            rugen-server-*.tar.gz
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rugen-server-*.zip
+            rugen-server-*.tar.gz

@@ -12,7 +12,7 @@ name: rugen
 services:
   rugen-server:
     # prebuilt image from GHCR (published on v* tags); or build locally:
-    image: ${RUGEN_IMAGE:-ghcr.io/diary-axel-rakotoarivao/rugen-server:latest}
+    image: ${RUGEN_IMAGE:-ghcr.io/rugen-dev/rugen-server:latest}
     # build:
     #   context: ..
     #   dockerfile: deploy/Dockerfile

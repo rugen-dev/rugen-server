@@ -1,24 +1,24 @@
 [package]
-name = "rugen-relay"
+name = "rugen-server"
 description = "rugen-server: lobby, rooms, ranked (Elo), match relay over UDP / WebSocket, SQLite"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+version = "0.3.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rugen-dev/rugen-server"
+rust-version = "1.85"
 
 [[bin]]
 name = "rugen-server"
 path = "src/main.rs"
 
 [dependencies]
-rugen-proto.workspace = true
-rugen-fair.workspace = true
-rugen-formats.workspace = true
-rugen-sim = { workspace = true, optional = true }
-log.workspace = true
-env_logger.workspace = true
-serde.workspace = true
+rugen-proto = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-fair = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-formats = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main", optional = true }
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -31,11 +31,19 @@ argon2 = "0.5"
 resim = ["dep:rugen-sim"]
 
 [dev-dependencies]
-rugen-net.workspace = true
-rugen-content.workspace = true
-rugen-sim.workspace = true
+rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
 tokio-tungstenite = "0.27"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "warn"
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+[profile.dev.package."*"]
+opt-level = 2

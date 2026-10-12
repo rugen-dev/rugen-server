@@ -58,7 +58,7 @@ can be changed with `RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
    cannot carry UDP). With the tunnel you may also drop the `8080` port
    mapping from the server compose.
 
-The image is pulled from `ghcr.io/diary-axel-rakotoarivao/rugen-server:latest`
+The image is pulled from `ghcr.io/rugen-dev/rugen-server:latest`
 (published by `.github/workflows/server-image.yml` on `v*` tags). To build
 on the server instead, uncomment the `build:` block in the compose file
 (and drop `image:` or point `RUGEN_IMAGE` at a local tag).
@@ -143,7 +143,7 @@ do not run a public server if you cannot answer takedown requests.
 
 ### Re-simulating disputed matches
 
-Built with `--features resim` (`cargo build --release -p rugen-relay
+Built with `--features resim` (`cargo build --release
 --features resim`, or `docker build --build-arg FEATURES=resim ...`) and
 given the engine data (`RUGEN_RESIM_DATA=/path/to/data`, the folder with
 `common1.cns` / `fight.def`), the server re-plays a disputed match from

@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use rugen_proto::FighterDecl;
 
 pub fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("rugen-relay-{tag}-{}", crate::store::random_hex(4)));
+    let d = std::env::temp_dir().join(format!(
+        "rugen-server-{tag}-{}",
+        crate::store::random_hex(4)
+    ));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
