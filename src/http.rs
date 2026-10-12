@@ -184,6 +184,7 @@ async fn any(
         path: uri.path().to_string(),
         query,
         body: body.to_vec(),
+        ip: Some(client_ip(&headers, peer)),
     };
     let api = st.api.clone();
     match tokio::task::spawn_blocking(move || api.handle(req)).await {

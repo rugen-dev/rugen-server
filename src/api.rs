@@ -16,7 +16,7 @@
 //! POST /queue                   {key, char, ranked?, max_ping?, rtt_ms?}
 //! GET  /queue?key=              QueueStatus (found match once paired)
 //! DELETE /queue (or POST /queue/leave) {key}
-//! POST /result                  {key, match_id, winner, frames?, checksum?, inputs?}
+//! POST /result                  {key, match_id, winner, frames?, checksum?, inputs? | inputs_rle?, checksums?, turn?}
 //! GET  /replay/{match_id}       stored ranked replay
 //! GET  /leaderboard?key=
 //! GET  /seasons/current
@@ -62,12 +62,15 @@ use crate::password;
 use crate::relay::Relay;
 use crate::resim::ResimConfig;
 use crate::store::{Account, DbResult, ReportData, Store, random_code, setup_fingerprints};
+use crate::turn::{Turn, TurnConfig};
 
 pub struct Request {
     pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// Client address, for per-IP limits only (never stored or echoed).
+    pub ip: Option<std::net::IpAddr>,
 }
 
 pub struct Response {
@@ -160,6 +163,8 @@ pub struct ApiConfig {
     pub pkg: PkgConfig,
     pub thresholds: Thresholds,
     pub resim: Option<ResimConfig>,
+    /// Cloudflare Realtime TURN credentials ([`crate::turn`]).
+    pub turn: Option<TurnConfig>,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -183,6 +188,7 @@ pub struct Api {
     upload_budget: Mutex<HashMap<u64, (Instant, u64)>>,
     me: Weak<Api>,
     cfg: ApiConfig,
+    pub turn: Option<Arc<Turn>>,
 }
 
 type Res = Result<Response, Response>;
@@ -255,12 +261,18 @@ fn clean_rules(v: Option<&Value>) -> Rules {
 }
 
 fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
+    let mut transports = rugen_proto::relay_transports(udp.as_deref());
+    // TURN first for the two players when the server got credentials
+    if let Some(Some(t)) = r.turn.get(slot) {
+        transports.insert(0, t.clone());
+    }
     SessionTicket {
         session: r.session,
         slot: slot as u8,
         token: to_hex(&r.tokens[slot]),
         spectators: r.slots.len().saturating_sub(2) as u8,
         udp: udp.clone(),
+        transports,
     }
 }
 
@@ -272,6 +284,7 @@ impl Api {
                 Packages::open(None, cfg.pkg.clone())
             })
             .expect("a temporary packages directory");
+        let turn = cfg.turn.clone().map(Turn::new);
         Arc::new_cyclic(|me| Self {
             store: Mutex::new(store),
             rooms: Mutex::new(HashMap::new()),
@@ -284,7 +297,21 @@ impl Api {
             upload_budget: Mutex::new(HashMap::new()),
             me: me.clone(),
             cfg,
+            turn,
         })
+    }
+
+    pub fn store_lock(&self) -> MutexGuard<'_, Store> {
+        lock(&self.store)
+    }
+
+    /// TURN housekeeping (revocations, ceilings, analytics), every few
+    /// seconds from the server's timer.
+    pub fn sweep_turn(&self) {
+        if let Some(t) = &self.turn {
+            let s = lock(&self.store);
+            t.sweep(&s, &self.relay);
+        }
     }
 
     /// Expire / evict stored packages (TTL, LRU size cap).
@@ -312,7 +339,11 @@ impl Api {
         if key.len() != 64 {
             return Err(err(401, "bad key"));
         }
-        db(store.by_key(&key))?.ok_or_else(|| err(401, "bad key"))
+        let a = db(store.by_key(&key))?.ok_or_else(|| err(401, "bad key"))?;
+        if let (Some(t), Some(ip)) = (&self.turn, req.ip) {
+            t.note_ip(a.id, ip);
+        }
+        Ok(a)
     }
 
     fn me(&self, req: &Request, v: &Value) -> Result<Account, Response> {
@@ -346,7 +377,14 @@ impl Api {
         let path: Vec<&str> = req.path.trim_matches('/').split('/').collect();
         let v = body(&req);
         match (req.method.as_str(), path.as_slice()) {
-            ("GET", [""]) | ("GET", ["health"]) | ("GET", ["info"]) => ok(&db(self.info())?),
+            ("GET", [""]) | ("GET", ["health"]) | ("GET", ["info"]) => {
+                let mut v = serde_json::to_value(db(self.info())?).unwrap_or(Value::Null);
+                // TURN budget, numbers only (older clients ignore it)
+                if let Some(t) = &self.turn {
+                    v["turn"] = t.status(&lock(&self.store));
+                }
+                Ok(Response::json(200, &v))
+            }
             ("POST", ["register"]) => {
                 let mut s = lock(&self.store);
                 if db(s.account_count())? >= 1_000_000 {
@@ -949,11 +987,27 @@ impl Api {
         ) else {
             return Err(err(400, "match_id and winner required"));
         };
-        let inputs = match v.get("inputs").and_then(Value::as_str) {
-            Some(h) if h.len() <= 8 * 60 * 60 * 15 => {
+        const MAX_FRAMES: usize = 60 * 60 * 15;
+        let mut inputs = match v.get("inputs").and_then(Value::as_str) {
+            Some(h) if h.len() <= 8 * MAX_FRAMES => {
                 rugen_proto::from_hex(h).ok_or_else(|| err(400, "inputs must be hex"))?
             }
             Some(_) => return Err(err(413, "inputs too long")),
+            None => Vec::new(),
+        };
+        // run-length encoded inputs (clients of TURN-capable servers)
+        if let Some(h) = v.get("inputs_rle").and_then(Value::as_str) {
+            let rle = rugen_proto::from_hex(h)
+                .filter(|b| b.len() <= 5 * MAX_FRAMES)
+                .ok_or_else(|| err(400, "bad inputs_rle"))?;
+            inputs = rugen_proto::evidence::decode_inputs(&rle, MAX_FRAMES)
+                .ok_or_else(|| err(400, "bad inputs_rle"))?;
+        }
+        let checksums = match v.get("checksums").and_then(Value::as_str) {
+            Some(h) => rugen_proto::from_hex(h)
+                .filter(|b| b.len() <= 12 * (MAX_FRAMES / 60 + 1))
+                .and_then(|b| rugen_proto::evidence::decode_checksums(&b))
+                .ok_or_else(|| err(400, "bad checksums"))?,
             None => Vec::new(),
         };
         let data = ReportData {
@@ -961,10 +1015,22 @@ impl Api {
             frames: v.get("frames").and_then(Value::as_u64).unwrap_or(0) as u32,
             checksum: v.get("checksum").and_then(Value::as_u64),
             inputs,
+            checksums,
         };
         let out = db(s.report(me, match_id, &data))?;
         if !out.accepted {
             return Err(err(404, "not your match"));
+        }
+        // this player is done with TURN: settle and revoke its credential
+        if let Some(t) = &self.turn {
+            let reported = v
+                .get("turn")
+                .map(|b| b["rx"].as_u64().unwrap_or(0) + b["tx"].as_u64().unwrap_or(0));
+            if let Some(slot) =
+                db(s.match_players(match_id))?.and_then(|p| p.iter().position(|&a| a == me))
+            {
+                t.finished(&s, match_id, slot as u8, reported);
+            }
         }
         if out.disputed {
             self.spawn_resim(match_id);
@@ -1203,6 +1269,12 @@ impl Api {
         rooms: &mut HashMap<String, Room>,
         m: &mut Matchup,
     ) -> Result<bool, Response> {
+        // fetch TURN credentials while the clients sync files
+        if m.phase() == "sync"
+            && let Some(t) = &self.turn
+        {
+            t.prepare(store, m.id, m.players, m.ranked, &m.rules);
+        }
         if m.phase() != "sync" || !m.missing(&|fp| self.stored(store, fp)).is_empty() {
             return Ok(false);
         }
@@ -1243,11 +1315,17 @@ impl Api {
         let (session, tokens) = lock(&self.relay)
             .create(&slots)
             .ok_or_else(|| err(503, "relay full"))?;
+        let turn = self
+            .turn
+            .as_ref()
+            .map(|t| t.take(store, m.id, session))
+            .unwrap_or_default();
         let run = Running {
             match_id: m.id,
             session,
             slots,
             tokens,
+            turn,
         };
         if let Some(r) = room {
             r.running = Some(run.clone());
@@ -1574,6 +1652,7 @@ pub(crate) mod tests {
             path,
             query,
             body,
+            ip: None,
         }
     }
 

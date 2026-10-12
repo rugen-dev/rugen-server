@@ -30,6 +30,8 @@ pub struct Running {
     /// Accounts by relay slot (P1, P2, spectators).
     pub slots: Vec<u64>,
     pub tokens: Vec<[u8; 16]>,
+    /// `turn` ticket transport per player slot (empty: no TURN).
+    pub turn: Vec<Option<rugen_proto::RelayTransport>>,
 }
 
 pub struct Matchup {
