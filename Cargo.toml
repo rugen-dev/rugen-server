@@ -37,8 +37,9 @@ resim = ["dep:rugen-sim"]
 rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.4.0" }
 rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.4.0" }
 rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.4.0" }
-tokio-tungstenite = "0.27"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [lints.rust]
 unsafe_code = "warn"
