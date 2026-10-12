@@ -12,10 +12,10 @@ name = "rugen-server"
 path = "src/main.rs"
 
 [dependencies]
-rugen-proto = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
-rugen-fair = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
-rugen-formats = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
-rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main", optional = true }
+rugen-proto = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
+rugen-fair = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
+rugen-formats = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0", optional = true }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
@@ -31,9 +31,9 @@ argon2 = "0.5"
 resim = ["dep:rugen-sim"]
 
 [dev-dependencies]
-rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
-rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
-rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", branch = "main" }
+rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
+rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.3.0" }
 tokio-tungstenite = "0.27"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
