@@ -433,6 +433,7 @@ impl Api {
             match_id: r.running.as_ref().map_or(0, |run| run.match_id),
             est_ping_ms,
             ticket: my_ticket,
+            matchup: None,
         }
     }
 
@@ -851,6 +852,7 @@ impl Api {
                 ranked: me.ranked,
                 est_ping_ms: Some(est),
                 ticket: Some(ticket(&run, side as usize - 1, &self.cfg.udp_public)),
+                matchup: None,
             };
             let (ma, mb) = (info(1, a, b), info(2, b, a));
             {
@@ -939,6 +941,8 @@ impl Api {
             stage: field("stage"),
             winner,
             inputs: to_hex(&inputs),
+            fingerprints: Vec::new(),
+            files_available: false,
         })
     }
 }
