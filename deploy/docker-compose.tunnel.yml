@@ -1,0 +1,56 @@
+# rugen-server behind a Cloudflare Tunnel only: no published ports, no UDP.
+# For Dokploy "Compose" apps from this Git repository (compose path
+# ./deploy/docker-compose.tunnel.yml). The image is built on the host from
+# this repo, so no registry login is needed. Matches use the WebSocket relay
+# through the tunnel.
+#
+# Tunnel public hostname: play.example.com → HTTP → http://rugen-server:8080
+# (cloudflared must share a network with this service: dokploy-network here).
+
+name: rugen
+
+services:
+  rugen-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rugen-server:local
+    container_name: rugen-server
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RUGEN_BIND: 0.0.0.0:8080
+      RUGEN_UDP_BIND: "off"
+      RUGEN_DATA: /data
+      RUGEN_PUBLIC_URL: ${RUGEN_PUBLIC_URL:-}
+      RUGEN_NAME: ${RUGEN_NAME:-rugen server}
+      RUGEN_MOTD: ${RUGEN_MOTD:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - rugen-data:/data
+    # no "ports:": only the tunnel reaches the server
+    healthcheck:
+      test: ["CMD", "/rugen-server", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - rugen
+      - dokploy-network
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  rugen:
+    name: rugen
+  dokploy-network:
+    external: true
+
+volumes:
+  rugen-data: {}

@@ -42,6 +42,17 @@ can be changed with `RUGEN_HTTP_PORT` / `RUGEN_UDP_PORT`.
    `udp relay advertised as ...`; `https://rugen.example.com/health` answers
    with the server name, version and players online.
 
+### Tunnel-only (no open ports)
+
+If a Cloudflare Tunnel (or Zero Trust) is the only way in, use
+`deploy/docker-compose.tunnel.yml` as the compose path instead. It publishes
+no ports, turns the UDP relay off (matches use the WebSocket relay through
+the tunnel), joins `dokploy-network` so a cloudflared container there
+reaches it as `http://rugen-server:8080`, and builds the image on the host
+from this repository, so no registry login is needed. Set the Watch Paths to
+`deploy/**`, `src/**`, `Cargo.toml` and `Cargo.lock` to redeploy on server
+changes.
+
 ## 2. Optional: Cloudflare Tunnel (separate compose)
 
 1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a
