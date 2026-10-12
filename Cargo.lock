@@ -1384,7 +1384,7 @@ dependencies = [
 [[package]]
 name = "rugen-cns"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "indexmap",
  "libm",
@@ -1396,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "rugen-content"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "blake3",
  "image-webp",
@@ -1414,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "rugen-fair"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "libm",
  "log",
@@ -1429,7 +1429,7 @@ dependencies = [
 [[package]]
 name = "rugen-formats"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "bytemuck",
  "indexmap",
@@ -1441,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "rugen-net"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "bincode",
  "ggrs",
@@ -1458,7 +1458,7 @@ dependencies = [
 [[package]]
 name = "rugen-proto"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "serde",
 ]
@@ -1489,7 +1489,7 @@ dependencies = [
 [[package]]
 name = "rugen-sim"
 version = "0.3.0"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#906eb4b50abd46c5c489d9e333acba874f040000"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.3.0#52e296c7a8a56e917985e0a8ee9041a8a1f28f2c"
 dependencies = [
  "indexmap",
  "libm",
