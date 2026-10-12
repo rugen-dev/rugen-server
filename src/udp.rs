@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::relay::{Relay, Route};
@@ -12,7 +12,7 @@ use crate::relay::{Relay, Route};
 /// Datagrams per source IP per second before anything is parsed.
 const IP_PPS: u32 = 2000;
 
-pub fn serve(socket: Arc<UdpSocket>, relay: Arc<Mutex<Relay>>) -> std::io::Result<()> {
+pub fn serve(socket: Arc<UdpSocket>, relay: Arc<Relay>) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     log::info!("udp relay listening on {}", socket.local_addr()?);
     let mut buf = [0u8; 2048];
@@ -21,8 +21,8 @@ pub fn serve(socket: Arc<UdpSocket>, relay: Arc<Mutex<Relay>>) -> std::io::Resul
     loop {
         let now = Instant::now();
         if now.duration_since(last_expire) > Duration::from_secs(5) {
+            // (relay sessions expire on the server's own timer, UDP or not)
             per_ip.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(2));
-            relay.lock().unwrap_or_else(|p| p.into_inner()).expire(now);
             last_expire = now;
         }
         let (n, from) = match socket.recv_from(&mut buf) {
@@ -50,10 +50,7 @@ pub fn serve(socket: Arc<UdpSocket>, relay: Arc<Mutex<Relay>>) -> std::io::Resul
         if e.1 > IP_PPS {
             continue;
         }
-        relay
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .on_packet(&buf[..n], Route::Udp(from), now);
+        relay.on_packet(&buf[..n], &Route::Udp(from), now);
     }
 }
 
@@ -68,9 +65,9 @@ mod tests {
     fn udp_clients_exchange_through_the_relay() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let server = socket.local_addr().unwrap();
-        let relay = Arc::new(Mutex::new(Relay::default()));
-        relay.lock().unwrap().set_udp(socket.clone());
-        let (id, tokens) = relay.lock().unwrap().create(&[1, 2]).unwrap();
+        let relay = Arc::new(Relay::default());
+        relay.set_udp(socket.clone());
+        let (id, tokens) = relay.create(&[1, 2]).unwrap();
         let r = relay.clone();
         std::thread::spawn(move || serve(socket, r));
 
@@ -111,6 +108,9 @@ mod tests {
         assert_eq!(recv(&a, wire::DATA), b"input-b");
         send(&a, wire::PING, 0, 0, b"123");
         assert_eq!(recv(&a, wire::PONG), b"123");
-        assert_eq!(relay.lock().unwrap().forwarded, 2);
+        assert_eq!(
+            relay.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 }

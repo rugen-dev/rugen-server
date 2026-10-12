@@ -54,6 +54,11 @@ pub struct Matchup {
     pub started: Option<Running>,
     pub created: Instant,
     pub touched: Instant,
+    /// Queue matches: estimated player ↔ player round trip.
+    pub est_ping_ms: Option<u32>,
+    /// Queue matches: the estimate is above the high-ping threshold, so
+    /// clients show it on the confirm screen (both must accept anyway).
+    pub high_ping: bool,
 }
 
 impl Matchup {
@@ -82,6 +87,8 @@ impl Matchup {
             started: None,
             created: Instant::now(),
             touched: Instant::now(),
+            est_ping_ms: None,
+            high_ping: false,
         }
     }
 
@@ -134,6 +141,15 @@ impl Matchup {
             out.push(0);
         }
         out
+    }
+
+    /// Additive JSON fields of this matchup's view (documented in the API
+    /// module): `est_ping_ms` and `high_ping`, queue matches only.
+    pub fn extend_view(&self, view: &mut serde_json::Value) {
+        if let (Some(est), Some(obj)) = (self.est_ping_ms, view.as_object_mut()) {
+            obj.insert("est_ping_ms".into(), est.into());
+            obj.insert("high_ping".into(), self.high_ping.into());
+        }
     }
 
     pub fn phase(&self) -> &'static str {

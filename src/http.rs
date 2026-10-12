@@ -30,30 +30,143 @@ use crate::relay::Route;
 /// Package upload chunks (4 MB) are the largest bodies; results carry input
 /// streams; everything else is tiny.
 const MAX_BODY: usize = 4 * 1024 * 1024 + 64 * 1024;
-/// Requests allowed per IP per window.
-const RATE_LIMIT: u32 = 120;
+/// Rate-limit window of API requests.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Window of the registration limit.
+const REGISTER_WINDOW: Duration = Duration::from_secs(60);
 /// Lobby WebSocket keepalive + RTT probe (Cloudflare closes idle sockets after ~100 s).
 const WS_PING: Duration = Duration::from_secs(15);
+/// Outbound frames written to a `/relay` socket before one flush.
+const WS_BATCH: usize = 64;
 
-#[derive(Default)]
+/// Request budgets. Players behind carrier-grade NAT share one address, so
+/// API calls are budgeted per account (the `key` they carry) with a much
+/// higher per-IP ceiling against abuse; only calls without a key (and
+/// registration) are budgeted per IP. `/relay` upgrades have their own
+/// per-IP budget and never count against the API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// `RUGEN_RATE_ACCOUNT`: requests per account per 10 s.
+    pub account: u32,
+    /// `RUGEN_RATE_IP`: requests per IP per 10 s, everything together.
+    pub ip: u32,
+    /// `RUGEN_RATE_ANON`: requests without a key per IP per 10 s.
+    pub anon: u32,
+    /// `RUGEN_RATE_REGISTER`: registrations per IP per minute.
+    pub register: u32,
+    /// `RUGEN_RATE_RELAY`: `/relay` WebSocket upgrades per IP per 10 s.
+    pub relay: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            account: 120,
+            ip: 2000,
+            anon: 300,
+            register: 30,
+            relay: 300,
+        }
+    }
+}
+
+impl Limits {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let n = |k: &str, v: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.trim().parse::<u32>().ok())
+                .filter(|&x| x > 0)
+                .unwrap_or(v)
+        };
+        Self {
+            account: n("RUGEN_RATE_ACCOUNT", d.account),
+            ip: n("RUGEN_RATE_IP", d.ip),
+            anon: n("RUGEN_RATE_ANON", d.anon),
+            register: n("RUGEN_RATE_REGISTER", d.register),
+            relay: n("RUGEN_RATE_RELAY", d.relay),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Bucket {
+    Ip(IpAddr),
+    Anon(IpAddr),
+    Register(IpAddr),
+    Relay(IpAddr),
+    /// Hash of the account key (no database lookup in the limiter; random
+    /// keys only buy the per-IP ceiling).
+    Account(u64),
+}
+
+/// What a request is: decides the buckets it is charged to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call<'a> {
+    Api { key: Option<&'a str> },
+    Register,
+    Relay,
+}
+
 struct RateLimiter {
-    hits: HashMap<IpAddr, (Instant, u32)>,
+    limits: Limits,
+    seed: std::hash::RandomState,
+    hits: HashMap<Bucket, (Instant, u32)>,
 }
 
 impl RateLimiter {
-    fn allow(&mut self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        if self.hits.len() > 50_000 {
+    fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            seed: std::hash::RandomState::new(),
+            hits: HashMap::new(),
+        }
+    }
+
+    fn buckets(&self, ip: IpAddr, call: Call<'_>) -> Vec<(Bucket, u32, Duration)> {
+        use std::hash::BuildHasher as _;
+        let l = &self.limits;
+        match call {
+            Call::Relay => vec![(Bucket::Relay(ip), l.relay, RATE_WINDOW)],
+            Call::Register => vec![
+                (Bucket::Ip(ip), l.ip, RATE_WINDOW),
+                (Bucket::Register(ip), l.register, REGISTER_WINDOW),
+            ],
+            Call::Api { key: Some(k) } if k.len() == 64 => vec![
+                (Bucket::Ip(ip), l.ip, RATE_WINDOW),
+                (
+                    Bucket::Account(self.seed.hash_one(k)),
+                    l.account,
+                    RATE_WINDOW,
+                ),
+            ],
+            Call::Api { .. } => vec![
+                (Bucket::Ip(ip), l.ip, RATE_WINDOW),
+                (Bucket::Anon(ip), l.anon, RATE_WINDOW),
+            ],
+        }
+    }
+
+    fn allow(&mut self, ip: IpAddr, call: Call<'_>) -> bool {
+        self.allow_at(ip, call, Instant::now())
+    }
+
+    fn allow_at(&mut self, ip: IpAddr, call: Call<'_>, now: Instant) -> bool {
+        if self.hits.len() > 200_000 {
             self.hits
-                .retain(|_, (t, _)| now.duration_since(*t) < RATE_WINDOW);
+                .retain(|_, (t, _)| now.duration_since(*t) < REGISTER_WINDOW);
         }
-        let e = self.hits.entry(ip).or_insert((now, 0));
-        if now.duration_since(e.0) >= RATE_WINDOW {
-            *e = (now, 0);
+        let mut ok = true;
+        for (b, limit, window) in self.buckets(ip, call) {
+            let e = self.hits.entry(b).or_insert((now, 0));
+            if now.duration_since(e.0) >= window {
+                *e = (now, 0);
+            }
+            e.1 = e.1.saturating_add(1);
+            ok &= e.1 <= limit;
         }
-        e.1 += 1;
-        e.1 <= RATE_LIMIT
+        ok
     }
 }
 
@@ -80,7 +193,7 @@ impl UploadLimiter {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     api: Arc<Api>,
     limiter: Arc<Mutex<RateLimiter>>,
     uploads: Arc<Mutex<UploadLimiter>>,
@@ -109,15 +222,37 @@ fn json_error(status: u16, msg: &str) -> HttpResponse {
     to_http(Response::json(status, &serde_json::json!({ "error": msg })))
 }
 
-fn allowed(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> bool {
+fn allowed(st: &AppState, headers: &HeaderMap, peer: SocketAddr, call: Call<'_>) -> bool {
     let ip = client_ip(headers, peer);
-    st.limiter.lock().map(|mut l| l.allow(ip)).unwrap_or(false)
+    st.limiter
+        .lock()
+        .map(|mut l| l.allow(ip, call))
+        .unwrap_or(false)
+}
+
+/// The account key a request carries (`?key=` or the JSON body's `key`).
+fn request_key(query: &HashMap<String, String>, body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct KeyOnly {
+        key: Option<String>,
+    }
+    if let Some(k) = query.get("key") {
+        return Some(k.clone());
+    }
+    if body.first() != Some(&b'{') || body.len() > 64 * 1024 {
+        return None;
+    }
+    serde_json::from_slice::<KeyOnly>(body).ok()?.key
 }
 
 pub fn router(api: Arc<Api>) -> Router {
+    router_with(api, Limits::from_env())
+}
+
+pub fn router_with(api: Arc<Api>, limits: Limits) -> Router {
     let state = AppState {
         api,
-        limiter: Arc::new(Mutex::new(RateLimiter::default())),
+        limiter: Arc::new(Mutex::new(RateLimiter::new(limits))),
         uploads: Arc::new(Mutex::new(UploadLimiter::default())),
         started: Instant::now(),
     };
@@ -161,8 +296,27 @@ async fn any(
     // package transfers have their own byte budget (below / per account)
     let transfer = uri.path().starts_with("/pkg/")
         && (uri.path().ends_with("/upload") || uri.path().ends_with("/data"));
-    if uri.path() != "/health" && !transfer && !allowed(&st, &headers, peer) {
-        return json_error(429, "rate limited");
+    let query: HashMap<String, String> = uri
+        .query()
+        .map(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uri.path() != "/health" && !transfer {
+        let key = request_key(&query, &body);
+        let call = if uri.path().trim_end_matches('/') == "/register" {
+            Call::Register
+        } else {
+            Call::Api {
+                key: key.as_deref(),
+            }
+        };
+        if !allowed(&st, &headers, peer, call) {
+            return json_error(429, "rate limited");
+        }
     }
     if method == Method::POST && uri.path().starts_with("/pkg/") && uri.path().ends_with("/upload")
     {
@@ -177,15 +331,6 @@ async fn any(
             return json_error(429, "upload limit reached, try again later");
         }
     }
-    let query = uri
-        .query()
-        .map(|q| {
-            q.split('&')
-                .filter_map(|kv| kv.split_once('='))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
     let req = Request {
         method: method.as_str().to_string(),
         path: uri.path().to_string(),
@@ -210,10 +355,10 @@ async fn lobby_ws(
     Query(q): Query<HashMap<String, String>>,
     upgrade: WebSocketUpgrade,
 ) -> HttpResponse {
-    if !allowed(&st, &headers, peer) {
+    let key = q.get("key").cloned().unwrap_or_default();
+    if !allowed(&st, &headers, peer, Call::Api { key: Some(&key) }) {
         return json_error(429, "rate limited");
     }
-    let key = q.get("key").cloned().unwrap_or_default();
     let api = st.api.clone();
     let account = tokio::task::spawn_blocking(move || api.account_for_key(&key))
         .await
@@ -235,21 +380,25 @@ async fn lobby_session(
     name: String,
     mut socket: WebSocket,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let send = |tx: &crate::hub::Outbox, m: &ServerMsg| {
+        if let Ok(text) = serde_json::to_string(m) {
+            let _ = tx.send(text);
+        }
+    };
     let conn = api
         .hub
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .connect(account, tx.clone());
     log::debug!("ws: account {account} connected");
-    let _ = tx.send(ServerMsg::Welcome { id: account, name });
+    send(&tx, &ServerMsg::Welcome { id: account, name });
     let mut ping = tokio::time::interval(WS_PING);
     let mut budget = (Instant::now(), 0u32);
     loop {
         tokio::select! {
             out = rx.recv() => {
-                let Some(m) = out else { break };
-                let Ok(text) = serde_json::to_string(&m) else { continue };
+                let Some(text) = out else { break };
                 if socket.send(Message::Text(text.into())).await.is_err() {
                     break;
                 }
@@ -289,7 +438,7 @@ async fn lobby_session(
                     Ok(ClientMsg::Ping) => ServerMsg::Pong,
                     Err(e) => ServerMsg::Error { error: format!("bad message: {e}") },
                 };
-                let _ = tx.send(reply);
+                send(&tx, &reply);
             }
         }
     }
@@ -308,7 +457,9 @@ async fn relay_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> HttpResponse {
-    if !allowed(&st, &headers, peer) {
+    // its own per-IP budget: never charged to the API (players behind one
+    // carrier NAT open many of these)
+    if !allowed(&st, &headers, peer, Call::Relay) {
         return json_error(429, "rate limited");
     }
     let api = st.api.clone();
@@ -318,36 +469,37 @@ async fn relay_ws(
 }
 
 async fn relay_session(api: Arc<Api>, mut socket: WebSocket) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let conn = api
-        .relay
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ws_connect(tx);
+    use futures_util::SinkExt as _;
+    let (conn, mut rx) = api.relay.ws_connect();
+    let route = Route::Ws(conn.clone());
     loop {
         tokio::select! {
             out = rx.recv() => {
-                let Some(bytes) = out else { break };
-                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                let Some(first) = out else { break };
+                // write whatever is queued, then flush once (not per frame)
+                if socket.feed(Message::Binary(first.into())).await.is_err() {
+                    break;
+                }
+                let mut ok = true;
+                for _ in 1..WS_BATCH {
+                    let Ok(more) = rx.try_recv() else { break };
+                    if socket.feed(Message::Binary(more.into())).await.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok || socket.flush().await.is_err() {
                     break;
                 }
             }
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Binary(b))) => {
-                        api.relay.lock().unwrap_or_else(|p| p.into_inner())
-                            .on_packet(&b, Route::Ws(conn), Instant::now());
-                    }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
-                }
-            }
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Binary(b))) => api.relay.on_packet(&b, &route, Instant::now()),
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            },
         }
     }
-    api.relay
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ws_disconnect(conn);
+    api.relay.ws_disconnect(&conn);
 }
 
 #[cfg(test)]
@@ -369,7 +521,7 @@ mod tests {
                 name: "test".into(),
                 ..Default::default()
             },
-            Arc::new(Mutex::new(Relay::default())),
+            Arc::new(Relay::default()),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -563,7 +715,7 @@ mod tests {
             let api = Api::new(
                 Store::open(None).unwrap(),
                 ApiConfig::default(),
-                Arc::new(Mutex::new(Relay::default())),
+                Arc::new(Relay::default()),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -576,7 +728,7 @@ mod tests {
             } else {
                 tokio::spawn(async move { axum::serve(listener, app).await });
             }
-            let (session, tokens) = api.relay.lock().unwrap().create(&[1, 2]).unwrap();
+            let (session, tokens) = api.relay.create(&[1, 2]).unwrap();
             let connect = || async {
                 let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay"))
                     .await
@@ -632,6 +784,68 @@ mod tests {
                 rtts[rtts.len() - 1]
             );
         }
+    }
+
+    #[test]
+    fn rate_limits_are_per_account_with_an_ip_ceiling() {
+        let limits = Limits {
+            account: 5,
+            ip: 12,
+            anon: 3,
+            register: 2,
+            relay: 4,
+        };
+        let mut l = RateLimiter::new(limits);
+        let ip: IpAddr = "100.64.0.1".parse().unwrap();
+        let t = Instant::now();
+        let (ka, kb) = ("a".repeat(64), "b".repeat(64));
+        fn api(k: &str) -> Call<'_> {
+            Call::Api { key: Some(k) }
+        }
+        // two players behind one carrier NAT each get their own budget
+        for _ in 0..5 {
+            assert!(l.allow_at(ip, api(&ka), t));
+            assert!(l.allow_at(ip, api(&kb), t));
+        }
+        assert!(!l.allow_at(ip, api(&ka), t), "account budget spent");
+        // relay upgrades never touch the API budgets
+        for _ in 0..4 {
+            assert!(l.allow_at(ip, Call::Relay, t));
+        }
+        assert!(!l.allow_at(ip, Call::Relay, t));
+        // the per-IP ceiling still stops a flood of keys from one address
+        let kc = "c".repeat(64);
+        assert!(l.allow_at(ip, api(&kc), t));
+        assert!(!l.allow_at(ip, api(&kc), t), "ip ceiling (12) reached");
+        // windows reset
+        let later = t + RATE_WINDOW;
+        assert!(l.allow_at(ip, api(&ka), later));
+        // anonymous calls and registration are per IP
+        let other: IpAddr = "198.51.100.3".parse().unwrap();
+        for _ in 0..3 {
+            assert!(l.allow_at(other, Call::Api { key: None }, t));
+        }
+        assert!(!l.allow_at(other, Call::Api { key: None }, t));
+        let third: IpAddr = "198.51.100.4".parse().unwrap();
+        assert!(l.allow_at(third, Call::Register, t));
+        assert!(l.allow_at(third, Call::Register, t));
+        assert!(
+            !l.allow_at(third, Call::Register, t + RATE_WINDOW),
+            "per minute"
+        );
+        assert!(l.allow_at(third, Call::Register, t + REGISTER_WINDOW));
+    }
+
+    #[test]
+    fn the_key_is_found_in_the_query_or_the_body() {
+        let mut q = HashMap::new();
+        assert_eq!(
+            request_key(&q, br#"{"key":"k1","char":"kfm"}"#),
+            Some("k1".into())
+        );
+        assert_eq!(request_key(&q, b"raw bytes"), None);
+        q.insert("key".to_string(), "k2".to_string());
+        assert_eq!(request_key(&q, br#"{"key":"k1"}"#), Some("k2".into()));
     }
 
     #[tokio::test]

@@ -45,6 +45,23 @@
 //! GET  /v1/admin/blocklist?token=
 //! ```
 //!
+//! Additive JSON fields (older clients ignore them; typed `rugen_proto`
+//! payloads parse unchanged):
+//!
+//! ```text
+//! MatchupView of a queue match   est_ping_ms: u32, high_ping: bool
+//!   (GET/POST /matchup/{id}..., the `matchup` lobby push, found.matchup)
+//! MatchInfo (`found` of GET/POST /queue and the `found` push)
+//!                                high_ping: bool
+//! GET /health                    relay: {sessions, forwarded, dropped, queue_drops}
+//! ```
+//!
+//! `high_ping` is true when the estimated player ↔ player round trip is
+//! above `RUGEN_HIGH_PING_MS` (200): clients should show the ping on the
+//! confirm screen (accepting the matchup is required for every match).
+//! `/health` → `matches` counts running matches (a slot connected and
+//! relay traffic within the last 10 s); it is cached for one second.
+//!
 //! Privacy: requests carry no client address at all (the HTTP layer keeps
 //! it for rate limiting only), so no response can leak one. Match traffic is
 //! relayed by the server ([`crate::relay`]); players never learn each
@@ -177,6 +194,9 @@ pub struct ApiConfig {
     pub truth: TruthConfig,
     /// Cloudflare Realtime TURN credentials ([`crate::turn`]).
     pub turn: Option<TurnConfig>,
+    /// `RUGEN_HIGH_PING_MS`: queue pairs estimated above this are flagged
+    /// `high_ping` (0 = [`matchmaking::HIGH_PING_MS`]).
+    pub high_ping_ms: u32,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -190,10 +210,11 @@ pub struct Api {
     store: Mutex<Store>,
     rooms: Mutex<HashMap<String, Room>>,
     queue: Mutex<Vec<QueueEntry>>,
-    /// Matches found for queued players, consumed on poll.
-    found: Mutex<HashMap<u64, MatchInfo>>,
+    /// Matches found for queued players, consumed on poll (with the
+    /// additive `high_ping` flag).
+    found: Mutex<HashMap<u64, (MatchInfo, bool)>>,
     pub hub: Mutex<Hub>,
-    pub relay: Arc<Mutex<Relay>>,
+    pub relay: Arc<Relay>,
     matchups: Mutex<HashMap<u64, Matchup>>,
     pub packages: Packages,
     /// Upload bytes per account in the current hour.
@@ -203,7 +224,17 @@ pub struct Api {
     me: Weak<Api>,
     cfg: ApiConfig,
     pub turn: Option<Arc<Turn>>,
+    /// Accounts by when they last made an authenticated call (the
+    /// `online` count of `/health` without a table scan).
+    seen: Mutex<HashMap<u64, Instant>>,
+    /// The `/health` body, rebuilt at most every [`HEALTH_TTL`].
+    health: Mutex<Option<(Instant, Value)>>,
 }
+
+/// How long a computed `/health` body is served from the cache.
+const HEALTH_TTL: Duration = Duration::from_secs(1);
+/// Accounts count as online this long after their last call.
+const ONLINE_SECS: u64 = 300;
 
 type Res = Result<Response, Response>;
 
@@ -274,6 +305,18 @@ fn clean_rules(v: Option<&Value>) -> Rules {
     r
 }
 
+/// Additive fields of a queue match ([`MatchInfo`] JSON): `high_ping` on
+/// the match and `est_ping_ms` / `high_ping` on its `matchup`.
+fn extend_found(found: &mut Value, est: u32, high: bool) {
+    if let Some(obj) = found.as_object_mut() {
+        obj.insert("high_ping".into(), high.into());
+    }
+    if let Some(obj) = found.get_mut("matchup").and_then(Value::as_object_mut) {
+        obj.insert("est_ping_ms".into(), est.into());
+        obj.insert("high_ping".into(), high.into());
+    }
+}
+
 fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
     let mut transports = rugen_proto::relay_transports(udp.as_deref());
     // TURN first for the two players when the server got credentials
@@ -291,7 +334,7 @@ fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
 }
 
 impl Api {
-    pub fn new(store: Store, mut cfg: ApiConfig, relay: Arc<Mutex<Relay>>) -> Arc<Self> {
+    pub fn new(store: Store, mut cfg: ApiConfig, relay: Arc<Relay>) -> Arc<Self> {
         let truth = Truth::new(
             std::mem::take(&mut cfg.truth),
             &cfg.name,
@@ -318,7 +361,16 @@ impl Api {
             me: me.clone(),
             cfg,
             turn,
+            seen: Mutex::new(HashMap::new()),
+            health: Mutex::new(None),
         })
+    }
+
+    fn high_ping_ms(&self) -> u32 {
+        match self.cfg.high_ping_ms {
+            0 => matchmaking::HIGH_PING_MS,
+            v => v,
+        }
     }
 
     pub fn store_lock(&self) -> MutexGuard<'_, Store> {
@@ -345,7 +397,37 @@ impl Api {
         if key.len() != 64 {
             return None;
         }
-        lock(&self.store).by_key(key).ok().flatten()
+        let a = lock(&self.store).by_key(key).ok().flatten()?;
+        self.note_seen(a.id);
+        Some(a)
+    }
+
+    fn note_seen(&self, id: u64) {
+        let mut seen = lock(&self.seen);
+        if seen.len() > 200_000 {
+            seen.retain(|_, t| t.elapsed().as_secs() < ONLINE_SECS);
+        }
+        seen.insert(id, Instant::now());
+    }
+
+    /// Relay housekeeping, every few seconds from the server's timer (UDP
+    /// or not): idle sessions go.
+    pub fn sweep_relay(&self) {
+        let n = self.relay.expire(Instant::now());
+        if n > 0 {
+            log::debug!("relay: {n} idle sessions expired");
+        }
+    }
+
+    /// Close the relay session of match `match_id` (result settled).
+    fn close_match_session(&self, match_id: u64) {
+        let session = lock(&self.matchups)
+            .get(&match_id)
+            .and_then(|m| m.started.as_ref().map(|r| r.session));
+        if let Some(session) = session {
+            self.relay.close(session);
+            log::info!("match {match_id}: result settled, relay session {session:08x} closed");
+        }
     }
 
     /// Account for the key in `v` (body) or `?key=`.
@@ -360,6 +442,7 @@ impl Api {
             return Err(err(401, "bad key"));
         }
         let a = db(store.by_key(&key))?.ok_or_else(|| err(401, "bad key"))?;
+        self.note_seen(a.id);
         if let (Some(t), Some(ip)) = (&self.turn, req.ip) {
             t.note_ip(a.id, ip);
         }
@@ -376,7 +459,11 @@ impl Api {
     }
 
     pub fn info(&self) -> DbResult<ServerInfo> {
-        let accounts_online = lock(&self.store).online_count(300)?;
+        let accounts_online = {
+            let mut seen = lock(&self.seen);
+            seen.retain(|_, t| t.elapsed().as_secs() < ONLINE_SECS);
+            seen.len()
+        };
         let rooms = lock(&self.rooms).len();
         let queued = lock(&self.queue).len();
         let ws = lock(&self.hub).online();
@@ -388,7 +475,8 @@ impl Api {
             online: accounts_online.max(ws),
             queued,
             rooms,
-            matches: lock(&self.relay).session_count(),
+            // running matches: a slot connected and traffic in the last seconds
+            matches: self.relay.active_count(Instant::now()),
             udp: self.cfg.udp_public.clone(),
             transports: rugen_proto::relay_transports(self.cfg.udp_public.as_deref()),
             key: self.truth.public_key().map(|k| k.hex()),
@@ -401,11 +489,26 @@ impl Api {
         let v = body(&req);
         match (req.method.as_str(), path.as_slice()) {
             ("GET", [""]) | ("GET", ["health"]) | ("GET", ["info"]) => {
+                // health checks and server lists poll this: served from a
+                // short cache so they never queue behind the store
+                if let Some((t, v)) = &*lock(&self.health)
+                    && t.elapsed() < HEALTH_TTL
+                {
+                    return Ok(Response::json(200, v));
+                }
                 let mut v = serde_json::to_value(db(self.info())?).unwrap_or(Value::Null);
                 // TURN budget, numbers only (older clients ignore it)
                 if let Some(t) = &self.turn {
                     v["turn"] = t.status(&lock(&self.store));
                 }
+                // relay counters (additive)
+                v["relay"] = json!({
+                    "sessions": self.relay.session_count(),
+                    "forwarded": self.relay.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+                    "dropped": self.relay.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                    "queue_drops": self.relay.queue_drops.load(std::sync::atomic::Ordering::Relaxed),
+                });
+                *lock(&self.health) = Some((Instant::now(), v.clone()));
                 Ok(Response::json(200, &v))
             }
             ("POST", ["register"]) => {
@@ -504,20 +607,45 @@ impl Api {
 
     // ---- rooms
 
-    /// Drop silent members and empty / host-less / ancient rooms.
+    /// Drop silent members and empty / host-less / ancient rooms (their
+    /// relay sessions close). The players of a match whose relay session is
+    /// alive never time out (a client in a match does not poll the room);
+    /// spectators count as heard while their relay slot carries traffic.
     fn expire_rooms(&self, rooms: &mut HashMap<String, Room>) {
         let hub = lock(&self.hub);
+        let now = Instant::now();
         for r in rooms.values_mut() {
+            let live = r
+                .running
+                .as_ref()
+                .and_then(|run| Some((run.slots.clone(), self.relay.heard(run.session)?)));
             for m in &mut r.members {
                 if hub.is_online(m.account) {
-                    m.last_seen = Instant::now();
+                    m.last_seen = now;
+                }
+                if let Some((slots, heard)) = &live
+                    && let Some(i) = slots.iter().position(|&a| a == m.account)
+                {
+                    if i < 2 {
+                        m.last_seen = now;
+                    } else if let Some(&t) = heard.get(i) {
+                        m.last_seen = m.last_seen.max(t);
+                    }
                 }
             }
             r.members
                 .retain(|m| m.last_seen.elapsed().as_secs() < MEMBER_TIMEOUT_SECS);
         }
-        rooms.retain(|_, r| {
-            r.player(0).is_some() && r.created.elapsed().as_secs() < ROOM_MAX_AGE_SECS
+        rooms.retain(|code, r| {
+            let keep = r.player(0).is_some() && r.created.elapsed().as_secs() < ROOM_MAX_AGE_SECS;
+            if !keep && let Some(run) = &r.running {
+                self.relay.close(run.session);
+                log::info!(
+                    "room {code} closed: relay session {:08x} closed",
+                    run.session
+                );
+            }
+            keep
         });
     }
 
@@ -615,7 +743,7 @@ impl Api {
             .to_string();
         let match_id = db(store.new_match(players, false, &setup))?;
         if let Some(old) = r.running.take() {
-            lock(&self.relay).close(old.session);
+            self.relay.close(old.session);
         }
         let m = Matchup::new(
             match_id,
@@ -796,6 +924,12 @@ impl Api {
         if let Some(r) = rooms.get_mut(&code) {
             self.fail_matchup_of(&s, r, me.id, "your opponent left");
             r.members.retain(|m| m.account != me.id);
+            // a player left (or the host closed the room): the match is over
+            if r.player(0).is_none() || r.player(1).is_none() {
+                if let Some(run) = r.running.take() {
+                    self.relay.close(run.session);
+                }
+            }
             if r.player(0).is_none() {
                 // the host left: the room closes
                 let others: Vec<u64> = r.members.iter().map(|m| m.account).collect();
@@ -837,7 +971,7 @@ impl Api {
             .is_some_and(|run| run.slots[..2].contains(&target))
         {
             if let Some(run) = r.running.take() {
-                lock(&self.relay).close(run.session);
+                self.relay.close(run.session);
             }
         }
         lock(&self.hub).push(target, &ServerMsg::Kicked { code: code.clone() });
@@ -930,13 +1064,17 @@ impl Api {
     fn status_for(&self, me: u64) -> Res {
         let found = lock(&self.found).remove(&me);
         let q = lock(&self.queue);
-        if let Some(m) = found {
-            return ok(&QueueStatus {
+        if let Some((m, high)) = found {
+            let est = m.est_ping_ms.unwrap_or(0);
+            let mut v = serde_json::to_value(QueueStatus {
                 queued: false,
                 waiting_secs: 0,
                 players_in_queue: q.len(),
                 found: Some(m),
-            });
+            })
+            .unwrap_or(Value::Null);
+            extend_found(&mut v["found"], est, high);
+            return Ok(Response::json(200, &v));
         }
         let mine = q.iter().find(|e| e.id == me);
         ok(&QueueStatus {
@@ -976,7 +1114,10 @@ impl Api {
             let setup = json!({ "p1_char": a.char_id, "p2_char": b.char_id }).to_string();
             let match_id = db(s.new_match([a.id, b.id], a.ranked, &setup))?;
             let code = random_code();
-            let m = Matchup::new(match_id, [a.id, b.id], a.ranked, Rules::default(), None);
+            let mut m = Matchup::new(match_id, [a.id, b.id], a.ranked, Rules::default(), None);
+            let high = matchmaking::high_ping(est, self.high_ping_ms());
+            m.est_ping_ms = Some(est);
+            m.high_ping = high;
             let views = [
                 self.matchup_view(&s, &m, a.id),
                 self.matchup_view(&s, &m, b.id),
@@ -1002,17 +1143,24 @@ impl Api {
             let (ma, mb) = (info(1, a, b, va), info(2, b, a, vb));
             {
                 let hub = lock(&self.hub);
-                hub.push(a.id, &ServerMsg::Found { found: ma.clone() });
-                hub.push(b.id, &ServerMsg::Found { found: mb.clone() });
+                for (id, found) in [(a.id, &ma), (b.id, &mb)] {
+                    let mut msg = serde_json::to_value(ServerMsg::Found {
+                        found: found.clone(),
+                    })
+                    .unwrap_or(Value::Null);
+                    extend_found(&mut msg["found"], est, high);
+                    hub.push_json(id, &msg);
+                }
             }
             let mut found = lock(&self.found);
-            found.insert(a.id, ma);
-            found.insert(b.id, mb);
+            found.insert(a.id, (ma, high));
+            found.insert(b.id, (mb, high));
             log::info!(
-                "{} match {match_id}: {} vs {} (est {est} ms), matchup phase",
+                "{} match {match_id}: {} vs {} (est {est} ms{}), matchup phase",
                 if a.ranked { "ranked" } else { "quick" },
                 a.id,
-                b.id
+                b.id,
+                if high { ", HIGH PING" } else { "" }
             );
             remove.extend([i, j]);
         }
@@ -1081,6 +1229,10 @@ impl Api {
         }
         if out.disputed {
             self.spawn_resim(match_id);
+        }
+        // both sides reported: nobody needs the relay session any more
+        if db(s.match_resolved(match_id))? {
+            self.close_match_session(match_id);
         }
         let rating = match out.delta {
             Some(_) => db(s.by_id(me))?.map(|a| a.rating),
@@ -1327,17 +1479,32 @@ impl Api {
         m.view(me, store, &|fp| self.stored(store, fp), ticket)
     }
 
+    /// [`Self::matchup_view`] as JSON with the additive fields
+    /// ([`Matchup::extend_view`]).
+    fn matchup_json(&self, store: &Store, m: &Matchup, me: u64) -> Value {
+        let mut v = serde_json::to_value(self.matchup_view(store, m, me)).unwrap_or(Value::Null);
+        m.extend_view(&mut v);
+        v
+    }
+
     /// Push every player / spectator its view of the matchup.
     fn push_matchup(&self, store: &Store, m: &Matchup) {
         let mut who: Vec<u64> = m.players.to_vec();
         who.extend(&m.spectators);
-        let views: Vec<(u64, rugen_proto::MatchupView)> = who
+        let views: Vec<(u64, Value)> = who
             .into_iter()
-            .map(|a| (a, self.matchup_view(store, m, a)))
+            .map(|a| {
+                let mut v = serde_json::to_value(ServerMsg::Matchup {
+                    matchup: self.matchup_view(store, m, a),
+                })
+                .unwrap_or(Value::Null);
+                m.extend_view(&mut v["matchup"]);
+                (a, v)
+            })
             .collect();
         let hub = lock(&self.hub);
-        for (a, matchup) in views {
-            hub.push(a, &ServerMsg::Matchup { matchup });
+        for (a, msg) in views {
+            hub.push_json(a, &msg);
         }
     }
 
@@ -1379,7 +1546,7 @@ impl Api {
         if m.side_of(me.id).is_some() {
             m.touched = Instant::now();
         }
-        ok(&self.matchup_view(&s, m, me.id))
+        Ok(Response::json(200, &self.matchup_json(&s, m, me.id)))
     }
 
     fn matchup_op(&self, req: &Request, v: &Value, id: &str, op: &str) -> Res {
@@ -1397,7 +1564,7 @@ impl Api {
             return Err(err(409, &format!("matchup failed: {f}")));
         }
         if m.started.is_some() {
-            return ok(&self.matchup_view(&s, m, me.id));
+            return Ok(Response::json(200, &self.matchup_json(&s, m, me.id)));
         }
         m.touched = Instant::now();
         match op {
@@ -1436,7 +1603,7 @@ impl Api {
                         self.auto_block(&mut s, &d.fingerprint, AutoCause::Liar)?;
                         m.fail(why);
                         self.push_matchup(&s, m);
-                        return ok(&self.matchup_view(&s, m, me.id));
+                        return Ok(Response::json(200, &self.matchup_json(&s, m, me.id)));
                     }
                 }
                 if let Some(f) = fighter {
@@ -1477,14 +1644,14 @@ impl Api {
         }
         self.try_start(&mut s, &mut rooms, m)?;
         self.push_matchup(&s, m);
-        let view = self.matchup_view(&s, m, me.id);
+        let view = self.matchup_json(&s, m, me.id);
         if let Some(code) = m.room.clone()
             && let Some(r) = rooms.get(&code)
         {
             drop(ms);
             self.broadcast(&s, &code, r);
         }
-        ok(&view)
+        Ok(Response::json(200, &view))
     }
 
     /// Start the relay session once the matchup is confirmed, every package
@@ -1539,7 +1706,8 @@ impl Api {
         .to_string();
         db(store.set_setup(m.id, &setup))?;
         db(store.touch_packages(&[&p1, &p2, &st]))?;
-        let (session, tokens) = lock(&self.relay)
+        let (session, tokens) = self
+            .relay
             .create(&slots)
             .ok_or_else(|| err(503, "relay full"))?;
         let turn = self
@@ -1917,7 +2085,7 @@ pub(crate) mod tests {
                 pkg,
                 ..Default::default()
             },
-            Arc::new(Mutex::new(Relay::default())),
+            Arc::new(Relay::default()),
         )
     }
 
@@ -2023,21 +2191,14 @@ pub(crate) mod tests {
             Value::Null,
         )));
         assert_eq!(v["phase"], "sync");
-        assert_eq!(v["missing"].as_array().unwrap().len(), 3);
         // ready before the files are on the server: waits
+        let fresh = !v["missing"].as_array().unwrap().is_empty();
         json_of(ready(api, id, keys[0], &v, "rugen 9"));
         json_of(ready(api, id, keys[1], &v, "rugen 9"));
-        // HAS: missing, then upload (P1 brings its fighter + stage, P2 its fighter)
-        let has = json_of(api.handle(req(
-            "GET",
-            &format!("/pkg/{}?key={}", kit.a.0.fingerprint, keys[0]),
-            Value::Null,
-        )));
-        assert_eq!(has["complete"], false);
-        json_of(upload(api, keys[0], &kit.a.0, &kit.a.1, 100));
-        json_of(upload(api, keys[0], &kit.stage.0, &kit.stage.1, 1 << 20));
-        let last = json_of(upload(api, keys[1], &kit.b.0, &kit.b.1, 1 << 20));
-        assert_eq!(last["complete"], true);
+        if fresh {
+            assert_eq!(v["missing"].as_array().unwrap().len(), 3);
+            upload_kit(api, keys, kit);
+        }
         let va = json_of(api.handle(req(
             "GET",
             &format!("/matchup/{id}?key={}", keys[0]),
@@ -2051,6 +2212,21 @@ pub(crate) mod tests {
         assert_eq!(va["phase"], "started", "{va}");
         assert_eq!(va["fighters"][1]["verified"], true);
         [va, vb]
+    }
+
+    /// The kit's packages, uploaded by the players that bring them.
+    fn upload_kit(api: &Api, keys: [&str; 2], kit: &Kit) {
+        // HAS: missing, then upload (P1 brings its fighter + stage, P2 its fighter)
+        let has = json_of(api.handle(req(
+            "GET",
+            &format!("/pkg/{}?key={}", kit.a.0.fingerprint, keys[0]),
+            Value::Null,
+        )));
+        assert_eq!(has["complete"], false);
+        json_of(upload(api, keys[0], &kit.a.0, &kit.a.1, 100));
+        json_of(upload(api, keys[0], &kit.stage.0, &kit.stage.1, 1 << 20));
+        let last = json_of(upload(api, keys[1], &kit.b.0, &kit.b.1, 1 << 20));
+        assert_eq!(last["complete"], true);
     }
 
     #[test]
@@ -2579,7 +2755,7 @@ pub(crate) mod tests {
                 }),
                 ..Default::default()
             },
-            Arc::new(Mutex::new(Relay::default())),
+            Arc::new(Relay::default()),
         );
         // packages of KFM and stage0, stored as if uploaded
         let mut fps = Vec::new();
@@ -2687,7 +2863,7 @@ pub(crate) mod tests {
                 truth,
                 ..Default::default()
             },
-            Arc::new(Mutex::new(Relay::default())),
+            Arc::new(Relay::default()),
         )
     }
 
@@ -3011,5 +3187,180 @@ pub(crate) mod tests {
         );
         drop(s);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A private room with a started match; returns (room code, match id).
+    fn started_room(api: &Api, ka: &str, kb: &str, kit: &Kit) -> (String, u64) {
+        let room = json_of(api.handle(req("POST", "/room", json!({"key": ka, "public": false}))));
+        let code = room["code"].as_str().unwrap().to_string();
+        let joined = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kb}),
+        )));
+        let id = joined["matchup"]["id"].as_u64().unwrap();
+        play_matchup(api, id, [ka, kb], kit);
+        (code, id)
+    }
+
+    #[test]
+    fn queue_pairs_flag_high_ping_additively() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        // far apart: no pair inside the first windows
+        json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": ka, "ranked": false, "rtt_ms": 150}),
+        )));
+        let st = json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kb, "ranked": false, "rtt_ms": 120}),
+        )));
+        assert!(st["found"].is_null(), "270 ms is outside the first window");
+        // after 30 s anything goes, flagged
+        for e in lock(&api.queue).iter_mut() {
+            e.since = Instant::now() - Duration::from_secs(31);
+        }
+        let st = json_of(api.handle(req("GET", &format!("/queue?key={kb}"), Value::Null)));
+        assert_eq!(st["found"]["high_ping"], true, "{st}");
+        assert_eq!(st["found"]["est_ping_ms"], 270);
+        assert_eq!(st["found"]["matchup"]["high_ping"], true);
+        assert_eq!(st["found"]["matchup"]["est_ping_ms"], 270);
+        let id = st["found"]["match_id"].as_u64().unwrap();
+        let st = json_of(api.handle(req("GET", &format!("/queue?key={ka}"), Value::Null)));
+        assert_eq!(st["found"]["high_ping"], true);
+        let v = json_of(api.handle(req("GET", &format!("/matchup/{id}?key={ka}"), Value::Null)));
+        assert_eq!(
+            (v["high_ping"].clone(), v["phase"].clone()),
+            (json!(true), json!("pick"))
+        );
+        // older clients parse the typed payload unchanged
+        let typed: rugen_proto::MatchupView = serde_json::from_value(v).unwrap();
+        assert_eq!(typed.id, id);
+
+        // close players: no flag
+        let (_, kc) = register(&api);
+        let (_, kd) = register(&api);
+        json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kc, "ranked": false, "rtt_ms": 20}),
+        )));
+        let st = json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kd, "ranked": false, "rtt_ms": 30}),
+        )));
+        assert_eq!(st["found"]["high_ping"], false, "{st}");
+        assert_eq!(st["found"]["matchup"]["est_ping_ms"], 50);
+    }
+
+    #[test]
+    fn relay_sessions_close_with_results_and_rooms() {
+        let kit = Kit::new();
+        let api = api();
+        let (aid, ka) = register(&api);
+        let (_, kb) = register(&api);
+        // a player leaving the room ends its match
+        let (code, _) = started_room(&api, &ka, &kb, &kit);
+        assert_eq!(api.relay.session_count(), 1);
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/leave"),
+            json!({"key": kb}),
+        )));
+        assert_eq!(api.relay.session_count(), 0, "challenger left");
+        // both results in: the session closes
+        let (code, id) = started_room(&api, &ka, &kb, &kit);
+        assert_eq!(api.relay.session_count(), 1);
+        let report = |k: &str| {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": id, "winner": aid}),
+            )))
+        };
+        assert_eq!(report(&ka)["accepted"], true);
+        assert_eq!(
+            api.relay.session_count(),
+            1,
+            "one report: the other may still play"
+        );
+        assert_eq!(report(&kb)["accepted"], true);
+        assert_eq!(api.relay.session_count(), 0);
+        // the host leaving closes the room and its (rematch) session
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": ka}),
+        )));
+        let v = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": kb}),
+        )));
+        let id = v["matchup"]["id"].as_u64().unwrap();
+        play_matchup(&api, id, [&ka, &kb], &kit);
+        assert_eq!(api.relay.session_count(), 1);
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/leave"),
+            json!({"key": ka}),
+        )));
+        assert_eq!(api.relay.session_count(), 0, "room closed");
+    }
+
+    #[test]
+    fn players_of_a_live_match_do_not_time_out() {
+        let kit = Kit::new();
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (code, _) = started_room(&api, &ka, &kb, &kit);
+        let silent = || {
+            for m in lock(&api.rooms).get_mut(&code).unwrap().members.iter_mut() {
+                m.last_seen = Instant::now() - Duration::from_secs(MEMBER_TIMEOUT_SECS + 5);
+            }
+        };
+        // nobody polled for longer than the timeout, but the match runs
+        silent();
+        json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(lock(&api.rooms)[&code].members.len(), 2);
+        // the relay session is gone (match over): they time out, the room closes
+        let session = lock(&api.rooms)[&code].running.as_ref().unwrap().session;
+        api.relay.close(session);
+        silent();
+        json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert!(!lock(&api.rooms).contains_key(&code));
+    }
+
+    #[test]
+    fn health_is_cached_and_counts_running_matches_only() {
+        let api = api();
+        let h = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(
+            (h["matches"].clone(), h["rooms"].clone()),
+            (json!(0), json!(0))
+        );
+        let (_, ka) = register(&api);
+        json_of(api.handle(req("POST", "/room", json!({"key": ka}))));
+        // within the cache period: the same body
+        let h = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(h["rooms"], 0);
+        *lock(&api.health) = None;
+        let h = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(h["rooms"], 1);
+        assert_eq!(h["online"], 1, "seen in memory, no table scan");
+        // a session nobody connected to is not a running match
+        api.relay.create(&[1, 2]).unwrap();
+        *lock(&api.health) = None;
+        let h = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(
+            (h["matches"].clone(), h["relay"]["sessions"].clone()),
+            (json!(0), json!(1))
+        );
     }
 }
