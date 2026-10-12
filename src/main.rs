@@ -57,6 +57,7 @@
 //! RUGEN_RATE_ANON               calls without a key per IP / 10 s  300
 //! RUGEN_RATE_REGISTER           registrations per IP per minute    30
 //! RUGEN_RATE_RELAY              /relay upgrades per IP per 10 s    300 (never charged to the API)
+//! RUGEN_HIGH_PING_MS            queue pairs above this: high_ping  200
 //! ```
 //!
 //! A server is **official** when its signing key is the official key;
@@ -222,7 +223,7 @@ fn main() {
              env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
              \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
              \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS\n\
-             \x20    RUGEN_WORKERS RUGEN_RATE_ACCOUNT RUGEN_RATE_IP RUGEN_RATE_ANON RUGEN_RATE_REGISTER RUGEN_RATE_RELAY"
+             \x20    RUGEN_WORKERS RUGEN_RATE_ACCOUNT RUGEN_RATE_IP RUGEN_RATE_ANON RUGEN_RATE_REGISTER RUGEN_RATE_RELAY RUGEN_HIGH_PING_MS"
         );
         return;
     }
@@ -465,6 +466,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         resim,
         truth: truth_cfg,
         turn: turn::TurnConfig::from_env(),
+        high_ping_ms: env_f("RUGEN_HIGH_PING_MS").map_or(0, |v| v.max(1.0) as u32),
     };
     if let Some(bind) = &s.udp_bind {
         let socket = Arc::new(

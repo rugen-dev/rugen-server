@@ -45,12 +45,20 @@
 //! GET  /v1/admin/blocklist?token=
 //! ```
 //!
-//! Additive JSON fields (older clients ignore them):
+//! Additive JSON fields (older clients ignore them; typed `rugen_proto`
+//! payloads parse unchanged):
 //!
 //! ```text
+//! MatchupView of a queue match   est_ping_ms: u32, high_ping: bool
+//!   (GET/POST /matchup/{id}..., the `matchup` lobby push, found.matchup)
+//! MatchInfo (`found` of GET/POST /queue and the `found` push)
+//!                                high_ping: bool
 //! GET /health                    relay: {sessions, forwarded, dropped, queue_drops}
 //! ```
 //!
+//! `high_ping` is true when the estimated player ↔ player round trip is
+//! above `RUGEN_HIGH_PING_MS` (200): clients should show the ping on the
+//! confirm screen (accepting the matchup is required for every match).
 //! `/health` → `matches` counts running matches (a slot connected and
 //! relay traffic within the last 10 s); it is cached for one second.
 //!
@@ -186,6 +194,9 @@ pub struct ApiConfig {
     pub truth: TruthConfig,
     /// Cloudflare Realtime TURN credentials ([`crate::turn`]).
     pub turn: Option<TurnConfig>,
+    /// `RUGEN_HIGH_PING_MS`: queue pairs estimated above this are flagged
+    /// `high_ping` (0 = [`matchmaking::HIGH_PING_MS`]).
+    pub high_ping_ms: u32,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -199,8 +210,9 @@ pub struct Api {
     store: Mutex<Store>,
     rooms: Mutex<HashMap<String, Room>>,
     queue: Mutex<Vec<QueueEntry>>,
-    /// Matches found for queued players, consumed on poll.
-    found: Mutex<HashMap<u64, MatchInfo>>,
+    /// Matches found for queued players, consumed on poll (with the
+    /// additive `high_ping` flag).
+    found: Mutex<HashMap<u64, (MatchInfo, bool)>>,
     pub hub: Mutex<Hub>,
     pub relay: Arc<Relay>,
     matchups: Mutex<HashMap<u64, Matchup>>,
@@ -293,6 +305,18 @@ fn clean_rules(v: Option<&Value>) -> Rules {
     r
 }
 
+/// Additive fields of a queue match ([`MatchInfo`] JSON): `high_ping` on
+/// the match and `est_ping_ms` / `high_ping` on its `matchup`.
+fn extend_found(found: &mut Value, est: u32, high: bool) {
+    if let Some(obj) = found.as_object_mut() {
+        obj.insert("high_ping".into(), high.into());
+    }
+    if let Some(obj) = found.get_mut("matchup").and_then(Value::as_object_mut) {
+        obj.insert("est_ping_ms".into(), est.into());
+        obj.insert("high_ping".into(), high.into());
+    }
+}
+
 fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
     let mut transports = rugen_proto::relay_transports(udp.as_deref());
     // TURN first for the two players when the server got credentials
@@ -340,6 +364,13 @@ impl Api {
             seen: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
         })
+    }
+
+    fn high_ping_ms(&self) -> u32 {
+        match self.cfg.high_ping_ms {
+            0 => matchmaking::HIGH_PING_MS,
+            v => v,
+        }
     }
 
     pub fn store_lock(&self) -> MutexGuard<'_, Store> {
@@ -1033,13 +1064,17 @@ impl Api {
     fn status_for(&self, me: u64) -> Res {
         let found = lock(&self.found).remove(&me);
         let q = lock(&self.queue);
-        if let Some(m) = found {
-            return ok(&QueueStatus {
+        if let Some((m, high)) = found {
+            let est = m.est_ping_ms.unwrap_or(0);
+            let mut v = serde_json::to_value(QueueStatus {
                 queued: false,
                 waiting_secs: 0,
                 players_in_queue: q.len(),
                 found: Some(m),
-            });
+            })
+            .unwrap_or(Value::Null);
+            extend_found(&mut v["found"], est, high);
+            return Ok(Response::json(200, &v));
         }
         let mine = q.iter().find(|e| e.id == me);
         ok(&QueueStatus {
@@ -1079,7 +1114,10 @@ impl Api {
             let setup = json!({ "p1_char": a.char_id, "p2_char": b.char_id }).to_string();
             let match_id = db(s.new_match([a.id, b.id], a.ranked, &setup))?;
             let code = random_code();
-            let m = Matchup::new(match_id, [a.id, b.id], a.ranked, Rules::default(), None);
+            let mut m = Matchup::new(match_id, [a.id, b.id], a.ranked, Rules::default(), None);
+            let high = matchmaking::high_ping(est, self.high_ping_ms());
+            m.est_ping_ms = Some(est);
+            m.high_ping = high;
             let views = [
                 self.matchup_view(&s, &m, a.id),
                 self.matchup_view(&s, &m, b.id),
@@ -1105,17 +1143,24 @@ impl Api {
             let (ma, mb) = (info(1, a, b, va), info(2, b, a, vb));
             {
                 let hub = lock(&self.hub);
-                hub.push(a.id, &ServerMsg::Found { found: ma.clone() });
-                hub.push(b.id, &ServerMsg::Found { found: mb.clone() });
+                for (id, found) in [(a.id, &ma), (b.id, &mb)] {
+                    let mut msg = serde_json::to_value(ServerMsg::Found {
+                        found: found.clone(),
+                    })
+                    .unwrap_or(Value::Null);
+                    extend_found(&mut msg["found"], est, high);
+                    hub.push_json(id, &msg);
+                }
             }
             let mut found = lock(&self.found);
-            found.insert(a.id, ma);
-            found.insert(b.id, mb);
+            found.insert(a.id, (ma, high));
+            found.insert(b.id, (mb, high));
             log::info!(
-                "{} match {match_id}: {} vs {} (est {est} ms), matchup phase",
+                "{} match {match_id}: {} vs {} (est {est} ms{}), matchup phase",
                 if a.ranked { "ranked" } else { "quick" },
                 a.id,
-                b.id
+                b.id,
+                if high { ", HIGH PING" } else { "" }
             );
             remove.extend([i, j]);
         }
@@ -1434,9 +1479,12 @@ impl Api {
         m.view(me, store, &|fp| self.stored(store, fp), ticket)
     }
 
-    /// [`Self::matchup_view`] as JSON.
+    /// [`Self::matchup_view`] as JSON with the additive fields
+    /// ([`Matchup::extend_view`]).
     fn matchup_json(&self, store: &Store, m: &Matchup, me: u64) -> Value {
-        serde_json::to_value(self.matchup_view(store, m, me)).unwrap_or(Value::Null)
+        let mut v = serde_json::to_value(self.matchup_view(store, m, me)).unwrap_or(Value::Null);
+        m.extend_view(&mut v);
+        v
     }
 
     /// Push every player / spectator its view of the matchup.
@@ -1446,10 +1494,11 @@ impl Api {
         let views: Vec<(u64, Value)> = who
             .into_iter()
             .map(|a| {
-                let v = serde_json::to_value(ServerMsg::Matchup {
+                let mut v = serde_json::to_value(ServerMsg::Matchup {
                     matchup: self.matchup_view(store, m, a),
                 })
                 .unwrap_or(Value::Null);
+                m.extend_view(&mut v["matchup"]);
                 (a, v)
             })
             .collect();
@@ -3152,6 +3201,61 @@ pub(crate) mod tests {
         let id = joined["matchup"]["id"].as_u64().unwrap();
         play_matchup(api, id, [ka, kb], kit);
         (code, id)
+    }
+
+    #[test]
+    fn queue_pairs_flag_high_ping_additively() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        // far apart: no pair inside the first windows
+        json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": ka, "ranked": false, "rtt_ms": 150}),
+        )));
+        let st = json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kb, "ranked": false, "rtt_ms": 120}),
+        )));
+        assert!(st["found"].is_null(), "270 ms is outside the first window");
+        // after 30 s anything goes, flagged
+        for e in lock(&api.queue).iter_mut() {
+            e.since = Instant::now() - Duration::from_secs(31);
+        }
+        let st = json_of(api.handle(req("GET", &format!("/queue?key={kb}"), Value::Null)));
+        assert_eq!(st["found"]["high_ping"], true, "{st}");
+        assert_eq!(st["found"]["est_ping_ms"], 270);
+        assert_eq!(st["found"]["matchup"]["high_ping"], true);
+        assert_eq!(st["found"]["matchup"]["est_ping_ms"], 270);
+        let id = st["found"]["match_id"].as_u64().unwrap();
+        let st = json_of(api.handle(req("GET", &format!("/queue?key={ka}"), Value::Null)));
+        assert_eq!(st["found"]["high_ping"], true);
+        let v = json_of(api.handle(req("GET", &format!("/matchup/{id}?key={ka}"), Value::Null)));
+        assert_eq!(
+            (v["high_ping"].clone(), v["phase"].clone()),
+            (json!(true), json!("pick"))
+        );
+        // older clients parse the typed payload unchanged
+        let typed: rugen_proto::MatchupView = serde_json::from_value(v).unwrap();
+        assert_eq!(typed.id, id);
+
+        // close players: no flag
+        let (_, kc) = register(&api);
+        let (_, kd) = register(&api);
+        json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kc, "ranked": false, "rtt_ms": 20}),
+        )));
+        let st = json_of(api.handle(req(
+            "POST",
+            "/queue",
+            json!({"key": kd, "ranked": false, "rtt_ms": 30}),
+        )));
+        assert_eq!(st["found"]["high_ping"], false, "{st}");
+        assert_eq!(st["found"]["matchup"]["est_ping_ms"], 50);
     }
 
     #[test]

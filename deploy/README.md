@@ -456,6 +456,7 @@ again (it is at least the current Unix time).
 | `RUGEN_RATE_ANON`  | `300`              | calls without a key per client IP per 10 s |
 | `RUGEN_RATE_REGISTER` | `30`            | registrations per client IP per minute |
 | `RUGEN_RATE_RELAY` | `300`              | `/relay` WebSocket upgrades per client IP per 10 s (not charged to the API budgets) |
+| `RUGEN_HIGH_PING_MS` | `200`            | queue pairs estimated above this round trip are flagged `high_ping` |
 
 ## Backups
 
@@ -540,9 +541,12 @@ What the client does to keep online play feeling local:
   match, a *CONNECTION UNSTABLE* warning on interruptions, large frame
   advantage or deep rollbacks; rooms and the queue show the estimated ping.
 - **Ping-aware matchmaking**: the server measures each player's round trip
-  on the lobby WebSocket; quick match / ranked pair the lowest combined
-  ping first with a window widening 60 → 120 → 200 ms → any after 30 s
-  (ranked also widens the Elo window). *Good connections only* caps it.
+  on the lobby WebSocket; quick match / ranked take the lowest estimated
+  ping pairs of the whole queue first with a window widening
+  80 → 150 → 250 ms → any after 30 s (ranked also widens the Elo window).
+  *Good connections only* caps it. Pairs estimated above
+  `RUGEN_HIGH_PING_MS` (200) carry `high_ping: true` so the client shows
+  the ping on the confirm screen, where both players accept anyway.
 - **Shared settings**: both sides of an online match simulate with the
   same game settings (room round time / mode), whatever their local
   options say.
