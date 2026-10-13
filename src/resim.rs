@@ -76,6 +76,10 @@ pub fn replay(
             if !packages.has(f) {
                 return Err(format!("package {} expired", rugen_fair::short(f)));
             }
+            // simulated by this engine, a 0.5 match could settle wrongly
+            if packages.is_legacy(f) {
+                return Err("an API 4 (rugen 0.5) match: not re-simulated".into());
+            }
             let u = packages.verified(f).map_err(|e| e.to_string())?;
             if u.fingerprint != *f {
                 return Err(format!("package {} changed", rugen_fair::short(f)));

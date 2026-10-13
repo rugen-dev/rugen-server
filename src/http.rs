@@ -337,6 +337,11 @@ async fn any(
         query,
         body: body.to_vec(),
         ip: Some(client_ip(&headers, peer)),
+        api: crate::compat::api_of(
+            headers
+                .get(crate::compat::API_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        ),
     };
     let api = st.api.clone();
     match tokio::task::spawn_blocking(move || api.handle(req)).await {

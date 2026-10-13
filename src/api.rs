@@ -98,6 +98,8 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Client address, for per-IP limits only (never stored or echoed).
     pub ip: Option<std::net::IpAddr>,
+    /// The client's lobby API ([`crate::compat::api_of`]: 4 unless it says).
+    pub api: u32,
 }
 
 pub struct Response {
@@ -152,6 +154,8 @@ struct Room {
     running: Option<Running>,
     /// Match in its matchup phase (pick / confirm / sync).
     matchup: Option<u64>,
+    /// The host's API: only clients of the same API may join.
+    api: u32,
 }
 
 impl Room {
@@ -177,6 +181,8 @@ struct QueueEntry {
     char_id: String,
     since: Instant,
     last_poll: Instant,
+    /// Only entries of the same API meet.
+    api: u32,
 }
 
 #[derive(Default)]
@@ -481,6 +487,8 @@ impl Api {
             transports: rugen_proto::relay_transports(self.cfg.udp_public.as_deref()),
             key: self.truth.public_key().map(|k| k.hex()),
             official: self.truth.is_official(),
+            // API 4 (0.5) clients never read `api`: both generations play here
+            api_min: crate::compat::LEGACY_API,
         })
     }
 
@@ -556,7 +564,7 @@ impl Api {
                 })
             }
             ("GET", ["replay", id]) => self.replay(id),
-            ("GET", ["rooms"]) => self.list_rooms(),
+            ("GET", ["rooms"]) => self.list_rooms(&req),
             ("POST", ["room"]) => self.create_room(&req, &v),
             ("POST", ["room", code, "join"]) => self.join_room(&req, &v, code),
             ("GET", ["room", code]) => self.poll_room(&req, &v, code),
@@ -765,19 +773,23 @@ impl Api {
         Ok(())
     }
 
-    fn list_rooms(&self) -> Res {
+    /// Public rooms, newest first, rooms of the caller's API before the
+    /// others. Each carries the additive `api` of its host; API 4 callers
+    /// (who ignore that field) see other rooms with a `[0.6]` name prefix.
+    fn list_rooms(&self, req: &Request) -> Res {
         let s = lock(&self.store);
         let mut rooms = lock(&self.rooms);
         self.expire_rooms(&mut rooms);
-        let mut list: Vec<(Instant, RoomSummary)> = rooms
+        let mut list: Vec<(bool, std::cmp::Reverse<Instant>, RoomSummary)> = rooms
             .iter()
             .filter(|(_, r)| r.public)
             .map(|(code, r)| {
                 (
-                    r.created,
+                    r.api != req.api,
+                    std::cmp::Reverse(r.created),
                     RoomSummary {
                         code: code.clone(),
-                        name: r.name.clone(),
+                        name: crate::compat::listed_name(&r.name, r.api, req.api),
                         host: r
                             .player(0)
                             .map(|m| Self::profile(&s, m.account).name)
@@ -788,12 +800,13 @@ impl Api {
                         max_spectators: r.max_spectators,
                         locked: r.password.is_some(),
                         in_match: r.running.is_some(),
+                        api: r.api,
                     },
                 )
             })
             .collect();
-        list.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-        let list: Vec<RoomSummary> = list.into_iter().take(100).map(|(_, r)| r).collect();
+        list.sort_by_key(|(other, t, _)| (*other, *t));
+        let list: Vec<RoomSummary> = list.into_iter().take(100).map(|(.., r)| r).collect();
         ok(&list)
     }
 
@@ -844,6 +857,7 @@ impl Api {
             created: Instant::now(),
             running: None,
             matchup: None,
+            api: req.api,
         };
         let view = self.room_view(&s, &code, &room, me.id);
         rooms.insert(code.clone(), room);
@@ -866,6 +880,10 @@ impl Api {
             return Err(err(403, "you were removed from this room"));
         }
         if r.member(me.id).is_none() {
+            // players and spectators alike need to read the host's fighters
+            if r.api != req.api {
+                return Err(err(409, &crate::compat::room_refusal(req.api, r.api)));
+            }
             if let Some(phc) = &r.password {
                 let given = str_field(v, "password", 64).unwrap_or_default();
                 if !password::verify(&given, phc) {
@@ -1033,6 +1051,7 @@ impl Api {
                 char_id,
                 since: Instant::now(),
                 last_poll: Instant::now(),
+                api: req.api,
             });
         }
         log::info!(
@@ -1103,6 +1122,7 @@ impl Api {
                     waited_secs: e.since.elapsed().as_secs(),
                     max_ping: e.max_ping,
                     ranked: e.ranked,
+                    api: e.api,
                 })
                 .collect()
         };
@@ -1833,7 +1853,7 @@ impl Api {
             });
         }
         // complete: verify outside the locks (open + hash + analysis)
-        let verified = self.packages.finalize(&fp, me.id);
+        let verified = self.packages.finalize(&fp, me.id, req.api);
         self.after_upload(&fp, me.id, verified)?;
         let mut st = PackageStatus {
             fingerprint: fp.clone(),
@@ -1948,6 +1968,10 @@ impl Api {
         if !self.stored(&s, &fp) {
             return Err(err(404, "not on the server (yet)"));
         }
+        // never hand a package to a client that cannot read it
+        if self.packages.is_legacy(&fp) != crate::compat::is_legacy(req.api) {
+            return Err(err(409, &crate::compat::package_refusal(req.api)));
+        }
         let q = |k: &str| req.query.get(k).and_then(|x| x.parse::<u64>().ok());
         let offset = q("offset").unwrap_or(0);
         let len = q("len").unwrap_or(MAX_CHUNK).min(MAX_CHUNK);
@@ -2039,8 +2063,18 @@ impl Api {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::testkit::{declare, tiny_char, tiny_stage, tmp};
+    use crate::testkit::{declare, declare_legacy, tiny_char, tiny_stage, tmp};
     use rugen_fair::Kind;
+
+    thread_local! {
+        /// The API test requests announce (each test runs on its own thread).
+        static CLIENT_API: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::compat::API) };
+    }
+
+    /// Requests of the rest of this test come from clients of `api`.
+    pub fn client_api(api: u32) {
+        CLIENT_API.with(|c| c.set(api));
+    }
 
     pub fn req(method: &str, path: &str, body: Value) -> Request {
         raw(method, path, serde_json::to_vec(&body).unwrap())
@@ -2063,6 +2097,7 @@ pub(crate) mod tests {
             query,
             body,
             ip: None,
+            api: CLIENT_API.with(|c| c.get()),
         }
     }
 
@@ -2114,6 +2149,18 @@ pub(crate) mod tests {
                 Kind::Char,
             );
             let stage = declare(&tiny_stage(&root.join("s")), Kind::Stage);
+            Self { a, b, stage, root }
+        }
+
+        /// The same content as an API 4 (rugen 0.5) client brings it.
+        pub(crate) fn legacy() -> Self {
+            let root = tmp("kit-legacy");
+            let a = declare_legacy(&tiny_char(&root.join("a"), "Alpha", ""), Kind::Char);
+            let b = declare_legacy(
+                &tiny_char(&root.join("b"), "Beta", "; another fighter\n"),
+                Kind::Char,
+            );
+            let stage = declare_legacy(&tiny_stage(&root.join("s")), Kind::Stage);
             Self { a, b, stage, root }
         }
     }
@@ -3378,5 +3425,290 @@ pub(crate) mod tests {
             (h["matches"].clone(), h["relay"]["sessions"].clone()),
             (json!(0), json!(1))
         );
+    }
+
+    // ---- API 4 (rugen 0.5) and API 5 (rugen 0.6) clients on one server
+
+    fn status_err(r: Response, status: u16) -> String {
+        assert_eq!(r.status, status, "{}", String::from_utf8_lossy(&r.body));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        v["error"].as_str().unwrap().to_string()
+    }
+
+    fn create(api: &Api, key: &str, name: &str) -> String {
+        let r = json_of(api.handle(req(
+            "POST",
+            "/room",
+            json!({"key": key, "char": "kfm", "name": name}),
+        )));
+        r["code"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn api4_clients_keep_their_whole_flow() {
+        // what a 0.5 client sends: no API header, RGPK packages, rugen-fp-1
+        client_api(4);
+        let kit = Kit::legacy();
+        let api = api();
+        let info = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(
+            (info["api"].as_u64(), info["api_min"].as_u64()),
+            (Some(5), Some(4))
+        );
+        // still parses as the typed ServerInfo the old client decodes
+        let _: ServerInfo = serde_json::from_value(info).unwrap();
+        let (aid, ka) = register(&api);
+        let (_, kb) = register(&api);
+        // a room: create, list, join, matchup with uploads, start, download
+        let code = create(&api, &ka, "OLD SCHOOL");
+        let rooms = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(rooms[0]["name"], "OLD SCHOOL");
+        let _: Vec<RoomSummary> = serde_json::from_value(rooms).unwrap();
+        let joined = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kb, "char": "kfm"}),
+        )));
+        let mid = joined["matchup"]["id"].as_u64().unwrap();
+        let [va, _] = play_matchup(&api, mid, [&ka, &kb], &kit);
+        assert!(va["ticket"]["token"].is_string());
+        for (d, _) in [&kit.a, &kit.b, &kit.stage] {
+            assert!(api.packages.is_legacy(&d.fingerprint), "kept as RGPK");
+        }
+        let fp = &kit.a.0.fingerprint;
+        let r = api.handle(req("GET", &format!("/pkg/{fp}/data?key={kb}"), Value::Null));
+        assert_eq!(
+            r.body, kit.a.1,
+            "the opponent gets the RGPK bytes unchanged"
+        );
+        // the same player on a 0.6 client could not read it
+        client_api(5);
+        let why = status_err(
+            api.handle(req("GET", &format!("/pkg/{fp}/data?key={kb}"), Value::Null)),
+            409,
+        );
+        assert!(why.contains("OLDER RUGEN (0.5)"), "{why}");
+        client_api(4);
+        // results settle and rate the rugen-fp-1 fingerprints
+        for k in [&ka, &kb] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": mid, "winner": aid, "frames": 100, "checksum": 9}),
+            )));
+        }
+        let ca = json_of(api.handle(req("GET", &format!("/char/{fp}"), Value::Null)));
+        assert_eq!(ca["games"], 1);
+        // the ranked queue pairs two 0.5 clients, and known packages are reused
+        let (_, kc) = register(&api);
+        let (_, kd) = register(&api);
+        json_of(api.handle(req("POST", "/queue", json!({"key": kc}))));
+        let fd = json_of(api.handle(req("POST", "/queue", json!({"key": kd}))));
+        let mid = fd["found"]["match_id"].as_u64().unwrap();
+        play_matchup(&api, mid, [&kc, &kd], &kit);
+        // a lying 0.5 client is still caught by its rugen-fp-1
+        let (_, ke) = register(&api);
+        let (_, kf) = register(&api);
+        let code = create(&api, &ke, "LIARS");
+        let j = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kf, "char": "kfm"}),
+        )));
+        let mid = j["matchup"]["id"].as_u64().unwrap();
+        let root = tmp("legacy-liar");
+        let (mut d, pkg) = declare_legacy(&tiny_char(&root, "Gamma", "; g\n"), Kind::Char);
+        let real = d.fingerprint.clone();
+        d.fingerprint = kit
+            .b
+            .0
+            .fingerprint
+            .replace(&kit.b.0.fingerprint[..4], "0000");
+        pick(&api, mid, &ke, &d, Some(&kit.stage.0));
+        let why = status_err(upload(&api, &ke, &d, &pkg, 1 << 20), 422);
+        assert!(why.contains("do not match"), "{why}");
+        assert!(!api.packages.has(&real));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn api5_clients_use_rgc_and_each_generation_refuses_the_others_package() {
+        let kit = Kit::new();
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let code = create(&api, &ka, "NEW");
+        let j = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kb, "char": "kfm"}),
+        )));
+        let mid = j["matchup"]["id"].as_u64().unwrap();
+        play_matchup(&api, mid, [&ka, &kb], &kit);
+        let fp = &kit.a.0.fingerprint;
+        assert!(!api.packages.is_legacy(fp));
+        assert!(
+            api.packages
+                .path(fp)
+                .extension()
+                .is_some_and(|e| e == "rgc")
+        );
+        assert!(
+            api.packages
+                .path(&kit.stage.0.fingerprint)
+                .extension()
+                .is_some_and(|e| e == "rgs")
+        );
+        // a 0.5 client never gets an .rgc
+        client_api(4);
+        let why = status_err(
+            api.handle(req("GET", &format!("/pkg/{fp}/data?key={kb}"), Value::Null)),
+            409,
+        );
+        assert!(why.contains("NEWER RUGEN (0.6)"), "{why}");
+        // uploads in the other generation's format are refused with a reason
+        // (fresh content: nothing the server already holds)
+        let old = Kit::legacy();
+        let root = tmp("fresh-rgc");
+        let fresh = Kit {
+            a: declare(&tiny_char(&root.join("a"), "Delta", "; d\n"), Kind::Char),
+            b: declare(&tiny_char(&root.join("b"), "Echo", "; e\n"), Kind::Char),
+            stage: declare(&tiny_stage(&root.join("s")), Kind::Stage),
+            root,
+        };
+        for (api_of, kit_of, code_name) in [(5, &old, "X"), (4, &fresh, "Y")] {
+            client_api(api_of);
+            let (_, kc) = register(&api);
+            let (_, kd) = register(&api);
+            let code = create(&api, &kc, code_name);
+            let j = json_of(api.handle(req(
+                "POST",
+                &format!("/room/{code}/join"),
+                json!({"key": kd, "char": "kfm"}),
+            )));
+            let mid = j["matchup"]["id"].as_u64().unwrap();
+            pick(&api, mid, &kc, &kit_of.a.0, Some(&kit_of.stage.0));
+            let why = status_err(upload(&api, &kc, &kit_of.a.0, &kit_of.a.1, 1 << 20), 400);
+            if api_of == 5 {
+                assert!(why.contains("older rugen (0.5)"), "{why}");
+            } else {
+                assert!(why.contains("did not announce API 5"), "{why}");
+            }
+        }
+    }
+
+    #[test]
+    fn rooms_refuse_players_of_the_other_api_with_a_reason() {
+        let api = api();
+        client_api(4);
+        let (_, old_host) = register(&api);
+        let (_, old_guest) = register(&api);
+        let old_room = create(&api, &old_host, "CLASSIC");
+        client_api(5);
+        let (_, new_host) = register(&api);
+        let (_, new_guest) = register(&api);
+        let new_room = create(&api, &new_host, "SHINY");
+        // a 0.6 player joining a 0.5 host, as challenger or spectator
+        for spectate in [false, true] {
+            let why = status_err(
+                api.handle(req(
+                    "POST",
+                    &format!("/room/{old_room}/join"),
+                    json!({"key": new_guest, "char": "kfm", "spectate": spectate}),
+                )),
+                409,
+            );
+            assert_eq!(
+                why,
+                "THIS ROOM'S HOST RUNS AN OLDER RUGEN (0.5). BOTH PLAYERS NEED THE SAME VERSION."
+            );
+        }
+        // the 0.6 lobby lists both, its own first, each with its api
+        let rooms = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(rooms[0]["name"], "SHINY");
+        assert_eq!(rooms[0]["api"], 5);
+        assert_eq!(rooms[1]["name"], "CLASSIC");
+        assert_eq!(rooms[1]["api"], 4);
+        // a 0.5 player joining a 0.6 host
+        client_api(4);
+        let why = status_err(
+            api.handle(req(
+                "POST",
+                &format!("/room/{new_room}/join"),
+                json!({"key": old_guest, "char": "kfm"}),
+            )),
+            409,
+        );
+        assert!(
+            why.contains("NEWER RUGEN (0.6)") && why.contains("UPDATE YOUR GAME"),
+            "{why}"
+        );
+        // the 0.5 lobby marks the newer room in its name and lists it last
+        let rooms = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(rooms[0]["name"], "CLASSIC");
+        assert_eq!(rooms[1]["name"], "[0.6] SHINY");
+        // same-API joins still work, and nothing was started by the refusals
+        let j = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{old_room}/join"),
+            json!({"key": old_guest, "char": "kfm"}),
+        )));
+        assert_eq!(j["side"], 2);
+        let host = json_of(api.handle(req(
+            "GET",
+            &format!("/room/{new_room}?key={new_host}"),
+            Value::Null,
+        )));
+        assert!(host["matchup"].is_null());
+        assert_eq!(host["members"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_queue_never_pairs_different_apis() {
+        let api = api();
+        for ranked in [true, false] {
+            client_api(4);
+            let (old_a, old_b) = (register(&api).1, register(&api).1);
+            client_api(5);
+            let (new_a, new_b) = (register(&api).1, register(&api).1);
+            client_api(4);
+            json_of(api.handle(req(
+                "POST",
+                "/queue",
+                json!({"key": old_a, "ranked": ranked}),
+            )));
+            client_api(5);
+            let st = json_of(api.handle(req(
+                "POST",
+                "/queue",
+                json!({"key": new_a, "ranked": ranked}),
+            )));
+            assert!(st["found"].is_null(), "mixed APIs paired: {st}");
+            assert_eq!(st["players_in_queue"], 2);
+            // a partner of each API arrives: each meets its own
+            let st = json_of(api.handle(req(
+                "POST",
+                "/queue",
+                json!({"key": new_b, "ranked": ranked}),
+            )));
+            let new_match = st["found"]["match_id"].as_u64().unwrap();
+            client_api(4);
+            let st = json_of(api.handle(req(
+                "POST",
+                "/queue",
+                json!({"key": old_b, "ranked": ranked}),
+            )));
+            let old_match = st["found"]["match_id"].as_u64().unwrap();
+            assert_ne!(old_match, new_match);
+            let id = |k: &str| lock(&api.store).by_key(k).unwrap().unwrap().id;
+            let ms = lock(&api.matchups);
+            for (m, keys) in [(old_match, [&old_a, &old_b]), (new_match, [&new_a, &new_b])] {
+                let mut want = [id(keys[0]), id(keys[1])];
+                let mut got = ms[&m].players;
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want);
+            }
+        }
     }
 }

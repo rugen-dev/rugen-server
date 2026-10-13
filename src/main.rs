@@ -76,11 +76,13 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod compat;
 #[cfg(test)]
 mod e2e;
 mod elo;
 mod http;
 mod hub;
+mod legacy;
 mod matchmaking;
 mod matchup;
 mod packages;

@@ -288,8 +288,8 @@ uploaded packages only to pass them between the two players of a match and
 deletes them on expiry; it does not list or publish them. As the operator
 you are responsible for what your server hosts: set the caps and TTL to
 what you are willing to keep, remove content on request (delete
-`packages/<fingerprint>.rgc` (stages: `.rgs`) from the data volume; the server drops its
-record on the next sweep), and
+`packages/<fingerprint>.rgc` (stages: `.rgs`, rugen 0.5 packages: `.rgpk`)
+from the data volume; the server drops its record on the next sweep), and
 do not run a public server if you cannot answer takedown requests.
 
 ### Re-simulating disputed matches
@@ -299,7 +299,36 @@ Built with `--features resim` (`cargo build --release
 given the engine data (`RUGEN_RESIM_DATA=/path/to/data`, the folder with
 `common1.cns` / `fight.def`), the server re-plays a disputed match from
 both input streams with the stored packages, headless, and settles the
-result when one report matches the simulation.
+result when one report matches the simulation. Matches between two rugen
+0.5 players (RGPK packages, see below) are not re-simulated: this engine
+is not theirs, so a disputed one settles as an unresolved dispute.
+
+### rugen 0.5 and 0.6 players on one server
+
+Since rugen 0.6 (lobby API 5) fighters travel as `.rgc` / `.rgs` with
+`rugen-fp-2` fingerprints; rugen 0.5 (API 4) uploads RGPK packages with
+`rugen-fp-1` fingerprints. This server serves both, so updating the server
+never locks 0.5 players out:
+
+- 0.6 clients send `X-Rugen-Api: 5` on every request; a request without
+  it is a 0.5 client. `/health` says `api: 5` and `api_min: 4` (0.5
+  clients ignore `api`; 0.6 clients refuse servers that serve API 4 only).
+- Players of different versions can never share fighters, so they never
+  meet: the queue pairs equal versions only; a room keeps its host's
+  version and refuses players and spectators of the other one
+  (`THIS ROOM'S HOST RUNS AN OLDER RUGEN (0.5). BOTH PLAYERS NEED THE SAME
+  VERSION.` / `... A NEWER RUGEN (0.6). UPDATE YOUR GAME TO JOIN.`). The
+  lobby lists every public room with its `api`; 0.5 clients see rooms of
+  0.6 hosts last, named `[0.6] ...`.
+- Uploads are verified in the uploader's format (0.5: unpacked into
+  scratch space, `rugen-fp-1`; 0.6: opened in place, `rugen-fp-2`) and a
+  package is only handed to a client of its own generation.
+- Accounts, ratings, seasons, results, TURN and signatures are shared.
+  Character ratings and the blocklist stay keyed by fingerprint, and the
+  two generations fingerprint the same character differently: a block of
+  a 0.5 fingerprint does not cover its `.rgc`. Block it again by the 0.6
+  fingerprint (the official feed simply carries both kinds; each client
+  only ever matches its own).
 
 LAN / direct-IP matches (`--net ip:port`, HOST / JOIN DIRECT MATCH) still
 work without any server; there the players type each other's address on
@@ -494,6 +523,10 @@ docker compose pull && docker compose up -d
 
 Releases: pushing a `v*` tag builds and pushes the image (amd64; run the
 workflow manually with *arm64* ticked for ARM servers).
+
+Packages already on the data volume keep working across an update: the
+RGPK packages of rugen 0.5 players (`packages/*.rgpk`) are still served to
+0.5 clients, new 0.6 uploads land next to them as `.rgc` / `.rgs`.
 
 ## Without a proxy
 

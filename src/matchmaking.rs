@@ -27,6 +27,9 @@ pub struct Candidate {
     pub max_ping: Option<u32>,
     /// Ranked entries respect the rating window; quick match ignores it.
     pub ranked: bool,
+    /// Lobby API of the client: players of different APIs cannot share
+    /// fighters, so they never meet ([`crate::compat`]).
+    pub api: u32,
 }
 
 /// Acceptable estimated round trip between the two players after waiting
@@ -48,7 +51,7 @@ pub fn estimate(a: Option<u32>, b: Option<u32>) -> u32 {
 
 /// The pair's estimated round trip when they may meet now.
 fn acceptable(a: &Candidate, b: &Candidate) -> Option<u32> {
-    if a.ranked != b.ranked {
+    if a.ranked != b.ranked || a.api != b.api {
         return None;
     }
     let gap = (a.rating - b.rating).abs();
@@ -67,7 +70,7 @@ fn acceptable(a: &Candidate, b: &Candidate) -> Option<u32> {
 }
 
 /// Pairs to start, as indices into `queue` (oldest first). Only entries of
-/// the same kind (ranked / quick) meet. Acceptable pairs are taken lowest
+/// the same kind (ranked / quick) and the same API meet. Acceptable pairs are taken lowest
 /// estimated ping first, then smallest rating gap, then longest wait.
 pub fn pairs(queue: &[Candidate]) -> Vec<(usize, usize)> {
     let mut all: Vec<(u32, i32, std::cmp::Reverse<u64>, usize, usize)> = Vec::new();
@@ -110,7 +113,21 @@ mod tests {
             waited_secs: waited,
             max_ping: None,
             ranked: true,
+            api: 5,
         }
+    }
+
+    #[test]
+    fn different_apis_never_meet() {
+        // perfect pair in every respect but the client generation
+        let mut old = c(1, 1200, Some(10), 999);
+        old.api = 4;
+        let new = c(2, 1200, Some(10), 999);
+        assert!(pairs(&[old.clone(), new.clone()]).is_empty());
+        let mut old2 = c(3, 1900, Some(90), 0);
+        old2.api = 4;
+        old2.ranked = true;
+        assert_eq!(pairs(&[old, new, old2]), vec![(0, 2)]);
     }
 
     #[test]

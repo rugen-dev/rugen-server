@@ -83,11 +83,28 @@ pub fn package(def: &Path, kind: rugen_fair::Kind) -> Vec<u8> {
     bytes
 }
 
-/// Declaration + package bytes of the content at `def`.
+/// Declaration + package bytes of the content at `def`, as an API 5
+/// client makes them (`.rgc` / `.rgs`, `rugen-fp-2`).
 pub fn declare(def: &Path, kind: rugen_fair::Kind) -> (FighterDecl, Vec<u8>) {
+    declare_as(def, kind, false)
+}
+
+/// [`declare`] as an API 4 (rugen 0.5) client makes them: an RGPK package
+/// and a `rugen-fp-1` fingerprint.
+pub fn declare_legacy(def: &Path, kind: rugen_fair::Kind) -> (FighterDecl, Vec<u8>) {
+    declare_as(def, kind, true)
+}
+
+fn declare_as(def: &Path, kind: rugen_fair::Kind, legacy: bool) -> (FighterDecl, Vec<u8>) {
     let files = rugen_fair::files::content_files(kind, def, None).unwrap();
-    let fp = rugen_fair::fingerprint(&files).unwrap();
-    let pkg = package(def, kind);
+    let (fp, pkg) = if legacy {
+        let fp = crate::legacy::fingerprint(&files).unwrap();
+        let mut pkg = Vec::new();
+        crate::legacy::write(&files, &fp, &mut pkg).unwrap();
+        (fp, pkg)
+    } else {
+        (rugen_fair::fingerprint(&files).unwrap(), package(def, kind))
+    };
     let profile = match kind {
         rugen_fair::Kind::Char => Some(rugen_fair::profile::analyze(&files).unwrap()),
         rugen_fair::Kind::Stage => None,

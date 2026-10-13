@@ -30,6 +30,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # HTTPS client: pulls the official truth feed and calls the Cloudflare TURN
 # API (rustls + bundled webpki roots: the scratch image has no CA store)
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# RGPK packages and rugen-fp-1 fingerprints of API 4 (rugen 0.5) clients
+zstd = { version = "0.13", default-features = false }
+sha2 = "0.11"
 
 [features]
 # re-simulate disputed ranked matches from stored packages (needs RUGEN_RESIM_DATA)
