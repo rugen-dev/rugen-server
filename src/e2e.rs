@@ -716,3 +716,61 @@ fn turn_match_through_a_tunnel_only_server() {
     eprintln!("turn status: {st}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Named accounts over real HTTP with the game's own client: create on one
+/// device, log out, log in on a second device, same account and rating;
+/// an older device's anonymous account is claimed and keeps its key.
+#[test]
+fn named_account_moves_between_devices() {
+    let tmp = crate::testkit::tmp("e2e-accounts");
+    let srv = server(&tmp.join("server"));
+    assert!(OnlineClient::new(&srv.url, None).info().unwrap().accounts);
+    // device 1: create, then a rating to recognise
+    let mut one = OnlineClient::new(&srv.url, None);
+    let s = one.create_account("Axel", "simple").unwrap();
+    assert_eq!(one.key.as_deref(), Some(s.key.as_str()));
+    assert!(s.profile.verified);
+    let opponent = OnlineClient::new(&srv.url, None).register().unwrap();
+    {
+        let mut st = srv.api.store_lock();
+        let m = st.new_match([s.id, opponent.id], true, "{}").unwrap();
+        let w = crate::store::ReportData {
+            winner: s.id,
+            ..Default::default()
+        };
+        st.report(s.id, m, &w).unwrap();
+        st.report(opponent.id, m, &w).unwrap();
+    }
+    let rating = one.account().unwrap().profile.rating;
+    assert_eq!(rating, 1216);
+    one.logout(false).unwrap();
+    assert!(one.account().is_err(), "logged out");
+    // device 2: a fresh client logs in
+    let mut two = OnlineClient::new(&srv.url, None);
+    let wrong = two.login("axel", "simplE").unwrap_err().to_string();
+    assert!(wrong.contains("WRONG USERNAME OR PASSWORD"), "{wrong}");
+    let l = two.login("axel", "simple").unwrap();
+    assert_eq!((l.id, l.username.as_str()), (s.id, "Axel"));
+    let info = two.account().unwrap();
+    assert_eq!(info.profile.rating, rating);
+    assert_eq!(info.sessions, 1);
+    // the leaderboard shows the badge
+    let board = two.leaderboard().unwrap();
+    assert!(board.rows.iter().any(|r| r.name == "Axel" && r.verified));
+    // change password on device 2: device 3 (logged in before) is logged out
+    let mut three = OnlineClient::new(&srv.url, None);
+    three.login("AXEL", "simple").unwrap();
+    two.change_password("simple", "better-one").unwrap();
+    assert!(three.account().is_err());
+    assert!(two.account().is_ok());
+    two.logout(true).unwrap();
+    assert!(two.account().is_err());
+    // an older device: anonymous account, then claimed
+    let mut old = OnlineClient::new(&srv.url, None);
+    let anon = old.register().unwrap();
+    assert!(!old.account().unwrap().named());
+    let c = old.claim("OldTimer", "simple").unwrap();
+    assert_eq!((c.id, c.key.as_str()), (anon.id, anon.key.as_str()));
+    assert_eq!(old.account().unwrap().username, "OldTimer");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
