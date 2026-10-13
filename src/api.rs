@@ -540,6 +540,19 @@ impl Api {
             self.relay.close(session);
             log::info!("match {match_id}: result settled, relay session {session:08x} closed");
         }
+        // the players were in the fight, not polling the room: they are
+        // fresh members now (a match outlasts MEMBER_TIMEOUT_SECS, and the
+        // challenger used to be dropped from the room, no REMATCH possible)
+        let now = Instant::now();
+        for r in lock(&self.rooms).values_mut() {
+            let Some(run) = r.running.as_ref().filter(|run| run.match_id == match_id) else {
+                continue;
+            };
+            let slots = run.slots.clone();
+            for m in r.members.iter_mut().filter(|m| slots.contains(&m.account)) {
+                m.last_seen = m.last_seen.max(now);
+            }
+        }
     }
 
     /// Account for the key in `v` (body) or `?key=`.
@@ -4028,6 +4041,43 @@ pub(crate) mod tests {
         silent();
         json_of(api.handle(req("GET", "/rooms", Value::Null)));
         assert!(!lock(&api.rooms).contains_key(&code));
+    }
+
+    /// A match longer than the member timeout (nobody polls the room while
+    /// fighting) keeps both players in the room once the results settle it:
+    /// REMATCH needs the challenger still there.
+    #[test]
+    fn players_stay_in_the_room_after_a_long_match() {
+        let kit = Kit::new();
+        let api = api();
+        let (aid, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (code, id) = started_room(&api, &ka, &kb, &kit);
+        // a long fight: the last poll is older than the timeout
+        for m in lock(&api.rooms).get_mut(&code).unwrap().members.iter_mut() {
+            m.last_seen = Instant::now() - Duration::from_secs(MEMBER_TIMEOUT_SECS + 30);
+        }
+        for k in [&ka, &kb] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": id, "winner": aid}),
+            )));
+        }
+        assert_eq!(api.relay.session_count(), 0, "settled, session closed");
+        json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(lock(&api.rooms)[&code].members.len(), 2, "challenger kept");
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": ka}),
+        )));
+        let v = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": kb}),
+        )));
+        assert!(v["matchup"]["id"].as_u64().is_some_and(|n| n != id), "{v}");
     }
 
     #[test]
