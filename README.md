@@ -4,8 +4,10 @@ The self-hostable online hub for [rugen](https://github.com/rugen-dev/rugen-engi
 the M.U.G.E.N engine rewritten in Rust. One small binary (≈5 MB image,
 SQLite inside):
 
-- anonymous accounts, a lobby with public and private rooms (optional
-  Argon2id room passwords), spectators, rematch
+- named accounts (username + password, Argon2id, several devices, operator
+  password resets) next to the anonymous accounts of older clients
+- a lobby with public and private rooms (optional Argon2id room
+  passwords), spectators, rematch
 - quick match and ranked (Elo K=32, 90-day seasons, leaderboard)
 - the **match relay**: every datagram goes player → server → player over UDP
   (WebSocket fallback), so players never learn each other's IP address

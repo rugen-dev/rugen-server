@@ -423,7 +423,23 @@ docker exec rugen-server /rugen-server --data /data --unblock <fp>
 docker exec rugen-server /rugen-server --data /data --blocklist
 ```
 
-Live matchups are judged again at once. Automatic entries (`source: auto`):
+Live matchups are judged again at once.
+
+**Password resets.** Named accounts have no e-mail, so the operator is the
+only way back in for a player who lost their password:
+
+```sh
+curl -X POST https://play.rugen.dev/v1/admin/reset_password \
+  -d '{"token":"...","username":"axel"}'        # → {"username","password"}
+docker exec rugen-server /rugen-server --data /data --reset-password axel
+```
+
+Both set a random temporary password, log the account out on every device
+and print the password once (it is never logged). Hand it over privately
+and have the player change it from PROFILE → CHANGE PASSWORD. Check who is
+asking first: the username is public.
+
+Automatic entries (`source: auto`):
 
 - the server's own analysis of an uploaded package finds a block-level
   cheat (`RUGEN_AUTO_BLOCK_ANALYSIS`, on),
@@ -488,7 +504,7 @@ again (it is at least the current Unix time).
 | `RUGEN_RATE_ACCOUNT` | `120`            | API calls per account (its key) per 10 s |
 | `RUGEN_RATE_IP`    | `2000`             | API calls per client IP per 10 s, all accounts together (abuse ceiling; mobile carriers put many players behind one IP) |
 | `RUGEN_RATE_ANON`  | `300`              | calls without a key per client IP per 10 s |
-| `RUGEN_RATE_REGISTER` | `30`            | registrations per client IP per minute |
+| `RUGEN_RATE_REGISTER` | `30`            | registrations, logins and other `POST /v1/account/*` calls per client IP per minute |
 | `RUGEN_RATE_RELAY` | `300`              | `/relay` WebSocket upgrades per client IP per 10 s (not charged to the API budgets) |
 | `RUGEN_HIGH_PING_MS` | `200`            | queue pairs estimated above this round trip are flagged `high_ping` |
 
@@ -556,8 +572,23 @@ proxy with TLS works too; it must pass WebSocket upgrades for `/ws` and
   queues (256 frames; overflow is dropped like lost UDP and counted in
   `/health` → `relay.queue_drops`). The container runs as non-root on a read-only root fs with
   all capabilities dropped.
-- Accounts are anonymous: the key in the player's `profile.json` *is* the
-  account. Keep backups of the database if rankings matter.
+- Accounts: rugen 0.6 players create a **named account** (unique username,
+  3-16 letters / digits / `_` / `-`, case-insensitive; reserved names like
+  `admin`, `rugen`, `official` refused) with a password of 6-128
+  characters. Passwords are hashed with Argon2id (19 MiB, 2 passes, 1
+  lane, per-hash salt; ≈ 22 ms on one core, at most two hashes at once),
+  only ever travel inside the HTTPS body and are never logged. Failed
+  logins: 5 free tries per username and 20 per IP, then a lockout of 30 s
+  doubling with every failure (15 min at most); every refusal reads
+  `WRONG USERNAME OR PASSWORD`. Logging in returns an account key like
+  before (stored as a SHA-256 hash, up to 10 devices per account); changing
+  the password or LOG OUT EVERYWHERE revokes the others. Anonymous accounts
+  (rugen 0.5 players, and 0.6 players who have not claimed theirs yet) still
+  work: their key in `profile.json` *is* the account, and they can claim it
+  (pick a username + password) without losing id, rating or history.
+  Usernames carry a `verified` flag in every profile so the game shows a
+  badge; free-form names of anonymous accounts can never equal a username.
+  Keep backups of the database if rankings matter.
 
 ## Netcode
 

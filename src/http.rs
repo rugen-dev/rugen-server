@@ -52,7 +52,8 @@ pub struct Limits {
     pub ip: u32,
     /// `RUGEN_RATE_ANON`: requests without a key per IP per 10 s.
     pub anon: u32,
-    /// `RUGEN_RATE_REGISTER`: registrations per IP per minute.
+    /// `RUGEN_RATE_REGISTER`: registrations, logins and other password
+    /// calls (`POST /v1/account/*`) per IP per minute.
     pub register: u32,
     /// `RUGEN_RATE_RELAY`: `/relay` WebSocket upgrades per IP per 10 s.
     pub relay: u32,
@@ -307,7 +308,12 @@ async fn any(
         .unwrap_or_default();
     if uri.path() != "/health" && !transfer {
         let key = request_key(&query, &body);
-        let call = if uri.path().trim_end_matches('/') == "/register" {
+        // registrations and password checks (Argon2id) share the per-IP
+        // registration budget
+        let path = uri.path().trim_end_matches('/');
+        let call = if path == "/register"
+            || (method == Method::POST && path.starts_with("/v1/account/"))
+        {
             Call::Register
         } else {
             Call::Api {

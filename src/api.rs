@@ -43,6 +43,17 @@
 //! POST /v1/admin/block          {token, fingerprint, reason}   RUGEN_ADMIN_TOKEN
 //! POST /v1/admin/unblock        {token, fingerprint}
 //! GET  /v1/admin/blocklist?token=
+//! POST /v1/admin/reset_password {token, username} → {username, password} (temporary;
+//!                               every key of the account is revoked)
+//!
+//! named accounts, API 5 only (see crate::api::accounts, rugen_proto::account)
+//! POST /v1/account/register     {username, password}             → Session
+//! POST /v1/account/login        {username, password}             → Session (new key)
+//! POST /v1/account/claim        {key, username, password}        → Session (same key)
+//! GET  /v1/account?key=         AccountInfo
+//! POST /v1/account/password     {key, password, new_password}    → Session (fresh key)
+//! POST /v1/account/logout       {key}
+//! POST /v1/account/logout_all   {key}
 //! ```
 //!
 //! Additive JSON fields (older clients ignore them; typed `rugen_proto`
@@ -90,6 +101,9 @@ use crate::resim::ResimConfig;
 use crate::store::{Account, DbResult, ReportData, Store, random_code, setup_fingerprints};
 use crate::truth::{Truth, TruthConfig};
 use crate::turn::{Turn, TurnConfig};
+
+mod accounts;
+pub use accounts::LoginGuard;
 
 pub struct Request {
     pub method: String,
@@ -259,6 +273,8 @@ pub struct Api {
     seen: Mutex<HashMap<u64, Instant>>,
     /// The `/health` body, rebuilt at most every [`HEALTH_TTL`].
     health: Mutex<Option<(Instant, Value)>>,
+    /// Failed logins per username / address ([`accounts`]).
+    logins: Mutex<LoginGuard>,
 }
 
 /// How long a computed `/health` body is served from the cache.
@@ -293,6 +309,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn body(req: &Request) -> Value {
     serde_json::from_slice(&req.body).unwrap_or(Value::Null)
+}
+
+/// The account key of a request: the JSON body's `key`, else `?key=`.
+fn request_key(req: &Request, v: &Value) -> Option<String> {
+    v.get("key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| req.query.get("key").cloned())
 }
 
 fn str_field(v: &Value, k: &str, max: usize) -> Option<String> {
@@ -393,6 +417,7 @@ impl Api {
             turn,
             seen: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
+            logins: Mutex::new(LoginGuard::default()),
         })
     }
 
@@ -462,12 +487,7 @@ impl Api {
 
     /// Account for the key in `v` (body) or `?key=`.
     fn auth(&self, store: &mut Store, req: &Request, v: &Value) -> Result<Account, Response> {
-        let key = v
-            .get("key")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| req.query.get("key").cloned())
-            .ok_or_else(|| err(401, "bad key"))?;
+        let key = request_key(req, v).ok_or_else(|| err(401, "bad key"))?;
         if key.len() != 64 {
             return Err(err(401, "bad key"));
         }
@@ -513,6 +533,8 @@ impl Api {
             official: self.truth.is_official(),
             // API 4 (0.5) clients never read `api`: both generations play here
             api_min: crate::compat::LEGACY_API,
+            // named accounts (API 5)
+            accounts: true,
         })
     }
 
@@ -631,6 +653,8 @@ impl Api {
                 blob.map_or_else(|| Err(err(404, "no official feed held")), |b| ok(&b))
             }
             ("GET", ["v1", "identity"]) => self.identity(&req),
+            ("GET", ["v1", "account"]) => self.account(&req, &v, "info"),
+            ("POST", ["v1", "account", op]) => self.account(&req, &v, op),
             ("POST", ["v1", "admin", op]) => self.admin(&req, &v, op),
             ("GET", ["v1", "admin", "blocklist"]) => self.admin(&req, &v, "blocklist"),
             _ => Err(err(404, "no such route")),
@@ -808,16 +832,15 @@ impl Api {
             .iter()
             .filter(|(_, r)| r.public)
             .map(|(code, r)| {
+                let host = r.player(0).map(|m| Self::profile(&s, m.account));
                 (
                     r.api != req.api,
                     std::cmp::Reverse(r.created),
                     RoomSummary {
                         code: code.clone(),
                         name: crate::compat::listed_name(&r.name, r.api, req.api),
-                        host: r
-                            .player(0)
-                            .map(|m| Self::profile(&s, m.account).name)
-                            .unwrap_or_default(),
+                        host: host.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
+                        host_verified: host.as_ref().is_some_and(|p| p.verified),
                         rules: r.rules.clone(),
                         players: r.members.iter().filter(|m| m.role < 2).count() as u8,
                         spectators: r.spectators(),
@@ -1445,6 +1468,11 @@ impl Api {
             .unwrap_or_default();
         if !self.truth.admin_ok(&token) {
             return Err(err(403, "bad admin token"));
+        }
+        if op == "reset_password" {
+            let username = str_field(v, "username", 64).unwrap_or_default();
+            let (username, password) = self.reset_password(&username)?;
+            return ok(&json!({ "username": username, "password": password }));
         }
         let fp = || -> Result<String, Response> {
             let fp = v
@@ -3973,5 +4001,415 @@ pub(crate) mod tests {
                 assert_eq!(got, want);
             }
         }
+    }
+
+    // ---- named accounts (API 5)
+
+    fn account(api: &Api, op: &str, body: Value) -> Response {
+        api.handle(req("POST", &format!("/v1/account/{op}"), body))
+    }
+
+    fn signup(api: &Api, user: &str, pw: &str) -> Value {
+        json_of(account(
+            api,
+            "register",
+            json!({"username": user, "password": pw}),
+        ))
+    }
+
+    fn login(api: &Api, user: &str, pw: &str) -> Response {
+        account(api, "login", json!({"username": user, "password": pw}))
+    }
+
+    fn key_works(api: &Api, key: &str) -> bool {
+        api.handle(req("GET", &format!("/v1/account?key={key}"), Value::Null))
+            .status
+            == 200
+    }
+
+    #[test]
+    fn register_login_and_username_rules() {
+        let api = api();
+        let info = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(info["accounts"], true);
+        let s = signup(&api, "Axel_99", "simple");
+        let key = s["key"].as_str().unwrap().to_string();
+        assert_eq!(key.len(), 64);
+        assert_eq!(s["username"], "Axel_99");
+        assert_eq!(s["profile"]["name"], "Axel_99");
+        assert_eq!(s["profile"]["verified"], true);
+        assert_eq!(s["profile"]["rating"], 1200);
+        assert!(
+            !String::from_utf8_lossy(
+                &account(
+                    &api,
+                    "register",
+                    json!({"username": "zed", "password": "simple"})
+                )
+                .body
+            )
+            .contains("simple")
+        );
+        // the key works for the whole lobby API, like an anonymous key
+        let me = json_of(api.handle(req(
+            "POST",
+            "/profile",
+            json!({"key": key, "name": "SOMETHING ELSE", "avatar": 3}),
+        )));
+        assert_eq!(
+            me["name"], "Axel_99",
+            "a named account's name is its username"
+        );
+        assert_eq!(me["avatar"], 3);
+        let code = create(&api, &key, "AXEL ROOM");
+        let rooms = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(rooms[0]["code"], code.as_str());
+        assert_eq!(rooms[0]["host_verified"], true);
+        // case-insensitive uniqueness
+        let e = status_err(
+            account(
+                &api,
+                "register",
+                json!({"username": "AXEL_99", "password": "another"}),
+            ),
+            409,
+        );
+        assert_eq!(e, "USERNAME TAKEN");
+        // rules
+        for (user, pw, want) in [
+            ("ab", "simple", "USERNAME: 3 TO 16 LETTERS, DIGITS, _ OR -"),
+            (
+                "has space",
+                "simple",
+                "USERNAME: 3 TO 16 LETTERS, DIGITS, _ OR -",
+            ),
+            (
+                "a2345678901234567",
+                "simple",
+                "USERNAME: 3 TO 16 LETTERS, DIGITS, _ OR -",
+            ),
+            ("Admin", "simple", "THIS USERNAME IS RESERVED"),
+            ("rugen", "simple", "THIS USERNAME IS RESERVED"),
+            ("Official", "simple", "THIS USERNAME IS RESERVED"),
+            ("server", "simple", "THIS USERNAME IS RESERVED"),
+            ("moderator", "simple", "THIS USERNAME IS RESERVED"),
+            ("PLAYER1234", "simple", "THIS USERNAME IS RESERVED"),
+            ("goodname", "12345", "PASSWORD: 6 TO 128 CHARACTERS"),
+        ] {
+            let r = account(&api, "register", json!({"username": user, "password": pw}));
+            assert_eq!(status_err(r, 400), want, "{user}");
+        }
+        let long = "x".repeat(129);
+        assert_eq!(
+            status_err(
+                account(
+                    &api,
+                    "register",
+                    json!({"username": "goodname", "password": long})
+                ),
+                400
+            ),
+            "PASSWORD: 6 TO 128 CHARACTERS"
+        );
+        // login: any case of the name, a fresh key per device
+        let l = json_of(login(&api, "axel_99", "simple"));
+        assert_eq!(l["id"], s["id"]);
+        assert_ne!(l["key"], s["key"]);
+        assert!(key_works(&api, l["key"].as_str().unwrap()));
+        assert!(key_works(&api, &key), "the first device stays logged in");
+        let info = json_of(api.handle(req("GET", &format!("/v1/account?key={key}"), Value::Null)));
+        assert_eq!(info["username"], "Axel_99");
+        assert_eq!(info["sessions"], 2);
+        // one generic answer for a wrong password and an unknown name
+        assert_eq!(
+            status_err(login(&api, "axel_99", "simplE"), 401),
+            "WRONG USERNAME OR PASSWORD"
+        );
+        assert_eq!(
+            status_err(login(&api, "nobody_here", "simple"), 401),
+            "WRONG USERNAME OR PASSWORD"
+        );
+        assert_eq!(
+            status_err(login(&api, "x", "simple"), 401),
+            "WRONG USERNAME OR PASSWORD"
+        );
+        assert_eq!(
+            status_err(account(&api, "login", json!({})), 401),
+            "WRONG USERNAME OR PASSWORD"
+        );
+        // the leaderboard / profile carry the badge
+        let p = json_of(api.handle(req("GET", &format!("/profile/{}", s["id"]), Value::Null)));
+        assert_eq!(p["verified"], true);
+    }
+
+    #[test]
+    fn failed_logins_lock_the_name_out() {
+        let api = api();
+        signup(&api, "victim", "right-password");
+        for _ in 0..5 {
+            assert_eq!(login(&api, "victim", "guess").status, 401);
+        }
+        // the 6th failure locks the name (even the right password waits)
+        assert_eq!(login(&api, "victim", "guess").status, 401);
+        let e = status_err(login(&api, "VICTIM", "right-password"), 429);
+        assert!(e.starts_with("TOO MANY ATTEMPTS: TRY AGAIN IN "), "{e}");
+        // other names are unaffected
+        signup(&api, "bystander", "password");
+        assert_eq!(login(&api, "bystander", "password").status, 200);
+        // per address too: one IP guessing many names
+        let from = |user: &str, pw: &str| {
+            let mut r = req(
+                "POST",
+                "/v1/account/login",
+                json!({"username": user, "password": pw}),
+            );
+            r.ip = Some("192.0.2.7".parse().unwrap());
+            api.handle(r)
+        };
+        for i in 0..=20 {
+            from(&format!("guess{i}"), "nope-nope");
+        }
+        assert_eq!(from("bystander", "password").status, 429);
+    }
+
+    #[test]
+    fn claiming_an_anonymous_account_keeps_its_rating_and_history() {
+        let api = api();
+        let (a, ka) = register(&api);
+        let (b, _) = register(&api);
+        {
+            let mut s = api.store_lock();
+            let m = s.new_match([a, b], true, "{}").unwrap();
+            let w = ReportData {
+                winner: a,
+                ..Default::default()
+            };
+            s.report(a, m, &w).unwrap();
+            s.report(b, m, &w).unwrap();
+        }
+        let before = json_of(api.handle(req("GET", &format!("/profile/{a}"), Value::Null)));
+        assert_eq!(before["rating"], 1216);
+        assert!(
+            before.get("verified").is_none(),
+            "anonymous: no flag at all"
+        );
+        // anonymous accounts cannot log out (the key is all they have)
+        assert_eq!(account(&api, "logout", json!({"key": ka})).status, 409);
+        assert_eq!(
+            account(
+                &api,
+                "password",
+                json!({"key": ka, "password": "x", "new_password": "simple"})
+            )
+            .status,
+            409
+        );
+        let c = json_of(account(
+            &api,
+            "claim",
+            json!({"key": ka, "username": "OldTimer", "password": "simple"}),
+        ));
+        assert_eq!(c["id"].as_u64(), Some(a));
+        assert_eq!(
+            c["key"].as_str(),
+            Some(ka.as_str()),
+            "the device keeps its key"
+        );
+        assert_eq!(c["profile"]["rating"], 1216);
+        assert_eq!(c["profile"]["wins"], 1);
+        assert_eq!(c["profile"]["verified"], true);
+        // twice: refused
+        let e = status_err(
+            account(
+                &api,
+                "claim",
+                json!({"key": ka, "username": "Other", "password": "simple"}),
+            ),
+            409,
+        );
+        assert_eq!(e, "THIS ACCOUNT ALREADY HAS A USERNAME");
+        // a taken name cannot be claimed
+        let (_, kb) = register(&api);
+        let e = status_err(
+            account(
+                &api,
+                "claim",
+                json!({"key": kb, "username": "oldtimer", "password": "simple"}),
+            ),
+            409,
+        );
+        assert_eq!(e, "USERNAME TAKEN");
+        // a second device logs in: same account, same rating
+        let l = json_of(login(&api, "oldtimer", "simple"));
+        assert_eq!(l["id"].as_u64(), Some(a));
+        assert_eq!(l["profile"]["rating"], 1216);
+        let board = json_of(api.handle(req("GET", "/leaderboard", Value::Null)));
+        assert_eq!(board["rows"][0]["name"], "OldTimer");
+        assert_eq!(board["rows"][0]["verified"], true);
+        assert!(board["rows"][1].get("verified").is_none());
+    }
+
+    #[test]
+    fn password_change_and_logouts_revoke_keys() {
+        let api = api();
+        let k1 = signup(&api, "multi", "first-pass")["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let k2 = json_of(login(&api, "multi", "first-pass"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let k3 = json_of(login(&api, "multi", "first-pass"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // log out one device
+        json_of(account(&api, "logout", json!({"key": k3})));
+        assert!(!key_works(&api, &k3));
+        assert!(key_works(&api, &k1) && key_works(&api, &k2));
+        // change password: needs the old one
+        let wrong = account(
+            &api,
+            "password",
+            json!({"key": k1, "password": "nope-nope", "new_password": "second-pass"}),
+        );
+        assert_eq!(status_err(wrong, 401), "WRONG PASSWORD");
+        let short = account(
+            &api,
+            "password",
+            json!({"key": k1, "password": "first-pass", "new_password": "123"}),
+        );
+        assert_eq!(short.status, 400);
+        let s = json_of(account(
+            &api,
+            "password",
+            json!({"key": k1, "password": "first-pass", "new_password": "second-pass"}),
+        ));
+        let k4 = s["key"].as_str().unwrap().to_string();
+        assert!(
+            key_works(&api, &k4),
+            "this device continues with a fresh key"
+        );
+        assert!(
+            !key_works(&api, &k1) && !key_works(&api, &k2),
+            "every other key revoked"
+        );
+        assert_eq!(login(&api, "multi", "first-pass").status, 401);
+        let k5 = json_of(login(&api, "multi", "second-pass"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // log out everywhere
+        json_of(account(&api, "logout_all", json!({"key": k4})));
+        assert!(!key_works(&api, &k4) && !key_works(&api, &k5));
+        // a claimed account's original key is revoked the same way
+        let (_, ka) = register(&api);
+        json_of(account(
+            &api,
+            "claim",
+            json!({"key": ka, "username": "claimer", "password": "simple"}),
+        ));
+        json_of(account(&api, "logout_all", json!({"key": ka})));
+        assert!(!key_works(&api, &ka));
+        assert_eq!(
+            api.handle(req("POST", "/profile", json!({"key": ka})))
+                .status,
+            401
+        );
+        assert_eq!(login(&api, "claimer", "simple").status, 200);
+    }
+
+    #[test]
+    fn sessions_are_capped_per_account() {
+        let api = api();
+        let first = signup(&api, "manydevices", "simple")["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..crate::store::MAX_SESSIONS {
+            json_of(login(&api, "manydevices", "simple"));
+        }
+        assert!(!key_works(&api, &first), "the oldest device was dropped");
+    }
+
+    #[test]
+    fn admin_resets_a_password() {
+        let api = official_api();
+        let key = signup(&api, "forgetful", "lost-it")["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reset = |token: &str, user: &str| {
+            api.handle(req(
+                "POST",
+                "/v1/admin/reset_password",
+                json!({"token": token, "username": user}),
+            ))
+        };
+        assert_eq!(reset("wrong", "forgetful").status, 403);
+        assert_eq!(reset("tok", "nobody").status, 404);
+        let r = json_of(reset("tok", "FORGETFUL"));
+        assert_eq!(r["username"], "forgetful");
+        let temp = r["password"].as_str().unwrap().to_string();
+        assert!(!key_works(&api, &key), "logged out everywhere");
+        assert_eq!(login(&api, "forgetful", "lost-it").status, 401);
+        assert_eq!(login(&api, "forgetful", &temp).status, 200);
+        // without RUGEN_ADMIN_TOKEN there is no admin API
+        assert_eq!(
+            api_with(PkgConfig::default())
+                .handle(req(
+                    "POST",
+                    "/v1/admin/reset_password",
+                    json!({"token": "", "username": "x"})
+                ))
+                .status,
+            404
+        );
+    }
+
+    #[test]
+    fn api4_clients_stay_anonymous_and_cannot_wear_a_username() {
+        let api = api();
+        let named = signup(&api, "Champion", "simple");
+        client_api(4);
+        // no account routes for 0.5 clients
+        assert_eq!(login(&api, "Champion", "simple").status, 404);
+        assert_eq!(
+            account(
+                &api,
+                "register",
+                json!({"username": "oldie", "password": "simple"})
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            api.handle(req("GET", "/v1/account", Value::Null)).status,
+            404
+        );
+        // the anonymous flow is unchanged
+        let (id, key) = register(&api);
+        let me = json_of(api.handle(req("POST", "/profile", json!({"key": key, "name": "Ryu"}))));
+        assert_eq!(me["name"], "Ryu");
+        let _: ProfileInfo = serde_json::from_value(me).unwrap();
+        // a username is not available as a free-form name
+        let me = json_of(api.handle(req(
+            "POST",
+            "/profile",
+            json!({"key": key, "name": "CHAMPION"}),
+        )));
+        assert_eq!(me["name"], "Ryu");
+        assert!(me.get("verified").is_none());
+        // the named player's profile carries the additive flag 0.5 ignores
+        let p = json_of(api.handle(req(
+            "GET",
+            &format!("/profile/{}", named["id"]),
+            Value::Null,
+        )));
+        let old: ProfileInfo = serde_json::from_value(p).unwrap();
+        assert_eq!(old.name, "Champion");
+        assert!(id > 0);
+        client_api(crate::compat::API);
     }
 }

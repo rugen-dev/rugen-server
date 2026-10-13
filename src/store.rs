@@ -28,6 +28,8 @@ pub struct Account {
     pub losses: u32,
     pub created: u64,
     pub last_seen: u64,
+    /// Named account (API 5): unique username (`name` equals it).
+    pub username: Option<String>,
 }
 
 impl Account {
@@ -41,6 +43,7 @@ impl Account {
             wins: self.wins,
             losses: self.losses,
             rank: rank_name(self.rating).to_string(),
+            verified: self.username.is_some(),
         }
     }
 
@@ -56,12 +59,39 @@ impl Account {
             losses: r.get(7)?,
             created: r.get::<_, i64>(8)? as u64,
             last_seen: r.get::<_, i64>(9)? as u64,
+            username: r.get(10)?,
         })
     }
 }
 
+/// Columns of an account row insert.
 const ACCOUNT_COLS: &str =
     "id, key, name, avatar, rating, best_rating, wins, losses, created, last_seen";
+/// Columns [`Account::from_row`] reads.
+const ACCOUNT_SELECT: &str =
+    "id, key, name, avatar, rating, best_rating, wins, losses, created, last_seen, username";
+
+/// Keys (devices) a named account keeps; the least recently used go first.
+pub const MAX_SESSIONS: i64 = 10;
+
+/// Why a username cannot be taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameError {
+    Taken,
+    /// The account already has a username (claim).
+    AlreadyNamed,
+}
+
+/// What `accounts.key` holds once that key was revoked (never 64 characters,
+/// so it can never authenticate: keys are exactly 64).
+fn dead_key(tag: &str) -> String {
+    format!("{tag}:{}", random_hex(16))
+}
+
+/// Session keys are stored as their sha256 (a database leak gives no key).
+fn key_hash(key: &str) -> String {
+    rugen_fair::sha256_hex(key.as_bytes())
+}
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -168,6 +198,20 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE reports ADD COLUMN at INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE matches ADD COLUMN ending TEXT;
      ALTER TABLE matches ADD COLUMN fled INTEGER;",
+    // v6: named accounts: a unique username (case-insensitive) and an
+    // Argon2id password hash; session keys of named accounts (sha256, one
+    // per device). Anonymous accounts keep authenticating with `key`.
+    "ALTER TABLE accounts ADD COLUMN username TEXT;
+     ALTER TABLE accounts ADD COLUMN password TEXT;
+     CREATE UNIQUE INDEX accounts_username ON accounts(username COLLATE NOCASE)
+         WHERE username IS NOT NULL;
+     CREATE TABLE account_keys (
+         hash TEXT PRIMARY KEY,
+         account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+         created INTEGER NOT NULL,
+         last_used INTEGER NOT NULL
+     );
+     CREATE INDEX account_keys_account ON account_keys(account, last_used);",
 ];
 
 /// Rating every character fingerprint starts from.
@@ -733,6 +777,7 @@ impl Store {
             losses: 0,
             created: t,
             last_seen: t,
+            username: None,
         };
         self.conn.execute(
             &format!("INSERT INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
@@ -744,16 +789,35 @@ impl Store {
         Ok(a)
     }
 
-    /// The account owning `key`; refreshes its `last_seen` (written at
-    /// most once a minute: this runs on every authenticated call).
+    /// The account owning `key` (an anonymous account's key, or a session
+    /// key of a named account); refreshes its `last_seen` (written at most
+    /// once a minute: this runs on every authenticated call).
     pub fn by_key(&mut self, key: &str) -> DbResult<Option<Account>> {
-        let a = self
+        if key.len() != 64 {
+            return Ok(None);
+        }
+        let mut a = self
             .conn
             .prepare_cached(&format!(
-                "SELECT {ACCOUNT_COLS} FROM accounts WHERE key = ?1"
+                "SELECT {ACCOUNT_SELECT} FROM accounts WHERE key = ?1"
             ))?
             .query_row([key], Account::from_row)
             .optional()?;
+        let mut session = None;
+        if a.is_none() {
+            let h = key_hash(key);
+            let row = self
+                .conn
+                .prepare_cached("SELECT account, last_used FROM account_keys WHERE hash = ?1")?
+                .query_row([&h], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .optional()?;
+            if let Some((id, used)) = row {
+                a = self.by_id(id as u64)?;
+                session = Some((h, used));
+            }
+        }
         let Some(mut a) = a else { return Ok(None) };
         let t = now();
         if a.last_seen + 60 <= t {
@@ -762,13 +826,195 @@ impl Store {
                 .execute(params![a.id as i64, t as i64])?;
             a.last_seen = t;
         }
+        if let Some((h, used)) = session
+            && used + 60 <= t
+        {
+            self.conn
+                .prepare_cached("UPDATE account_keys SET last_used = ?2 WHERE hash = ?1")?
+                .execute(params![h, t as i64])?;
+        }
         Ok(Some(a))
+    }
+
+    /// The named account called `username` (any case).
+    pub fn by_username(&self, username: &str) -> DbResult<Option<Account>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {ACCOUNT_SELECT} FROM accounts WHERE username = ?1 COLLATE NOCASE"
+            ))?
+            .query_row([username], Account::from_row)
+            .optional()
+    }
+
+    /// Account id and password hash of `username` (login).
+    pub fn credentials(&self, username: &str) -> DbResult<Option<(u64, Option<String>)>> {
+        self.conn
+            .prepare_cached("SELECT id, password FROM accounts WHERE username = ?1 COLLATE NOCASE")?
+            .query_row([username], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+            .optional()
+    }
+
+    /// Password hash of account `id`.
+    pub fn password_of(&self, id: u64) -> DbResult<Option<String>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT password FROM accounts WHERE id = ?1")?
+            .query_row([id as i64], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    pub fn username_taken(&self, username: &str) -> DbResult<bool> {
+        self.conn
+            .prepare_cached("SELECT 1 FROM accounts WHERE username = ?1 COLLATE NOCASE")?
+            .exists([username])
+    }
+
+    /// A new named account (rating at the start, like an anonymous one).
+    /// `username` must already be valid ([`rugen_proto::account::username_error`])
+    /// and `phc` an Argon2id hash. Returns the account and its first key.
+    pub fn register_named(
+        &mut self,
+        username: &str,
+        phc: &str,
+    ) -> DbResult<Result<(Account, String), NameError>> {
+        if self.username_taken(username)? {
+            return Ok(Err(NameError::Taken));
+        }
+        let id = self.fresh_id()?;
+        let t = now();
+        let inserted = self.conn.execute(
+            "INSERT INTO accounts (id, key, name, avatar, rating, best_rating, wins, losses,
+                 created, last_seen, username, password)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4, 0, 0, ?5, ?5, ?3, ?6)",
+            params![
+                id as i64,
+                dead_key("named"),
+                username,
+                elo::START_RATING,
+                t as i64,
+                phc
+            ],
+        );
+        match inserted {
+            Ok(_) => {}
+            // lost a race for the name
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Ok(Err(NameError::Taken));
+            }
+            Err(e) => return Err(e),
+        }
+        let key = self.issue_key(id)?;
+        let a = self
+            .by_id(id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok(Ok((a, key)))
+    }
+
+    /// Give anonymous account `id` a username and password: it keeps its
+    /// id, rating and history, and the key it already has.
+    pub fn claim(
+        &mut self,
+        id: u64,
+        username: &str,
+        phc: &str,
+    ) -> DbResult<Result<Account, NameError>> {
+        if self.by_id(id)?.is_some_and(|a| a.username.is_some()) {
+            return Ok(Err(NameError::AlreadyNamed));
+        }
+        if self.username_taken(username)? {
+            return Ok(Err(NameError::Taken));
+        }
+        let r = self.conn.execute(
+            "UPDATE accounts SET username = ?2, name = ?2, password = ?3
+             WHERE id = ?1 AND username IS NULL",
+            params![id as i64, username, phc],
+        );
+        match r {
+            Ok(1) => {}
+            Ok(_) => return Ok(Err(NameError::AlreadyNamed)),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Ok(Err(NameError::Taken));
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(Ok(self
+            .by_id(id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?))
+    }
+
+    /// A new session key for account `id` (login on a device). Only the
+    /// [`MAX_SESSIONS`] most recently used keys stay valid.
+    pub fn issue_key(&mut self, id: u64) -> DbResult<String> {
+        let key = random_hex(32);
+        let t = now() as i64;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO account_keys (hash, account, created, last_used) VALUES (?1, ?2, ?3, ?3)",
+            params![key_hash(&key), id as i64, t],
+        )?;
+        tx.execute(
+            "DELETE FROM account_keys WHERE account = ?1 AND hash NOT IN (
+                 SELECT hash FROM account_keys WHERE account = ?1
+                 ORDER BY last_used DESC, created DESC LIMIT ?2)",
+            params![id as i64, MAX_SESSIONS],
+        )?;
+        tx.commit()?;
+        Ok(key)
+    }
+
+    /// Revoke one key (log out this device).
+    pub fn revoke_key(&mut self, id: u64, key: &str) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE accounts SET key = ?3 WHERE id = ?1 AND key = ?2",
+            params![id as i64, key, dead_key("revoked")],
+        )?;
+        self.conn.execute(
+            "DELETE FROM account_keys WHERE account = ?1 AND hash = ?2",
+            params![id as i64, key_hash(key)],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke every key of account `id` (log out everywhere).
+    pub fn revoke_all(&mut self, id: u64) -> DbResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE accounts SET key = ?2 WHERE id = ?1",
+            params![id as i64, dead_key("revoked")],
+        )?;
+        tx.execute("DELETE FROM account_keys WHERE account = ?1", [id as i64])?;
+        tx.commit()
+    }
+
+    /// Replace the password hash of account `id` (callers revoke keys).
+    pub fn set_password(&mut self, id: u64, phc: &str) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE accounts SET password = ?2 WHERE id = ?1",
+            params![id as i64, phc],
+        )?;
+        Ok(())
+    }
+
+    /// Keys (devices) able to act for account `id`.
+    pub fn sessions(&self, id: u64) -> DbResult<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM account_keys WHERE account = ?1)
+                  + (SELECT COUNT(*) FROM accounts WHERE id = ?1 AND length(key) = 64)",
+            [id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
     }
 
     pub fn by_id(&self, id: u64) -> DbResult<Option<Account>> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {ACCOUNT_COLS} FROM accounts WHERE id = ?1"
+                "SELECT {ACCOUNT_SELECT} FROM accounts WHERE id = ?1"
             ))?
             .query_row([id as i64], Account::from_row)
             .optional()
@@ -780,13 +1026,16 @@ impl Store {
         name: Option<String>,
         avatar: Option<u32>,
     ) -> DbResult<Option<Account>> {
-        if let Some(n) = name {
+        // a named account's name is its username
+        let named = self.by_id(id)?.is_some_and(|a| a.username.is_some());
+        if let Some(n) = name.filter(|_| !named) {
             let clean: String = n
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
                 .take(16)
                 .collect();
-            if !clean.trim().is_empty() {
+            // nobody else may wear a username (API 4 players keep their own name)
+            if !clean.trim().is_empty() && !self.username_taken(clean.trim())? {
                 self.conn.execute(
                     "UPDATE accounts SET name = ?2 WHERE id = ?1",
                     params![id as i64, clean.trim()],
@@ -1609,7 +1858,7 @@ impl Store {
 
     pub fn leaderboard(&self, limit: usize) -> DbResult<Vec<ProfileInfo>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {ACCOUNT_COLS} FROM accounts WHERE wins + losses > 0
+            "SELECT {ACCOUNT_SELECT} FROM accounts WHERE wins + losses > 0
              ORDER BY rating DESC, id ASC LIMIT ?1"
         ))?;
         st.query_map([limit as i64], Account::from_row)?
@@ -1931,6 +2180,91 @@ mod tests {
             .unwrap();
         assert_eq!(a.name, "scriptBob Z");
         assert_eq!(a.avatar, 99);
+    }
+
+    #[test]
+    fn named_accounts_store_hashes_only() {
+        let mut s = Store::open(None).unwrap();
+        let (a, key) = s.register_named("Axel", "$argon2id$fake").unwrap().unwrap();
+        assert_eq!(
+            (a.name.as_str(), a.username.as_deref()),
+            ("Axel", Some("Axel"))
+        );
+        assert!(a.info().verified);
+        assert_ne!(a.key.len(), 64, "the row key never authenticates");
+        assert_eq!(s.by_key(&key).unwrap().unwrap().id, a.id);
+        // session keys are stored hashed
+        let stored: String = s
+            .conn
+            .query_row("SELECT hash FROM account_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(stored, key);
+        assert_eq!(stored, key_hash(&key));
+        assert_eq!(
+            s.register_named("AXEL", "$argon2id$fake")
+                .unwrap()
+                .unwrap_err(),
+            NameError::Taken
+        );
+        assert_eq!(s.credentials("axel").unwrap().unwrap().0, a.id);
+        assert!(s.credentials("nobody").unwrap().is_none());
+        // claim: same id and key, now named
+        let old = s.register().unwrap();
+        let c = s.claim(old.id, "Ryu", "$argon2id$x").unwrap().unwrap();
+        assert_eq!(
+            (c.id, c.key.as_str(), c.name.as_str()),
+            (old.id, old.key.as_str(), "Ryu")
+        );
+        assert_eq!(
+            s.claim(old.id, "Ken", "$argon2id$x").unwrap().unwrap_err(),
+            NameError::AlreadyNamed
+        );
+        assert_eq!(s.sessions(old.id).unwrap(), 1);
+        let k2 = s.issue_key(old.id).unwrap();
+        assert_eq!(s.sessions(old.id).unwrap(), 2);
+        s.revoke_key(old.id, &old.key).unwrap();
+        assert!(s.by_key(&old.key).unwrap().is_none());
+        assert!(s.by_key(&k2).unwrap().is_some());
+        s.revoke_all(old.id).unwrap();
+        assert!(s.by_key(&k2).unwrap().is_none());
+        assert_eq!(s.sessions(old.id).unwrap(), 0);
+        // deleting accounts takes their keys along
+        let (_, k) = s
+            .register_named("loadtest-1", "$argon2id$x")
+            .unwrap()
+            .unwrap();
+        s.delete_accounts_by_prefix("loadtest-", false).unwrap();
+        assert!(s.by_key(&k).unwrap().is_none());
+        let left: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM account_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "only Axel's key is left");
+    }
+
+    #[test]
+    fn schema_v5_databases_upgrade_in_place() {
+        let dir = temp_dir("v5");
+        {
+            let mut c = Connection::open(dir.join("rugen.db")).unwrap();
+            let tx = c.transaction().unwrap();
+            for sql in &MIGRATIONS[..5] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 5).unwrap();
+            tx.execute(
+                &format!("INSERT INTO accounts ({ACCOUNT_COLS}) VALUES (1000, ?1, 'OLD', 0, 1300, 1300, 3, 1, 1, 1)"),
+                ["cd".repeat(32)],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut s = Store::open(Some(&dir)).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 6);
+        let a = s.by_key(&"cd".repeat(32)).unwrap().unwrap();
+        assert_eq!((a.name.as_str(), a.rating, a.username), ("OLD", 1300, None));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

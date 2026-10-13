@@ -72,6 +72,9 @@
 //! `rugen-server --delete-accounts <name prefix> [--yes]` deletes the
 //! accounts whose name starts with the prefix (e.g. `loadtest-`) and their
 //! unranked matches; without `--yes` it only counts them.
+//! `rugen-server --reset-password <username>` sets a temporary password on
+//! a named account, logs it out everywhere and prints the password (players
+//! have no e-mail: this is the only recovery; works while the server runs).
 
 #![forbid(unsafe_code)]
 
@@ -221,7 +224,7 @@ fn main() {
         println!(
             "rugen-server [--bind 0.0.0.0:8080] [--udp-bind 0.0.0.0:7001|off] [--data /data] [--name NAME] [--healthcheck] [--backup out.db]\n\
              rugen-server --gen-key | --block <fingerprint> [--reason text] | --unblock <fingerprint> | --blocklist\n\
-             rugen-server --delete-accounts <name prefix> [--yes]\n\
+             rugen-server --delete-accounts <name prefix> [--yes] | --reset-password <username>\n\
              env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
              \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
              \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS\n\
@@ -329,6 +332,34 @@ fn delete_accounts_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::er
     Ok(true)
 }
 
+/// `--reset-password <username>`: a temporary password for a named account
+/// (every device logged out), printed once. True when it ran.
+fn reset_password_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(i) = args.iter().position(|a| a == "--reset-password") else {
+        return Ok(false);
+    };
+    let username = args
+        .get(i + 1)
+        .filter(|p| !p.starts_with("--"))
+        .ok_or("--reset-password needs a username")?;
+    let a = store
+        .by_username(username)?
+        .ok_or_else(|| format!("--reset-password: no account named {username}"))?;
+    let temp = password::temporary();
+    let phc = password::hash_account(&temp).ok_or("--reset-password: hashing failed")?;
+    store.set_password(a.id, &phc)?;
+    store.revoke_all(a.id)?;
+    println!(
+        "password of {} (account {}) reset; every device was logged out\n\
+         temporary password: {temp}\n\
+         give it to the player privately; they should change it from PROFILE",
+        a.username.unwrap_or_default(),
+        a.id
+    );
+    Ok(true)
+}
+
 /// Async worker threads: `RUGEN_WORKERS`, else the CPU quota of this
 /// process's cgroup (containers: `--cpus`), else the cores available; at
 /// least two.
@@ -398,7 +429,10 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("backup written to {out}");
         return Ok(());
     }
-    if blocklist_cli(&mut store)? || delete_accounts_cli(&mut store)? {
+    if blocklist_cli(&mut store)?
+        || delete_accounts_cli(&mut store)?
+        || reset_password_cli(&mut store)?
+    {
         return Ok(());
     }
     let (key, key_from) = truth::load_key(&s.data)?;
