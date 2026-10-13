@@ -1,7 +1,8 @@
 //! Server-side re-simulation of disputed matches (`--features resim`).
 //!
-//! The stored packages of both fighters and the stage are unpacked into a
-//! scratch directory and the confirmed input stream is replayed through
+//! The stored packages of both fighters and the stage (content files,
+//! verified again) are loaded in place and the confirmed input stream is
+//! replayed through
 //! the deterministic simulation (`rugen-sim`, no GPU / audio), built by the
 //! same [`rugen_sim::headless::build_world`] the game uses. The engine's
 //! `data/` (fightfx, fight.def) must be available: `RUGEN_RESIM_DATA`
@@ -69,19 +70,16 @@ pub fn replay(
             .ok_or_else(|| format!("setup has no {k}"))
     };
     let (f1, f2, fs) = (fp("p1_fp")?, fp("p2_fp")?, fp("stage_fp")?);
-    let scratch = packages
-        .dir()
-        .join("resim")
-        .join(crate::store::random_hex(6));
-    let out = (|| {
+    {
         let mut defs = Vec::new();
-        for (i, f) in [&f1, &f2, &fs].into_iter().enumerate() {
+        for f in [&f1, &f2, &fs] {
             if !packages.has(f) {
                 return Err(format!("package {} expired", rugen_fair::short(f)));
             }
-            let u = packages
-                .unpack_to(f, &scratch.join(i.to_string()))
-                .map_err(|e| e.to_string())?;
+            let u = packages.verified(f).map_err(|e| e.to_string())?;
+            if u.fingerprint != *f {
+                return Err(format!("package {} changed", rugen_fair::short(f)));
+            }
             defs.push(u.def_path());
         }
         let arena = v
@@ -112,9 +110,7 @@ pub fn replay(
             winner: r.winner,
             match_over: r.match_over,
         })
-    })();
-    let _ = std::fs::remove_dir_all(&scratch);
-    out
+    }
 }
 
 #[cfg(not(feature = "resim"))]

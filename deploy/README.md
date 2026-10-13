@@ -262,11 +262,16 @@ quick match, ranked) starts with a **matchup**:
 3. Both see the other's card and the verdict and confirm (or change fighter;
    any change resets confirmations, and so does a verdict that changes once
    the server has checked the files).
-4. From pick time each client uploads its optimised package (zstd, only the
-   files the character uses) **if the server does not already hold that
-   fingerprint**, resumably, in 2 MB chunks. The server unpacks it into
-   scratch space, recomputes fingerprint and profile, and fails the match
-   (and flags the account) when they differ from what the client claimed.
+4. From pick time each client uploads its content file (the character's
+   `.rgc` or the stage's `.rgs`: sprites pixel-exact, sounds as Opus,
+   about 20 MB for a big character) **if the server does not already hold
+   that fingerprint**, resumably, in 2 MB chunks. The server opens it in
+   place (nothing is unpacked), recomputes fingerprint and profile from its
+   content, and fails the match (and flags the account) when they differ
+   from what the client claimed. Fingerprints (`rugen-fp-2`) hash the
+   gameplay text, the palettes and the decoded sprites, not the sounds or
+   the container, so the same character has the same fingerprint on every
+   machine.
 5. Each client downloads what it lacks into `cache/net/` (never into
    `chars/`), reports ready with the fingerprints, rules and game version,
    and the server hands out the relay tickets once both agree.
@@ -283,7 +288,7 @@ uploaded packages only to pass them between the two players of a match and
 deletes them on expiry; it does not list or publish them. As the operator
 you are responsible for what your server hosts: set the caps and TTL to
 what you are willing to keep, remove content on request (delete
-`packages/<fingerprint>.rgpk` from the data volume; the server drops its
+`packages/<fingerprint>.rgc` (stages: `.rgs`) from the data volume; the server drops its
 record on the next sweep), and
 do not run a public server if you cannot answer takedown requests.
 

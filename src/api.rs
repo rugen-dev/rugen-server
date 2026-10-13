@@ -1832,7 +1832,7 @@ impl Api {
                 offset: len,
             });
         }
-        // complete: verify outside the locks (unpack + hash + analysis)
+        // complete: verify outside the locks (open + hash + analysis)
         let verified = self.packages.finalize(&fp, me.id);
         self.after_upload(&fp, me.id, verified)?;
         let mut st = PackageStatus {
@@ -2765,7 +2765,23 @@ pub(crate) mod tests {
         ] {
             let files = rugen_fair::files::content_files(kind, &def, Some(&data)).unwrap();
             let fp = rugen_fair::fingerprint(&files).unwrap();
-            rugen_fair::package::write_file(&files, &fp, &api.packages.path(&fp)).unwrap();
+            let src = rugen_content::convert::Source {
+                root: def.parent().unwrap().to_path_buf(),
+                def: files.def.clone(),
+                kind: match kind {
+                    Kind::Char => rugen_formats::rgc::Kind::Char,
+                    Kind::Stage => rugen_formats::rgc::Kind::Stage,
+                },
+                name: "reference".into(),
+            };
+            let r = rugen_content::convert::convert(
+                &src,
+                &api.packages.path_for(&fp, kind),
+                &data,
+                None,
+            )
+            .unwrap();
+            assert_eq!(r.fingerprint.as_deref(), Some(fp.as_str()));
             lock(&api.store)
                 .put_package(&crate::store::PackageRow {
                     fingerprint: fp.clone(),

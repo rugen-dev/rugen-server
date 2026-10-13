@@ -1,9 +1,11 @@
-//! Temporary content packages (`<RUGEN_DATA>/packages/<fingerprint>.rgpk`).
+//! Temporary content packages (`<RUGEN_DATA>/packages/<fingerprint>.rgc`
+//! for characters, `.rgs` for stages).
 //!
-//! Players upload the optimised package of the character / stage they
-//! bring (chunked, resumable per account); the server unpacks it into a
-//! scratch directory, **recomputes the fingerprint and the fairness
-//! profile from the files** and only then stores it, content-addressed.
+//! Players upload the content file (`.rgc` / `.rgs`) of the character /
+//! stage they bring (chunked, resumable per account); the server opens it,
+//! **recomputes the fingerprint and the fairness profile from its
+//! content** and only then stores it, content-addressed. Nothing is
+//! unpacked: the engine reads the file in place.
 //! Opponents download it (ranged reads, resumable). Packages are caches:
 //! they expire `RUGEN_PKG_TTL` after their last use, the oldest go first
 //! when the total passes `RUGEN_PKG_MAX_TOTAL`, and packages of stored
@@ -128,7 +130,7 @@ impl Packages {
             }
         };
         std::fs::create_dir_all(dir.join("partial"))?;
-        // scratch dirs of an interrupted verification
+        // files of an interrupted verification
         let _ = std::fs::remove_dir_all(dir.join("verify"));
         Ok(Self { dir, cfg })
     }
@@ -142,13 +144,25 @@ impl Packages {
         }
     }
 
-    #[cfg_attr(not(any(test, feature = "resim")), allow(dead_code))]
+    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// Where package `fp` is stored (`.rgc` unless a stage `.rgs` is there).
     pub fn path(&self, fp: &str) -> PathBuf {
-        self.dir.join(format!("{fp}.rgpk"))
+        let stage = self.dir.join(format!("{fp}.rgs"));
+        if stage.is_file() {
+            stage
+        } else {
+            self.dir.join(format!("{fp}.rgc"))
+        }
+    }
+
+    /// Where package `fp` of `kind` is stored.
+    pub fn path_for(&self, fp: &str, kind: rugen_fair::Kind) -> PathBuf {
+        self.dir
+            .join(format!("{fp}.{}", rugen_fair::package::ext(kind)))
     }
 
     fn partial(&self, fp: &str, account: u64) -> PathBuf {
@@ -159,6 +173,12 @@ impl Packages {
 
     pub fn has(&self, fp: &str) -> bool {
         self.path(fp).is_file()
+    }
+
+    /// The verified content of a stored package (re-simulation).
+    #[cfg_attr(not(feature = "resim"), allow(dead_code))]
+    pub fn verified(&self, fp: &str) -> rugen_fair::Result<rugen_fair::package::Verified> {
+        rugen_fair::package::verify(&self.path(fp), self.cfg.max_pkg.saturating_mul(6))
     }
 
     pub fn partial_len(&self, fp: &str, account: u64) -> u64 {
@@ -196,27 +216,42 @@ impl Packages {
         let _ = std::fs::remove_file(self.partial(fp, account));
     }
 
-    /// Verify a complete partial upload: unpack into scratch space,
+    /// Verify a complete partial upload: open it as a content file,
     /// recompute fingerprint and profile, store on success. The partial
     /// file is consumed either way.
     pub fn finalize(&self, fp: &str, account: u64) -> Verified {
         let part = self.partial(fp, account);
-        let scratch = self
-            .dir
-            .join("verify")
-            .join(format!("{fp}.{account}.{}", crate::store::random_hex(4)));
-        let out = self.verify_file(&part, fp, &scratch, account);
-        let _ = std::fs::remove_dir_all(&scratch);
-        match out {
+        let kind = match rugen_fair::package::read_header(&part) {
+            Ok((kind, _)) => kind,
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                return Verified::Invalid(e.to_string());
+            }
+        };
+        // checked under a name with the content-file extension the readers need
+        let checking = self.dir.join("verify").join(format!(
+            "{fp}.{account}.{}.{}",
+            crate::store::random_hex(4),
+            rugen_fair::package::ext(kind)
+        ));
+        let moved = std::fs::create_dir_all(self.dir.join("verify"))
+            .and_then(|()| std::fs::rename(&part, &checking));
+        if let Err(e) = moved {
+            let _ = std::fs::remove_file(&part);
+            return Verified::Invalid(format!("store: {e}"));
+        }
+        match self.verify_file(&checking, fp, account) {
             Ok(row) => {
-                if let Err(e) = std::fs::rename(&part, self.path(fp)) {
-                    let _ = std::fs::remove_file(&part);
+                rugen_formats::vfs::forget(&checking);
+                if let Err(e) = std::fs::rename(&checking, self.path_for(fp, kind)) {
+                    let _ = std::fs::remove_file(&checking);
                     return Verified::Invalid(format!("store: {e}"));
                 }
                 Verified::Stored(row)
             }
             Err(v) => {
-                let _ = std::fs::remove_file(&part);
+                rugen_formats::vfs::forget(&checking);
+                let _ = std::fs::remove_file(&checking);
                 v
             }
         }
@@ -226,15 +261,13 @@ impl Packages {
         &self,
         file: &Path,
         fp: &str,
-        scratch: &Path,
         account: u64,
     ) -> Result<Box<PackageRow>, Verified> {
         let size = std::fs::metadata(file)
             .map_err(|e| Verified::Invalid(e.to_string()))?
             .len();
-        let f = std::fs::File::open(file).map_err(|e| Verified::Invalid(e.to_string()))?;
-        // uncompressed content may be a few times the package
-        let u = rugen_fair::package::unpack(f, scratch, self.cfg.max_pkg.saturating_mul(6))
+        // decompressed content may be a few times the package
+        let u = rugen_fair::package::verify(file, self.cfg.max_pkg.saturating_mul(6))
             .map_err(|e| Verified::Invalid(e.to_string()))?;
         if u.fingerprint != fp {
             return Err(Verified::Mismatch {
@@ -291,17 +324,6 @@ impl Packages {
         Ok(buf)
     }
 
-    /// Unpack a stored package (re-simulation of disputed matches).
-    #[allow(dead_code)]
-    pub fn unpack_to(
-        &self,
-        fp: &str,
-        dest: &Path,
-    ) -> rugen_fair::Result<rugen_fair::package::Unpacked> {
-        let f = std::fs::File::open(self.path(fp))?;
-        rugen_fair::package::unpack(f, dest, self.cfg.max_pkg.saturating_mul(6))
-    }
-
     /// Expire (TTL, unless kept for a replay) and evict (LRU above the total
     /// cap) packages, drop stale partial uploads and orphan files. Returns
     /// the fingerprints removed.
@@ -337,7 +359,9 @@ impl Packages {
             }
         }
         for fp in &removed {
-            let _ = std::fs::remove_file(self.path(fp));
+            let path = self.path(fp);
+            rugen_formats::vfs::forget(&path);
+            let _ = std::fs::remove_file(path);
             let _ = store.delete_package(fp);
         }
         // orphans (files without rows) and partial uploads older than the TTL
@@ -356,7 +380,15 @@ impl Packages {
                     .ok()
                     .and_then(|m| m.elapsed().ok())
                     .is_none_or(|age| age.as_secs() < 600);
-                if let Some(fp) = name.strip_suffix(".rgpk")
+                // RGPK packages of API 4 servers: never served again
+                if name.ends_with(".rgpk") {
+                    let _ = std::fs::remove_file(e.path());
+                    continue;
+                }
+                let fp = name
+                    .strip_suffix(".rgc")
+                    .or_else(|| name.strip_suffix(".rgs"));
+                if let Some(fp) = fp
                     && !known.contains(fp)
                     && !young
                 {
