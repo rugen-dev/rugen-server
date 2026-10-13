@@ -65,6 +65,7 @@
 //!                               s3+http:// for plain HTTP (local MinIO), ?style=virtual
 //! RUGEN_BACKUP_RETENTION_DAYS   days backups are kept (the newest always)  7
 //! RUGEN_BACKUP_INCLUDE          extras: packages, signing-key       (none)
+//!                               (objects go under <prefix>/backups/; see `backup`)
 //! ```
 //!
 //! A server is **official** when its signing key is the official key;
@@ -487,7 +488,7 @@ fn backup_now_cli(s: &Settings) -> Result<bool, Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir(&work);
     let r = r.map_err(|e| format!("--backup-now: {e}"))?;
     println!(
-        "backup uploaded: {} ({} bytes, {} raw{}; {} old backups deleted)",
+        "backup uploaded: {} ({} bytes, {} raw{}; {} old backups deleted{})",
         r.db_key,
         r.size,
         r.raw_size,
@@ -496,7 +497,15 @@ fn backup_now_cli(s: &Settings) -> Result<bool, Box<dyn std::error::Error>> {
         } else {
             String::new()
         },
-        r.deleted
+        r.deleted,
+        if r.legacy_deleted > 0 {
+            format!(
+                ", {} objects of the old flat layout deleted",
+                r.legacy_deleted
+            )
+        } else {
+            String::new()
+        }
     );
     Ok(true)
 }

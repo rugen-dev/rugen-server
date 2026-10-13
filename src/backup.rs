@@ -21,14 +21,20 @@
 //!
 //! A backup is a consistent snapshot of `rugen.db` (`VACUUM INTO` on a
 //! second connection: the server keeps running and its store lock is never
-//! taken), zstd-compressed and streamed up, plus a manifest:
+//! taken), zstd-compressed and streamed up, plus a manifest. Everything
+//! goes into a tree of its own under the configured prefix (which may be
+//! empty), with year / month folders:
 //!
 //! ```text
-//! <prefix>/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.db.zst
-//! <prefix>/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.json        manifest (sha256, sizes, schema)
-//! <prefix>/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.signing.key only with RUGEN_BACKUP_INCLUDE=signing-key
-//! <prefix>/packages/<fingerprint>.<ext>                       only with RUGEN_BACKUP_INCLUDE=packages
+//! <prefix>/backups/db/YYYY/MM/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.db.zst
+//! <prefix>/backups/db/YYYY/MM/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.json         manifest (sha256, sizes, schema)
+//! <prefix>/backups/keys/YYYY/MM/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.signing.key only with RUGEN_BACKUP_INCLUDE=signing-key
+//! <prefix>/backups/packages/<fingerprint>.<ext>                                    only with RUGEN_BACKUP_INCLUDE=packages
 //! ```
+//!
+//! `<prefix>/chars/` and `<prefix>/stages/` are reserved for content
+//! uploads later; backups never touch anything outside `<prefix>/backups/`
+//! except the one-time cleanup of the legacy flat layout below.
 //!
 //! Packages are caches (24 h after last use by default) of files players
 //! upload again on demand, up to gigabytes: they are opt-in and uploaded
@@ -36,6 +42,14 @@
 //! size is never sent twice). After each successful backup, backup sets
 //! older than the retention are deleted, the newest complete one always
 //! stays; only objects named like ours are ever touched.
+//!
+//! **Legacy layout.** Servers up to 0.6.0 wrote flat
+//! `<prefix>/rugen-backup-*.db.zst` / `.json` objects. Restore and the
+//! listings still see them (restore `latest` falls back to them when no
+//! backup of the new layout exists). After the next successful backup in
+//! the new layout, exactly those flat `rugen-backup-*.db.zst` and
+//! `rugen-backup-*.json` objects directly under `<prefix>/` are deleted;
+//! nothing else is.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -64,7 +78,12 @@ pub const RETRY_AFTER: u64 = 3600;
 pub const MANUAL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_RETENTION_DAYS: u64 = 7;
 const NAME_PREFIX: &str = "rugen-backup-";
+/// Local directory of the packages under `RUGEN_DATA`.
 const PACKAGES_DIR: &str = "packages";
+/// The bucket tree, relative to the configured prefix.
+const DB_DIR: &str = "backups/db";
+const KEYS_DIR: &str = "backups/keys";
+const REMOTE_PACKAGES_DIR: &str = "backups/packages";
 const MANIFEST_FORMAT: u32 = 1;
 
 // ---- configuration
@@ -98,14 +117,19 @@ impl BackupSetting {
     }
 
     pub fn parse(url: Option<&str>, retention: Option<&str>, include: Option<&str>) -> Self {
+        let (url, retention, include) = (
+            url.map(unquote).filter(|v| !v.is_empty()),
+            retention.map(unquote).filter(|v| !v.is_empty()),
+            include.map(unquote),
+        );
         let Some(url) = url else {
             return Self::Off;
         };
-        let target = match parse_url(url.trim()) {
+        let target = match parse_url(url) {
             Ok(t) => t,
             Err(e) => return Self::Invalid(format!("RUGEN_BACKUP_S3: {e}")),
         };
-        let retention_days = match retention.map(|r| r.trim().parse::<u64>()) {
+        let retention_days = match retention.map(|r| r.parse::<u64>()) {
             None => DEFAULT_RETENTION_DAYS,
             Some(Ok(d)) if (1..=36_500).contains(&d) => d,
             Some(_) => {
@@ -139,6 +163,21 @@ impl BackupSetting {
             include_key,
         })
     }
+}
+
+/// An env value without surrounding whitespace and one pair of matching
+/// quotes (`"…"` or `'…'`): a quoted value in an env file or compose
+/// `environment:` list often arrives with its quotes.
+pub fn unquote(v: &str) -> &str {
+    let v = v.trim();
+    for q in ['"', '\''] {
+        if v.len() >= 2
+            && let Some(inner) = v.strip_prefix(q).and_then(|r| r.strip_suffix(q))
+        {
+            return inner.trim();
+        }
+    }
+    v
 }
 
 fn percent_decode(s: &str) -> Result<String, String> {
@@ -303,6 +342,8 @@ pub struct BackupSet {
     pub manifest: Option<String>,
     /// Every object of the set (full keys).
     pub keys: Vec<String>,
+    /// Flat `<prefix>/rugen-backup-*` objects of servers up to 0.6.0.
+    pub legacy: bool,
 }
 
 impl BackupSet {
@@ -326,22 +367,55 @@ pub fn parse_name(name: &str) -> Option<(&str, u64, &'static str)> {
     (stem.len() > NAME_PREFIX.len() + 16).then_some((stem, time, suffix))
 }
 
-/// Group a listing of the prefix into backup sets, newest first.
+/// `<dir>/YYYY/MM` (relative to the prefix) of a backup made at `t`.
+pub fn dated_dir(dir: &str, t: u64) -> String {
+    let (y, m, ..) = crate::s3::civil(t);
+    format!("{dir}/{y:04}/{m:02}")
+}
+
+/// `key` relative to `prefix` (`None` when it lies outside).
+fn relative<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        Some(key)
+    } else {
+        key.strip_prefix(prefix)?.strip_prefix('/')
+    }
+}
+
+/// `(name, legacy)` of an object of ours, from its key relative to the
+/// prefix: anywhere under `backups/db/` (database, manifest) or
+/// `backups/keys/` (signing key), or a flat database / manifest directly
+/// under the prefix (the legacy layout).
+fn classify(rel: &str) -> Option<(&str, bool)> {
+    if !rel.contains('/') {
+        return is_legacy_name(rel).then_some((rel, true));
+    }
+    let name = rel.rsplit('/').next()?;
+    let ok = if rel.starts_with(&format!("{DB_DIR}/")) {
+        name.ends_with(".db.zst") || name.ends_with(".json")
+    } else if rel.starts_with(&format!("{KEYS_DIR}/")) {
+        name.ends_with(".signing.key")
+    } else {
+        false
+    };
+    ok.then_some((name, false))
+}
+
+/// Group a listing of the prefix into backup sets, newest first (at the
+/// same time, the new layout before the legacy one).
 pub fn group(objects: &[Object], prefix: &str) -> Vec<BackupSet> {
     let mut sets: Vec<BackupSet> = Vec::new();
     for o in objects {
-        let name = if prefix.is_empty() {
-            o.key.as_str()
-        } else {
-            match o.key.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) {
-                Some(n) => n,
-                None => continue,
-            }
+        let Some((name, legacy)) = relative(&o.key, prefix).and_then(classify) else {
+            continue;
         };
         let Some((stem, time, suffix)) = parse_name(name) else {
             continue;
         };
-        let i = match sets.iter().position(|s| s.stem == stem) {
+        let i = match sets
+            .iter()
+            .position(|s| s.stem == stem && s.legacy == legacy)
+        {
             Some(i) => i,
             None => {
                 sets.push(BackupSet {
@@ -350,6 +424,7 @@ pub fn group(objects: &[Object], prefix: &str) -> Vec<BackupSet> {
                     db: None,
                     manifest: None,
                     keys: Vec::new(),
+                    legacy,
                 });
                 sets.len() - 1
             }
@@ -362,7 +437,12 @@ pub fn group(objects: &[Object], prefix: &str) -> Vec<BackupSet> {
             _ => {}
         }
     }
-    sets.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.stem.cmp(&a.stem)));
+    sets.sort_by(|a, b| {
+        b.time
+            .cmp(&a.time)
+            .then_with(|| b.stem.cmp(&a.stem))
+            .then_with(|| a.legacy.cmp(&b.legacy))
+    });
     sets
 }
 
@@ -514,6 +594,8 @@ pub struct Report {
     pub raw_size: u64,
     pub packages_uploaded: u64,
     pub deleted: usize,
+    /// Legacy flat objects deleted (database and manifest objects).
+    pub legacy_deleted: usize,
     pub created: u64,
 }
 
@@ -566,13 +648,13 @@ impl Runner<'_> {
             out.flush().map_err(|e| format!("compress: {e}"))?;
             src.done()
         };
-        let db_name = format!("{stem}.db.zst");
+        let db_name = format!("{}/{stem}.db.zst", dated_dir(DB_DIR, created));
         let db_key = s3.key(&db_name);
         let size = std::fs::metadata(zst).map_or(0, |m| m.len());
         let sha256 = s3.put_file(&db_key, zst).map_err(|e| fail(&e))?;
         let signing_key = match (self.cfg.include_key, self.data) {
             (true, Some(d)) if d.join("signing.key").is_file() => {
-                let name = format!("{stem}.signing.key");
+                let name = format!("{}/{stem}.signing.key", dated_dir(KEYS_DIR, created));
                 let path = d.join("signing.key");
                 let sha = s3.put_file(&s3.key(&name), &path).map_err(|e| fail(&e))?;
                 Some(FilePart {
@@ -611,8 +693,14 @@ impl Runner<'_> {
             packages,
         };
         let body = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-        s3.put_bytes(&s3.key(&format!("{stem}.json")), &body, "application/json")
+        let manifest_name = format!("{}/{stem}.json", dated_dir(DB_DIR, created));
+        s3.put_bytes(&s3.key(&manifest_name), &body, "application/json")
             .map_err(|e| fail(&e))?;
+        // a complete backup of the new layout is up: the flat one can go
+        let legacy_deleted = self.delete_legacy().unwrap_or_else(|e| {
+            log::warn!("backup: legacy cleanup: {e}");
+            0
+        });
         let deleted = self.retention().unwrap_or_else(|e| {
             log::warn!("backup: retention: {e}");
             0
@@ -624,6 +712,7 @@ impl Runner<'_> {
             raw_size,
             packages_uploaded,
             deleted,
+            legacy_deleted,
             created,
         })
     }
@@ -631,7 +720,7 @@ impl Runner<'_> {
     /// Upload the packages the bucket does not have yet (same name + size).
     fn packages(&self, dir: &Path) -> Result<PackagesPart, String> {
         let s3 = self.s3;
-        let remote_prefix = s3.key(PACKAGES_DIR);
+        let remote_prefix = s3.key(REMOTE_PACKAGES_DIR);
         let remote = s3
             .list(&format!("{remote_prefix}/"))
             .map_err(|e| fail(&e))?;
@@ -670,17 +759,37 @@ impl Runner<'_> {
             }
         }
         Ok(PackagesPart {
-            dir: PACKAGES_DIR.into(),
+            dir: REMOTE_PACKAGES_DIR.into(),
             count,
             bytes,
             uploaded,
         })
     }
 
-    /// Delete expired backup sets. Returns how many sets went.
+    /// Delete the legacy flat objects: exactly `<prefix>/rugen-backup-*`
+    /// ending in `.db.zst` or `.json`, nothing deeper, nothing else.
+    /// Returns how many objects went.
+    pub fn delete_legacy(&self) -> Result<usize, S3Error> {
+        let s3 = self.s3;
+        let prefix = &s3.target.prefix;
+        let mut n = 0;
+        for o in s3.list(&s3.key(NAME_PREFIX))? {
+            if relative(&o.key, prefix).is_some_and(is_legacy_name) {
+                s3.delete(&o.key)?;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            log::info!("backup: {n} objects of the old flat layout deleted");
+        }
+        Ok(n)
+    }
+
+    /// Delete expired backup sets of the new layout. Returns how many
+    /// sets went.
     pub fn retention(&self) -> Result<usize, S3Error> {
         let s3 = self.s3;
-        let sets = list_sets(s3)?;
+        let sets: Vec<BackupSet> = list_sets(s3)?.into_iter().filter(|s| !s.legacy).collect();
         let gone = expired(&sets, now(), self.cfg.retention_days);
         for stem in &gone {
             if let Some(set) = sets.iter().find(|s| &s.stem == stem) {
@@ -700,6 +809,13 @@ impl Runner<'_> {
     }
 }
 
+/// A legacy flat object name (relative to the prefix) the cleanup deletes.
+fn is_legacy_name(rel: &str) -> bool {
+    !rel.contains('/')
+        && rel.starts_with(NAME_PREFIX)
+        && (rel.ends_with(".db.zst") || rel.ends_with(".json"))
+}
+
 fn is_package_name(name: &str) -> bool {
     let Some((fp, ext)) = name.split_once('.') else {
         return false;
@@ -713,15 +829,14 @@ fn fail(e: &S3Error) -> String {
     e.short()
 }
 
-/// The backup sets under the configured prefix, newest first.
+/// The backup sets under the configured prefix, newest first: everything
+/// under `backups/db/` and `backups/keys/` (recursively, all pages), plus
+/// the legacy flat objects.
 pub fn list_sets(s3: &S3) -> Result<Vec<BackupSet>, S3Error> {
-    let prefix = &s3.target.prefix;
-    let list_prefix = if prefix.is_empty() {
-        NAME_PREFIX.to_string()
-    } else {
-        format!("{prefix}/{NAME_PREFIX}")
-    };
-    Ok(group(&s3.list(&list_prefix)?, prefix))
+    let mut objects = s3.list(&format!("{}/", s3.key(DB_DIR)))?;
+    objects.extend(s3.list(&format!("{}/", s3.key(KEYS_DIR)))?);
+    objects.extend(s3.list(&s3.key(NAME_PREFIX))?);
+    Ok(group(&objects, &s3.target.prefix))
 }
 
 // ---- server-side state: jobs, schedule, health
@@ -1056,6 +1171,7 @@ impl Backups {
                 "time": rfc3339(s.time),
                 "size": s.db.as_ref().map_or(0, |d| d.1),
                 "complete": s.complete(),
+                "legacy": s.legacy,
             })).collect::<Vec<_>>(),
         }))
     }
@@ -1069,7 +1185,11 @@ pub fn restore(cfg: &BackupConfig, data: &Path, which: &str) -> Result<String, S
     let s3 = S3::new(cfg.target.clone());
     let sets = list_sets(&s3).map_err(|e| e.to_string())?;
     let set = if which == "latest" {
-        sets.iter().find(|s| s.complete())
+        // the new layout first; the flat one of servers up to 0.6.0 when
+        // there is none yet
+        sets.iter()
+            .find(|s| s.complete() && !s.legacy)
+            .or_else(|| sets.iter().find(|s| s.complete()))
     } else {
         let name = which.rsplit('/').next().unwrap_or(which);
         let stem = SUFFIXES
@@ -1374,21 +1494,129 @@ mod tests {
     #[test]
     fn groups_backup_sets_and_ignores_foreign_objects() {
         let objs = [
+            obj(
+                "p/backups/db/2026/10/rugen-backup-20261001T030000Z-0.6.0.db.zst",
+                10,
+            ),
+            obj(
+                "p/backups/db/2026/10/rugen-backup-20261001T030000Z-0.6.0.json",
+                1,
+            ),
+            obj(
+                "p/backups/keys/2026/10/rugen-backup-20261001T030000Z-0.6.0.signing.key",
+                1,
+            ),
+            obj(
+                "p/backups/db/2026/10/rugen-backup-20261002T030000Z-0.7.0.db.zst",
+                20,
+            ),
+            obj("p/notes.txt", 5),
+            obj(
+                "p/backups/packages/rugen-backup-20261001T030000Z-0.6.0.db.zst",
+                5,
+            ),
+            obj("p/chars/rugen-backup-20261001T030000Z-0.6.0.db.zst", 5),
+            obj(
+                "p/backups/db/2026/10/rugen-backup-20261003T030000Z-0.6.0.signing.key",
+                5,
+            ),
+            obj(
+                "other/backups/db/2026/10/rugen-backup-20261003T030000Z-0.6.0.db.zst",
+                5,
+            ),
+            obj("p/backups/db/2026/10/rugen-backup-garbage.db.zst", 5),
+            // legacy flat objects: a set of their own
             obj("p/rugen-backup-20261001T030000Z-0.6.0.db.zst", 10),
             obj("p/rugen-backup-20261001T030000Z-0.6.0.json", 1),
-            obj("p/rugen-backup-20261002T030000Z-0.7.0.db.zst", 20),
-            obj("p/notes.txt", 5),
-            obj("p/packages/rugen-backup-20261001T030000Z-0.6.0.db.zst", 5),
-            obj("other/rugen-backup-20261003T030000Z-0.6.0.db.zst", 5),
-            obj("p/rugen-backup-garbage.db.zst", 5),
         ];
         let sets = group(&objs, "p");
-        assert_eq!(sets.len(), 2);
+        assert_eq!(sets.len(), 3, "{sets:?}");
         assert_eq!(sets[0].stem, "rugen-backup-20261002T030000Z-0.7.0");
-        assert!(!sets[0].complete());
-        assert!(sets[1].complete());
-        assert_eq!(sets[1].keys.len(), 2);
+        assert!(!sets[0].complete() && !sets[0].legacy);
+        assert_eq!(sets[1].stem, "rugen-backup-20261001T030000Z-0.6.0");
+        assert!(sets[1].complete() && !sets[1].legacy, "new layout first");
+        assert_eq!(sets[1].keys.len(), 3, "database, manifest, signing key");
+        assert!(sets[2].complete() && sets[2].legacy);
         assert_eq!(group(&objs[..1], "").len(), 0, "prefix mismatch: not ours");
+        // an empty prefix: the tree sits at the bucket root
+        let root = [
+            obj(
+                "backups/db/2026/10/rugen-backup-20261013T141050Z-0.6.0.db.zst",
+                1,
+            ),
+            obj("rugen-backup-20261013T141050Z-0.6.0.json", 1),
+            obj("chars/x/rugen-backup-20261013T141050Z-0.6.0.json", 1),
+        ];
+        let sets = group(&root, "");
+        assert_eq!(sets.len(), 2);
+        assert!(!sets[0].legacy && sets[1].legacy);
+    }
+
+    #[test]
+    fn dated_layout_and_legacy_names() {
+        let t = parse_amz_date("20261013T141050Z").unwrap();
+        assert_eq!(dated_dir(DB_DIR, t), "backups/db/2026/10");
+        assert_eq!(
+            dated_dir(KEYS_DIR, parse_amz_date("20270105T000000Z").unwrap()),
+            "backups/keys/2027/01"
+        );
+        assert!(is_legacy_name("rugen-backup-20261013T141050Z-0.6.0.db.zst"));
+        assert!(is_legacy_name("rugen-backup-20261013T141050Z-0.6.0.json"));
+        for keep in [
+            "rugen-backup-20261013T141050Z-0.6.0.signing.key",
+            "rugen-backup-notes.txt",
+            "backups/db/2026/10/rugen-backup-20261013T141050Z-0.6.0.json",
+            "chars/rugen-backup-x.json",
+            "my-rugen-backup-x.json",
+        ] {
+            assert!(!is_legacy_name(keep), "{keep}");
+        }
+    }
+
+    #[test]
+    fn env_values_lose_whitespace_and_one_pair_of_quotes() {
+        assert_eq!(unquote("  \"s3://k:s@h/b\"  "), "s3://k:s@h/b");
+        assert_eq!(unquote("'14'"), "14");
+        assert_eq!(unquote(" 7 "), "7");
+        assert_eq!(unquote("\"\"x\"\""), "\"x\"", "one pair only");
+        assert_eq!(unquote("\"x'"), "\"x'", "mismatched quotes stay");
+        assert_eq!(unquote("\""), "\"");
+        for url in [
+            "\"s3://k:s@h.example/b/p?region=auto\"",
+            "'s3://k:s@h.example/b/p?region=auto'",
+            " \" s3://k:s@h.example/b/p?region=auto \"\n",
+        ] {
+            let c = on(BackupSetting::parse(
+                Some(url),
+                Some("\"14\""),
+                Some("'packages'"),
+            ));
+            assert_eq!(
+                (c.target.bucket.as_str(), c.target.prefix.as_str()),
+                ("b", "p")
+            );
+            assert_eq!(c.target.region, "auto");
+            assert_eq!(c.retention_days, 14);
+            assert!(c.include_packages);
+        }
+        assert_eq!(
+            on(BackupSetting::parse(
+                Some("s3://k:s@h/b"),
+                Some("' 30 '"),
+                None
+            ))
+            .retention_days,
+            30
+        );
+        // quoted but empty: off / the default
+        assert_eq!(
+            BackupSetting::parse(Some("\"\""), None, None),
+            BackupSetting::Off
+        );
+        assert_eq!(
+            on(BackupSetting::parse(Some("s3://k:s@h/b"), Some("''"), None)).retention_days,
+            DEFAULT_RETENTION_DAYS
+        );
     }
 
     fn set(day: u32, complete: bool) -> BackupSet {
@@ -1398,6 +1626,7 @@ mod tests {
             db: Some((format!("{stem}.db.zst"), 1)),
             manifest: complete.then(|| format!("{stem}.json")),
             keys: vec![],
+            legacy: false,
             stem,
         }
     }
@@ -1551,6 +1780,111 @@ mod tests {
         d
     }
 
+    /// The owner's case: no prefix, one backup of 0.6.0 flat at the bucket
+    /// root. Restore finds it until a backup of the new layout exists; the
+    /// first successful one deletes exactly the flat `.db.zst` / `.json`.
+    #[test]
+    fn legacy_flat_backups_are_restored_then_cleaned_up() {
+        use crate::s3_fake::FakeS3;
+        let fake = FakeS3::start("backup-of-backups", "AK", "SK", "auto");
+        let url = format!(
+            "s3+http://AK:SK@127.0.0.1:{}/backup-of-backups?region=auto",
+            fake.port
+        );
+        let cfg = on(BackupSetting::parse(Some(&url), None, None));
+        assert_eq!(cfg.target.prefix, "");
+        let s3 = S3::new(cfg.target.clone());
+        let data = temp_dir("legacy");
+        {
+            let mut store = crate::store::Store::open(Some(&data)).unwrap();
+            store.register().unwrap();
+        }
+        let db = data.join("rugen.db");
+        let work = data.join("backup-tmp");
+        let runner = Runner {
+            cfg: &cfg,
+            s3: &s3,
+            data: Some(&data),
+            work: &work,
+        };
+
+        // make a genuine flat backup as 0.6.0 wrote it: move a fresh set
+        // to the bucket root, the manifest naming the flat database
+        let made = runner.run(&|out| snapshot_file(&db, out)).unwrap();
+        let legacy = "rugen-backup-20261013T141050Z-0.6.0";
+        {
+            let mut objs = fake.objects.lock().unwrap();
+            let manifest_key = made.db_key.replace(".db.zst", ".json");
+            let body = objs.remove(&made.db_key).unwrap();
+            objs.insert(format!("{legacy}.db.zst"), body);
+            let mut m: Manifest =
+                serde_json::from_slice(&objs.remove(&manifest_key).unwrap().body).unwrap();
+            m.db.name = format!("{legacy}.db.zst");
+            let body = serde_json::to_vec(&m).unwrap();
+            objs.insert(
+                format!("{legacy}.json"),
+                crate::s3_fake::Stored { body, modified: 1 },
+            );
+        }
+        assert!(list_sets(&s3).unwrap().iter().all(|s| s.legacy));
+        // things the cleanup must leave alone
+        for k in [
+            format!("{legacy}.signing.key"),
+            "rugen-backup-notes.txt".into(),
+            "chars/kfm/rugen-backup-20261013T141050Z-0.6.0.json".into(),
+            "stages/rugen-backup-x.db.zst".into(),
+            "README.md".into(),
+        ] {
+            fake.put(&k, b"keep", 1);
+        }
+
+        // no backup of the new layout yet: restore finds the flat one
+        let target = temp_dir("legacy-restore");
+        let out = restore(&cfg, &target, "latest").unwrap();
+        assert!(out.contains(legacy), "{out}");
+        assert!(restore(&cfg, &target, legacy).is_ok());
+        assert!(restore(&cfg, &target, &format!("{legacy}.db.zst")).is_ok());
+        let b = Backups::new(BackupSetting::On(cfg.clone()), None);
+        let rows = b.list().unwrap()["backups"].clone();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["legacy"], true);
+        assert_eq!(rows[0]["key"], format!("{legacy}.db.zst"));
+
+        // a failed backup deletes nothing
+        assert!(runner.run(&|_| Err("disk full".into())).is_err());
+        assert!(fake.keys().contains(&format!("{legacy}.json")));
+
+        // the next successful backup: new layout up, flat objects gone
+        let rep = runner.run(&|out| snapshot_file(&db, out)).unwrap();
+        assert_eq!(rep.legacy_deleted, 2);
+        assert_eq!(rep.deleted, 0, "retention ignores the flat layout");
+        let keys = fake.keys();
+        assert!(rep.db_key.starts_with("backups/db/"), "{}", rep.db_key);
+        assert!(keys.contains(&rep.db_key));
+        assert!(!keys.contains(&format!("{legacy}.db.zst")), "{keys:?}");
+        assert!(!keys.contains(&format!("{legacy}.json")), "{keys:?}");
+        for k in [
+            format!("{legacy}.signing.key"),
+            "rugen-backup-notes.txt".into(),
+            "chars/kfm/rugen-backup-20261013T141050Z-0.6.0.json".into(),
+            "stages/rugen-backup-x.db.zst".into(),
+            "README.md".into(),
+        ] {
+            assert!(keys.contains(&k), "{k} stays: {keys:?}");
+        }
+        let sets = list_sets(&s3).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert!(!sets[0].legacy);
+        assert!(
+            restore(&cfg, &target, "latest")
+                .unwrap()
+                .contains(&rep.stem)
+        );
+        assert_eq!(*fake.rejected.lock().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
     /// Backup, incremental packages, retention and restore against the
     /// in-process fake S3 (signatures checked on every request).
     #[test]
@@ -1595,19 +1929,42 @@ mod tests {
         std::fs::write(data.join(format!("packages/{fp}.rgc")), b"hello").unwrap();
         std::fs::write(data.join("packages/partial/x.part"), b"skip me").unwrap();
 
-        // an old backup set and a foreign object: retention drops the set only
+        // an old backup set and foreign objects: retention drops the set only
         fake.put(
-            "prod/eu/rugen-backup-20200101T030000Z-0.5.0.db.zst",
+            "prod/eu/backups/db/2020/01/rugen-backup-20200101T030000Z-0.5.0.db.zst",
             b"old",
             1,
         );
-        fake.put("prod/eu/rugen-backup-20200101T030000Z-0.5.0.json", b"{}", 1);
+        fake.put(
+            "prod/eu/backups/db/2020/01/rugen-backup-20200101T030000Z-0.5.0.json",
+            b"{}",
+            1,
+        );
+        fake.put(
+            "prod/eu/backups/keys/2020/01/rugen-backup-20200101T030000Z-0.5.0.signing.key",
+            b"k",
+            1,
+        );
         fake.put("prod/eu/README.txt", b"mine", 1);
-        // more objects than one listing page
+        fake.put("prod/eu/chars/kfm.zip", b"char", 1);
+        fake.put("prod/eu/packages/old.rgc", b"pre-layout package", 1);
+        // more objects than one listing page (backups of other months too)
         for i in 0..4 {
             fake.put(
-                &format!("prod/eu/packages/{}.rgc", format!("{i:02}").repeat(32)),
+                &format!(
+                    "prod/eu/backups/packages/{}.rgc",
+                    format!("{i:02}").repeat(32)
+                ),
                 b"p",
+                1,
+            );
+            fake.put(
+                &format!(
+                    "prod/eu/backups/db/2019/{:02}/rugen-backup-2019{:02}01T030000Z-0.4.0.db.zst",
+                    i + 1,
+                    i + 1
+                ),
+                b"older",
                 1,
             );
         }
@@ -1627,28 +1984,60 @@ mod tests {
             "every request signed correctly"
         );
         assert_eq!(rep.packages_uploaded, 1);
-        assert_eq!(rep.deleted, 1);
+        assert_eq!(rep.deleted, 5, "the 2020 set and the four 2019 ones");
+        assert_eq!(rep.legacy_deleted, 0);
         let keys = fake.keys();
-        assert!(
-            keys.contains(&format!("prod/eu/{}.db.zst", rep.stem)),
-            "{keys:?}"
-        );
-        assert!(keys.contains(&format!("prod/eu/{}.json", rep.stem)));
-        assert!(keys.contains(&format!("prod/eu/{}.signing.key", rep.stem)));
-        assert!(keys.contains(&format!("prod/eu/packages/{fp}.rgc")));
-        assert!(
-            keys.contains(&"prod/eu/README.txt".to_string()),
-            "foreign objects stay"
-        );
+        let month = format!("prod/eu/{}", dated_dir(DB_DIR, rep.created));
+        assert!(month.starts_with("prod/eu/backups/db/20"), "{month}");
+        assert_eq!(rep.db_key, format!("{month}/{}.db.zst", rep.stem));
+        assert!(keys.contains(&rep.db_key), "{keys:?}");
+        assert!(keys.contains(&format!("{month}/{}.json", rep.stem)));
+        assert!(keys.contains(&format!(
+            "prod/eu/{}/{}.signing.key",
+            dated_dir(KEYS_DIR, rep.created),
+            rep.stem
+        )));
+        assert!(keys.contains(&format!("prod/eu/backups/packages/{fp}.rgc")));
+        for foreign in [
+            "prod/eu/README.txt",
+            "prod/eu/chars/kfm.zip",
+            "prod/eu/packages/old.rgc",
+        ] {
+            assert!(
+                keys.contains(&foreign.to_string()),
+                "foreign {foreign} stays"
+            );
+        }
         assert!(!keys.iter().any(|k| k.contains("20200101")), "{keys:?}");
+        assert!(!keys.iter().any(|k| k.contains("2019")), "{keys:?}");
         assert!(!keys.iter().any(|k| k.contains("part")));
         // stale remote packages that are gone locally were deleted
-        assert_eq!(keys.iter().filter(|k| k.contains("/packages/")).count(), 1);
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.contains("/backups/packages/"))
+                .count(),
+            1
+        );
+        assert!(
+            keys.iter().all(|k| k.starts_with("prod/eu/backups/")
+                || [
+                    "prod/eu/README.txt",
+                    "prod/eu/chars/kfm.zip",
+                    "prod/eu/packages/old.rgc"
+                ]
+                .contains(&k.as_str())),
+            "{keys:?}"
+        );
         assert!(!work.join("snapshot.db").exists() && !work.join("snapshot.db.zst").exists());
         let manifest: Manifest = serde_json::from_slice(
-            &fake.objects.lock().unwrap()[&format!("prod/eu/{}.json", rep.stem)].body,
+            &fake.objects.lock().unwrap()[&format!("{month}/{}.json", rep.stem)].body,
         )
         .unwrap();
+        assert_eq!(
+            manifest.db.name,
+            format!("{}/{}.db.zst", dated_dir(DB_DIR, rep.created), rep.stem)
+        );
+        assert_eq!(manifest.packages.as_ref().unwrap().dir, "backups/packages");
         assert_eq!(
             manifest.schema_version,
             crate::store::Store::open(Some(&data))
@@ -1691,9 +2080,14 @@ mod tests {
             std::fs::read_to_string(target.join("signing.key")).unwrap(),
             "00".repeat(32)
         );
-        // by name too; a tampered object is refused
-        let first = format!("prod/eu/{}.db.zst", rep.stem);
+        // by key and by name too; a tampered object is refused
+        let first = rep.db_key.clone();
         assert!(restore(&cfg, &target, &first).is_ok());
+        assert!(
+            restore(&cfg, &target, &rep.stem)
+                .unwrap()
+                .contains(&rep.stem)
+        );
         fake.objects
             .lock()
             .unwrap()

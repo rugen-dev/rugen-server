@@ -46,7 +46,7 @@
 //! POST /v1/admin/reset_password {token, username} → {username, password} (temporary;
 //!                               every key of the account is revoked)
 //! POST /v1/admin/backup         {token} → 202 {job} | 409 running | 429 (1 per 10 min)
-//! GET  /v1/admin/backups?token= backups in the bucket {backups: [{key, name, time, size, complete}]}
+//! GET  /v1/admin/backups?token= backups in the bucket {backups: [{key, name, time, size, complete, legacy}]}
 //! GET  /v1/admin/backup/status?token=  the health `backup` object + job, includes
 //!   (admin calls also take `Authorization: Bearer <RUGEN_ADMIN_TOKEN>`; see crate::backup)
 //!
@@ -4539,7 +4539,7 @@ pub(crate) mod tests {
             rows[0]["key"]
                 .as_str()
                 .unwrap()
-                .starts_with("srv/rugen-backup-")
+                .starts_with("srv/backups/db/")
         );
         assert_eq!(rows[0]["complete"], true);
         assert_eq!(fake.keys().len(), 2, "database + manifest");
