@@ -356,6 +356,12 @@ fn clean_rules(v: Option<&Value>) -> Rules {
         r.chars = "free".into();
     }
     r.stage = clean_id(&r.stage);
+    // FIGHTER SIZE is simulated: only the known values; anything else (or
+    // missing, from clients before it) is normal
+    r.fighter_size = r.fighter_size.trim().to_ascii_lowercase();
+    if !rugen_proto::FIGHTER_SIZES.contains(&r.fighter_size.as_str()) {
+        r.fighter_size = "normal".into();
+    }
     r
 }
 
@@ -2189,6 +2195,17 @@ impl Api {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn rooms_keep_a_known_fighter_size() {
+        let size = |v: Value| clean_rules(Some(&v)).fighter_size;
+        assert_eq!(size(json!({"fighter_size": "chibi"})), "chibi");
+        assert_eq!(size(json!({"fighter_size": " None "})), "none");
+        // API 5 clients from before the option send none: normal
+        assert_eq!(size(json!({"rounds": 3})), "normal");
+        assert_eq!(size(json!({"fighter_size": "giant"})), "normal");
+        assert_eq!(clean_rules(None).fighter_size, "normal");
+    }
     use crate::testkit::{declare, declare_legacy, tiny_char, tiny_stage, tmp};
     use rugen_fair::Kind;
 
@@ -3014,6 +3031,7 @@ pub(crate) mod tests {
             movement: Default::default(),
             round_time: None,
             ai: [0, 0],
+            fighter_size: rugen_sim::scale::FighterSize::Normal,
         };
         let mut world = rugen_sim::headless::build_world(&spec).unwrap();
         let mut inputs = Vec::new();

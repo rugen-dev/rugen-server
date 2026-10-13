@@ -221,6 +221,9 @@ fn play(
                     movement: Default::default(),
                     round_time: None,
                     ai: [0, 0],
+                    // as the game does: the room's size, missing / unknown = normal
+                    fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
+                        .unwrap_or_default(),
                 };
                 let mut w = rugen_sim::headless::build_world(&spec).unwrap();
                 let ticket = view.ticket.unwrap();
@@ -608,6 +611,9 @@ fn turn_match_through_a_tunnel_only_server() {
                     movement: Default::default(),
                     round_time: None,
                     ai: [0, 0],
+                    // as the game does: the room's size, missing / unknown = normal
+                    fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
+                        .unwrap_or_default(),
                 };
                 let mut w = rugen_sim::headless::build_world(&spec).unwrap();
                 let ticket = view.ticket.unwrap();

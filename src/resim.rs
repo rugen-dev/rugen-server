@@ -86,11 +86,16 @@ pub fn replay(
             }
             defs.push(u.def_path());
         }
-        let arena = v
-            .get("rules")
-            .and_then(|r| r.get("mode"))
-            .and_then(|m| m.as_str())
-            == Some("arena");
+        let rule = |k: &str| {
+            v.get("rules")
+                .and_then(|r| r.get(k))
+                .and_then(|m| m.as_str())
+        };
+        let arena = rule("mode") == Some("arena");
+        // the room's FIGHTER SIZE; setups from before it are normal, as the clients played them
+        let fighter_size = rule("fighter_size")
+            .and_then(rugen_sim::scale::FighterSize::parse)
+            .unwrap_or_default();
         let spec = rugen_sim::headless::MatchSpec {
             p1: &defs[0],
             p2: &defs[1],
@@ -105,6 +110,7 @@ pub fn replay(
             },
             round_time: None,
             ai: [0, 0],
+            fighter_size,
         };
         let mut world = rugen_sim::headless::build_world(&spec).map_err(|e| e.to_string())?;
         let r = rugen_sim::headless::replay(&mut world, inputs, stop_frame);
