@@ -162,6 +162,12 @@ const MIGRATIONS: &[&str] = &[
      );
      ALTER TABLE flags ADD COLUMN fingerprint TEXT;
      CREATE INDEX flags_fingerprint ON flags(fingerprint);",
+    // v5: matches that end early: a report's `ending` (flee / disconnect)
+    // and when it came; the settled ending and the account that left
+    "ALTER TABLE reports ADD COLUMN ending TEXT;
+     ALTER TABLE reports ADD COLUMN at INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE matches ADD COLUMN ending TEXT;
+     ALTER TABLE matches ADD COLUMN fled INTEGER;",
 ];
 
 /// Rating every character fingerprint starts from.
@@ -245,6 +251,11 @@ pub struct ReportData {
     pub inputs: Vec<u8>,
     /// `(frame, world checksum)` every 60 frames (clients with TURN support).
     pub checksums: Vec<(u32, u64)>,
+    /// The match ended early ([`rugen_proto::Ending`]): with the other
+    /// player as the winner a forfeit (settled at once), with the reporter
+    /// as the winner a claim the server checks against the relay
+    /// ([`Store::pending_claims`]).
+    pub ending: Option<rugen_proto::Ending>,
 }
 
 /// Outcome of [`Store::report`].
@@ -256,8 +267,36 @@ pub struct ReportOutcome {
     pub disputed: bool,
 }
 
+/// A report that claims the other player fled or disconnected, still
+/// waiting for the server to see it on the relay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Claim {
+    pub match_id: u64,
+    /// The claimant (it reported itself as the winner).
+    pub winner: u64,
+    pub ending: rugen_proto::Ending,
+    /// When the claim arrived (Unix seconds).
+    pub at: u64,
+}
+
+/// How a settled match ended: `(ending, account that left)`.
+pub type EndingRow = Option<(String, Option<u64>)>;
+
 /// Do two reports describe the same match? Inputs must agree on their
 /// common confirmed prefix, checksums when taken at the same frame.
+fn report_row(r: &Row<'_>) -> DbResult<ReportData> {
+    Ok(ReportData {
+        winner: r.get::<_, i64>(0)? as u64,
+        frames: r.get(1)?,
+        checksum: r.get::<_, Option<i64>>(2)?.map(|c| c as u64),
+        inputs: r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+        checksums: checksums_col(r.get(4)?),
+        ending: r
+            .get::<_, Option<String>>(5)?
+            .and_then(|e| rugen_proto::Ending::parse(&e)),
+    })
+}
+
 pub fn reports_agree(a: &ReportData, b: &ReportData) -> bool {
     if a.winner != b.winner {
         return false;
@@ -834,8 +873,8 @@ impl Store {
             });
         }
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs, checksums)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs, checksums, ending, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 match_id as i64,
                 reporter as i64,
@@ -844,7 +883,9 @@ impl Store {
                 data.checksum.map(|c| c as i64),
                 (!data.inputs.is_empty()).then_some(&data.inputs),
                 (!data.checksums.is_empty())
-                    .then(|| rugen_proto::evidence::encode_checksums(&data.checksums))
+                    .then(|| rugen_proto::evidence::encode_checksums(&data.checksums)),
+                data.ending.map(|e| e.as_str()),
+                now() as i64
             ],
         )?;
         if inserted == 0 {
@@ -856,19 +897,32 @@ impl Store {
         }
         let reports: Vec<ReportData> = {
             let mut st = tx.prepare(
-                "SELECT winner, frames, checksum, inputs, checksums FROM reports WHERE match_id = ?1 ORDER BY reporter",
+                "SELECT winner, frames, checksum, inputs, checksums, ending FROM reports WHERE match_id = ?1 ORDER BY reporter",
             )?;
-            st.query_map([match_id as i64], |r| {
-                Ok(ReportData {
-                    winner: r.get::<_, i64>(0)? as u64,
-                    frames: r.get(1)?,
-                    checksum: r.get::<_, Option<i64>>(2)?.map(|c| c as u64),
-                    inputs: r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
-                    checksums: checksums_col(r.get(4)?),
-                })
-            })?
-            .collect::<DbResult<_>>()?
+            st.query_map([match_id as i64], report_row)?
+                .collect::<DbResult<_>>()?
         };
+        // a forfeit: the reporter names the other player as the winner of
+        // a match it left; nobody else needs to agree to a loss
+        if reports.len() < 2 && data.ending.is_some() && data.winner != reporter {
+            let deltas = Self::settle(
+                &tx,
+                match_id,
+                players,
+                ranked,
+                &setup,
+                data.winner,
+                &data.inputs,
+            )?;
+            Self::set_ending(&tx, match_id, data.ending, Some(reporter))?;
+            tx.commit()?;
+            log::info!("match {match_id}: {reporter} fled, {} wins", data.winner);
+            return Ok(ReportOutcome {
+                accepted: true,
+                delta: Some(deltas[side]),
+                disputed: false,
+            });
+        }
         if reports.len() < 2 {
             tx.commit()?;
             return Ok(ReportOutcome {
@@ -895,6 +949,11 @@ impl Store {
             reports[1].inputs.clone()
         };
         let deltas = Self::settle(&tx, match_id, players, ranked, &setup, data.winner, &inputs)?;
+        // both agree on the winner; either may say the loser left early
+        if let Some(e) = reports.iter().find_map(|r| r.ending) {
+            let loser = players.into_iter().find(|&p| p != data.winner);
+            Self::set_ending(&tx, match_id, Some(e), loser)?;
+        }
         tx.commit()?;
         Ok(ReportOutcome {
             accepted: true,
@@ -1013,6 +1072,120 @@ impl Store {
         Ok(deltas)
     }
 
+    fn set_ending(
+        tx: &rusqlite::Transaction<'_>,
+        match_id: u64,
+        ending: Option<rugen_proto::Ending>,
+        fled: Option<u64>,
+    ) -> DbResult<()> {
+        tx.execute(
+            "UPDATE matches SET ending = ?2, fled = ?3 WHERE id = ?1",
+            params![
+                match_id as i64,
+                ending.map(|e| e.as_str()),
+                fled.map(|f| f as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Unsettled matches with a single report, from the player who says it
+    /// won because the other one fled or disconnected.
+    pub fn pending_claims(&self) -> DbResult<Vec<Claim>> {
+        let mut st = self.conn.prepare(
+            "SELECT r.match_id, r.reporter, r.ending, r.at FROM reports r
+             JOIN matches m ON m.id = r.match_id
+             WHERE m.resolved = 0 AND r.ending IS NOT NULL AND r.winner = r.reporter
+               AND (SELECT COUNT(*) FROM reports x WHERE x.match_id = r.match_id) = 1",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (match_id, winner, ending, at) = row?;
+            if let Some(ending) = rugen_proto::Ending::parse(&ending) {
+                out.push(Claim {
+                    match_id,
+                    winner,
+                    ending,
+                    at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Settle a claim the server confirmed on its own view of the relay:
+    /// the claimant wins, the other player fled / disconnected. `None`
+    /// when the match is no longer a pending claim (settled meanwhile, or
+    /// the other report arrived: agreement or dispute decide then).
+    pub fn settle_claim(&mut self, c: &Claim) -> DbResult<Option<[i32; 2]>> {
+        let tx = self.conn.transaction()?;
+        if !Self::pending_claims_tx(&tx, c)? {
+            return Ok(None);
+        }
+        let (players, ranked, setup) = tx.query_row(
+            "SELECT p1, p2, ranked, setup FROM matches WHERE id = ?1",
+            [c.match_id as i64],
+            |r| {
+                Ok((
+                    [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let inputs: Option<Vec<u8>> = tx.query_row(
+            "SELECT inputs FROM reports WHERE match_id = ?1 AND reporter = ?2",
+            params![c.match_id as i64, c.winner as i64],
+            |r| r.get(0),
+        )?;
+        let deltas = Self::settle(
+            &tx,
+            c.match_id,
+            players,
+            ranked,
+            &setup,
+            c.winner,
+            &inputs.unwrap_or_default(),
+        )?;
+        let loser = players.into_iter().find(|&p| p != c.winner);
+        Self::set_ending(&tx, c.match_id, Some(c.ending), loser)?;
+        tx.commit()?;
+        Ok(Some(deltas))
+    }
+
+    /// Still unsettled with only the claimant's report?
+    fn pending_claims_tx(tx: &rusqlite::Transaction<'_>, c: &Claim) -> DbResult<bool> {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM reports r JOIN matches m ON m.id = r.match_id
+             WHERE r.match_id = ?1 AND m.resolved = 0 AND r.reporter = ?2 AND r.ending IS NOT NULL
+               AND (SELECT COUNT(*) FROM reports x WHERE x.match_id = r.match_id) = 1",
+            params![c.match_id as i64, c.winner as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n == 1)
+    }
+
+    /// How a settled match ended early (`None` for a match played out).
+    pub fn match_ending(&self, match_id: u64) -> DbResult<EndingRow> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT ending, fled FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(e, f)| e.map(|e| (e, f.map(|f| f as u64)))))
+    }
+
     /// A client saw a desync (ggrs checksum mismatch): the match can no
     /// longer resolve by agreement.
     pub fn report_desync(&mut self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
@@ -1117,6 +1290,7 @@ impl Store {
                         checksum: r.get::<_, Option<i64>>(3)?.map(|c| c as u64),
                         inputs: r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
                         checksums: checksums_col(r.get(5)?),
+                        ending: None,
                     },
                 ))
             })?
@@ -1385,6 +1559,16 @@ impl Store {
         }))
     }
 
+    /// Test: make a match's reports `secs` older.
+    #[cfg(test)]
+    pub fn age_reports(&self, match_id: u64, secs: i64) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE reports SET at = at - ?2 WHERE match_id = ?1",
+            params![match_id as i64, secs],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn flags_of(&self, account: u64) -> DbResult<Vec<String>> {
         let mut st = self
@@ -1523,6 +1707,103 @@ mod tests {
         assert_eq!(s.rank_of(b).unwrap(), Some(2));
     }
 
+    fn ended(w: u64, e: rugen_proto::Ending) -> ReportData {
+        ReportData {
+            winner: w,
+            frames: 300,
+            inputs: inputs(300, None),
+            ending: Some(e),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_forfeit_settles_at_once_as_a_loss() {
+        use rugen_proto::Ending;
+        let mut s = Store::open(None).unwrap();
+        let a = s.register().unwrap().id;
+        let b = s.register().unwrap().id;
+        let m = s.new_match([a, b], true, "{}").unwrap();
+        // b flees: it reports a as the winner of the match it left
+        let out = s.report(b, m, &ended(a, Ending::Flee)).unwrap();
+        assert_eq!(out.delta, Some(-16), "a normal ranked loss");
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
+        assert_eq!(s.by_id(b).unwrap().unwrap().losses, 1);
+        assert_eq!(
+            s.match_ending(m).unwrap(),
+            Some(("flee".to_string(), Some(b)))
+        );
+        // the winner's own claim afterwards: already settled, same result
+        let late = s.report(a, m, &ended(a, Ending::Flee)).unwrap();
+        assert_eq!(late.delta, Some(16));
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
+        assert!(s.pending_claims().unwrap().is_empty());
+        // casual: no rating, still recorded as a flee
+        let m2 = s.new_match([a, b], false, "{}").unwrap();
+        let out = s.report(a, m2, &ended(b, Ending::Flee)).unwrap();
+        assert_eq!(out.delta, Some(0));
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
+        assert_eq!(
+            s.match_ending(m2).unwrap(),
+            Some(("flee".to_string(), Some(a)))
+        );
+    }
+
+    #[test]
+    fn a_claim_waits_for_the_server_and_yields_to_the_other_report() {
+        use rugen_proto::Ending;
+        let mut s = Store::open(None).unwrap();
+        let a = s.register().unwrap().id;
+        let b = s.register().unwrap().id;
+        // a says b disconnected: nothing moves on its word alone
+        let m = s.new_match([a, b], true, "{}").unwrap();
+        let out = s.report(a, m, &ended(a, Ending::Disconnect)).unwrap();
+        assert!(out.accepted && out.delta.is_none() && !out.disputed);
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1200);
+        let claims = s.pending_claims().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].winner, a);
+        assert_eq!(claims[0].ending, Ending::Disconnect);
+        // the server confirmed it on the relay: settled for a
+        assert_eq!(s.settle_claim(&claims[0]).unwrap(), Some([16, -16]));
+        assert_eq!(s.by_id(b).unwrap().unwrap().rating, 1184);
+        assert_eq!(
+            s.match_ending(m).unwrap(),
+            Some(("disconnect".to_string(), Some(b)))
+        );
+        assert_eq!(s.settle_claim(&claims[0]).unwrap(), None, "only once");
+        assert!(s.pending_claims().unwrap().is_empty());
+        // a false claim: b reports the match it actually won
+        let m2 = s.new_match([a, b], true, "{}").unwrap();
+        s.report(a, m2, &ended(a, Ending::Flee)).unwrap();
+        let claim = s.pending_claims().unwrap().remove(0);
+        let out = s
+            .report(
+                b,
+                m2,
+                &ReportData {
+                    winner: b,
+                    frames: 300,
+                    inputs: inputs(300, None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.disputed, "two winners: the resim / nobody decides");
+        assert!(s.pending_claims().unwrap().is_empty());
+        assert_eq!(s.settle_claim(&claim).unwrap(), None);
+        assert_eq!(s.by_id(a).unwrap().unwrap().rating, 1216);
+        // a claim the other report agrees with settles by agreement
+        let m3 = s.new_match([a, b], false, "{}").unwrap();
+        s.report(a, m3, &ended(a, Ending::Flee)).unwrap();
+        let out = s.report(b, m3, &ended(a, Ending::Flee)).unwrap();
+        assert_eq!(out.delta, Some(0));
+        assert_eq!(
+            s.match_ending(m3).unwrap(),
+            Some(("flee".to_string(), Some(b)))
+        );
+    }
+
     #[test]
     fn disagreement_is_disputed_and_outsiders_rejected() {
         let mut s = Store::open(None).unwrap();
@@ -1551,6 +1832,7 @@ mod tests {
             checksum: None,
             inputs: inputs(600, None),
             checksums: (1..=10).map(|i| (i * 60, i as u64)).collect(),
+            ending: None,
         };
         // agreeing logs (the other side a few unconfirmed frames short)
         let m = s.new_match([a, b], true, "{}").unwrap();
@@ -1588,6 +1870,7 @@ mod tests {
             checksum: Some(42),
             inputs: inputs(600, None),
             checksums: vec![(60, 1), (120, 2)],
+            ending: None,
         };
         let rb = ReportData {
             winner: a,
@@ -1595,6 +1878,7 @@ mod tests {
             checksum: Some(7),
             inputs: inputs(590, None),
             checksums: vec![(60, 1), (120, 2)],
+            ending: None,
         };
         s.report(a, m, &ra).unwrap();
         let out = s.report(b, m, &rb).unwrap();

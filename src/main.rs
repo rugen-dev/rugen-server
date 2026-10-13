@@ -522,6 +522,9 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 every.tick().await;
                 r.sweep_relay();
+                // flee / disconnect claims the relay can confirm
+                let a = r.clone();
+                let _ = tokio::task::spawn_blocking(move || a.sweep_claims()).await;
             }
         });
         // package retention: TTL + LRU size cap

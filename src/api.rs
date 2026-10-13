@@ -207,6 +207,30 @@ pub struct ApiConfig {
 
 /// Matchups not started and untouched for this long fail.
 const MATCHUP_IDLE: Duration = Duration::from_secs(15 * 60);
+/// A claim that the other player fled waits this long for that player's
+/// own report before the relay's view settles it.
+pub const CLAIM_GRACE_SECS: u64 = 15;
+/// A slot silent this long on the relay has left (HELLOs come every 2 s,
+/// whatever path the match uses).
+const SLOT_GONE: Duration = Duration::from_secs(10);
+/// The claimant must have stayed connected this much longer than the
+/// player it says left.
+const OUTLASTED: Duration = Duration::from_secs(2);
+
+/// The relay saw `theirs` leave the match before `mine`: it said BYE or
+/// went silent for [`SLOT_GONE`], while `mine` was still heard at least
+/// [`OUTLASTED`] later. Both must have joined (a slot that never connected
+/// is a failed start, not a flee).
+pub fn left_first(
+    mine: &crate::relay::Presence,
+    theirs: &crate::relay::Presence,
+    now: Instant,
+) -> bool {
+    mine.joined
+        && theirs.joined
+        && (theirs.bye || now.saturating_duration_since(theirs.heard) >= SLOT_GONE)
+        && mine.heard >= theirs.heard + OUTLASTED
+}
 /// Started / failed matchups are forgotten after this long.
 const MATCHUP_KEEP: Duration = Duration::from_secs(4 * 3600);
 /// Largest chunk of an upload / download.
@@ -1231,6 +1255,12 @@ impl Api {
             checksum: v.get("checksum").and_then(Value::as_u64),
             inputs,
             checksums,
+            // additive: older clients never send it (a match ended early
+            // simply never resolves for them, as before)
+            ending: v
+                .get("ending")
+                .and_then(Value::as_str)
+                .and_then(rugen_proto::Ending::parse),
         };
         let out = db(s.report(me, match_id, &data))?;
         if !out.accepted {
@@ -1262,12 +1292,15 @@ impl Api {
             Some(_) => self.result_ack(&s, match_id, me)?.signed,
             None => None,
         };
+        let (ending, fled) = Self::ending_fields(db(s.match_ending(match_id))?);
         ok(&ResultAck {
             accepted: true,
             rating,
             delta: out.delta,
             disputed: out.disputed,
             signed,
+            ending,
+            fled,
         })
     }
 
@@ -1282,8 +1315,11 @@ impl Api {
                 delta: None,
                 disputed,
                 signed: None,
+                ending: None,
+                fled: None,
             });
         };
+        let (ending, fled) = Self::ending_fields(db(s.match_ending(match_id))?);
         let rating = if ranked {
             db(s.by_id(me))?.map(|a| a.rating)
         } else {
@@ -1310,7 +1346,69 @@ impl Api {
             delta: Some(delta),
             disputed,
             signed,
+            ending,
+            fled,
         })
+    }
+
+    fn ending_fields(row: crate::store::EndingRow) -> (Option<String>, Option<u64>) {
+        match row {
+            Some((e, f)) => (Some(e), f),
+            None => (None, None),
+        }
+    }
+
+    /// Settle the claims "the other player fled / disconnected" that the
+    /// relay confirms (every few seconds from the server's timer). A claim
+    /// waits [`CLAIM_GRACE_SECS`] for the other player's own report (then
+    /// agreement or a dispute decide), and is settled only when the
+    /// relay saw the other slot leave first ([`left_first`]): a client's
+    /// word alone never moves a rating.
+    pub fn sweep_claims(&self) {
+        let mut s = lock(&self.store);
+        let claims = match s.pending_claims() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("claims: {e}");
+                return;
+            }
+        };
+        let t = crate::store::now();
+        for c in claims {
+            if t < c.at + CLAIM_GRACE_SECS {
+                continue;
+            }
+            let running = lock(&self.matchups)
+                .get(&c.match_id)
+                .and_then(|m| m.started.clone());
+            let Some(run) = running else { continue };
+            let Some(seen) = self.relay.presence(run.session) else {
+                continue;
+            };
+            let Some(me) = run.slots.iter().take(2).position(|&a| a == c.winner) else {
+                continue;
+            };
+            let (Some(mine), Some(theirs)) = (seen.get(me), seen.get(1 - me)) else {
+                continue;
+            };
+            if !left_first(mine, theirs, Instant::now()) {
+                continue;
+            }
+            match s.settle_claim(&c) {
+                Ok(Some(d)) => {
+                    log::info!(
+                        "match {}: the relay confirms the other player left ({}), {} wins ({:+})",
+                        c.match_id,
+                        c.ending.as_str(),
+                        c.winner,
+                        d[me]
+                    );
+                    self.close_match_session(c.match_id);
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("match {}: claim not settled: {e}", c.match_id),
+            }
+        }
     }
 
     // ---- official server: identity, admin
@@ -3264,6 +3362,171 @@ pub(crate) mod tests {
         let id = joined["matchup"]["id"].as_u64().unwrap();
         play_matchup(api, id, [ka, kb], kit);
         (code, id)
+    }
+
+    #[test]
+    fn flee_claims_settle_on_the_relays_view_only() {
+        use crate::relay::Route;
+        use rugen_proto::relay::{self as wire, Header};
+        let kit = Kit::new();
+        let api = api();
+        let (aid, ka) = register(&api);
+        let (bid, kb) = register(&api);
+        let (_, id) = started_room(&api, &ka, &kb, &kit);
+        let run = lock(&api.matchups)
+            .get(&id)
+            .and_then(|m| m.started.clone())
+            .unwrap();
+        let send = |slot: u8, kind: u8, at: Instant| {
+            let p = wire::encode_client(
+                Header {
+                    kind,
+                    from: slot,
+                    to: 0,
+                    session: run.session,
+                },
+                &run.tokens[slot as usize],
+                &[],
+            );
+            let from = Route::Udp(
+                format!("127.0.0.1:{}", 9100 + u16::from(slot))
+                    .parse()
+                    .unwrap(),
+            );
+            api.relay.on_packet(&p, &from, at);
+        };
+        let t0 = Instant::now();
+        send(0, wire::HELLO, t0);
+        send(1, wire::HELLO, t0);
+        let result = |k: &str| {
+            json_of(api.handle(req(
+                "GET",
+                &format!("/match/{id}/result?key={k}"),
+                Value::Null,
+            )))
+        };
+        // a says b fled, but the relay still hears b: nothing moves
+        let ack = json_of(api.handle(req(
+            "POST",
+            "/result",
+            json!({"key": ka, "match_id": id, "winner": aid, "ending": "flee"}),
+        )));
+        assert_eq!(ack["accepted"], true);
+        assert!(ack["delta"].is_null(), "{ack}");
+        lock(&api.store).age_reports(id, 60).unwrap();
+        api.sweep_claims();
+        assert!(result(&ka)["delta"].is_null(), "b is still connected");
+        // b's BYE reaches the relay, a stays connected: settled for a
+        send(1, wire::BYE, t0 + Duration::from_secs(1));
+        send(0, wire::HELLO, t0 + Duration::from_secs(4));
+        api.sweep_claims();
+        let r = result(&ka);
+        assert_eq!(r["delta"], 0, "casual: no rating, {r}");
+        assert_eq!(r["ending"], "flee");
+        assert_eq!(r["fled"], bid);
+        let rb = result(&kb);
+        assert_eq!(rb["fled"], bid);
+        assert_eq!(rb["ending"], "flee");
+        // a late report from b changes nothing
+        let late = json_of(api.handle(req(
+            "POST",
+            "/result",
+            json!({"key": kb, "match_id": id, "winner": bid}),
+        )));
+        assert_eq!(late["ending"], "flee");
+        assert_eq!(result(&ka)["fled"], bid);
+    }
+
+    #[test]
+    fn a_fresh_claim_waits_for_the_other_report() {
+        use crate::relay::Route;
+        use rugen_proto::relay::{self as wire, Header};
+        let kit = Kit::new();
+        let api = api();
+        let (aid, ka) = register(&api);
+        let (bid, kb) = register(&api);
+        let (_, id) = started_room(&api, &ka, &kb, &kit);
+        let run = lock(&api.matchups)
+            .get(&id)
+            .and_then(|m| m.started.clone())
+            .unwrap();
+        let t0 = Instant::now();
+        for (slot, kind, at) in [
+            (0u8, wire::HELLO, t0),
+            (1, wire::HELLO, t0),
+            (1, wire::BYE, t0 + Duration::from_secs(1)),
+            (0, wire::HELLO, t0 + Duration::from_secs(5)),
+        ] {
+            let p = wire::encode_client(
+                Header {
+                    kind,
+                    from: slot,
+                    to: 0,
+                    session: run.session,
+                },
+                &run.tokens[slot as usize],
+                &[],
+            );
+            let from = Route::Udp(
+                format!("127.0.0.1:{}", 9200 + u16::from(slot))
+                    .parse()
+                    .unwrap(),
+            );
+            api.relay.on_packet(&p, &from, at);
+        }
+        json_of(api.handle(req(
+            "POST",
+            "/result",
+            json!({"key": ka, "match_id": id, "winner": aid, "ending": "disconnect"}),
+        )));
+        // the relay agrees, but the claim is younger than the grace period
+        api.sweep_claims();
+        assert_eq!(lock(&api.store).pending_claims().unwrap().len(), 1);
+        // the other report says the claimant lost: a dispute, never a win
+        let r = json_of(api.handle(req(
+            "POST",
+            "/result",
+            json!({"key": kb, "match_id": id, "winner": bid}),
+        )));
+        assert_eq!(r["accepted"], true);
+        assert_eq!(r["disputed"], true);
+        assert!(lock(&api.store).pending_claims().unwrap().is_empty());
+    }
+
+    #[test]
+    fn left_first_needs_the_other_slot_gone_before_the_claimant() {
+        use crate::relay::Presence;
+        let t = Instant::now();
+        let p = |joined, heard: u64, bye| Presence {
+            joined,
+            heard: t + Duration::from_secs(heard),
+            bye,
+        };
+        let now = t + Duration::from_secs(30);
+        assert!(
+            left_first(&p(true, 5, false), &p(true, 1, true), now),
+            "bye"
+        );
+        assert!(
+            left_first(&p(true, 20, false), &p(true, 1, false), now),
+            "silent for long"
+        );
+        assert!(
+            !left_first(&p(true, 2, false), &p(true, 1, true), now),
+            "left together"
+        );
+        assert!(
+            !left_first(&p(true, 25, false), &p(true, 24, false), now),
+            "still heard"
+        );
+        assert!(
+            !left_first(&p(true, 5, false), &p(false, 0, false), now),
+            "never joined"
+        );
+        assert!(
+            !left_first(&p(true, 1, true), &p(true, 5, true), now),
+            "the claimant left first"
+        );
     }
 
     #[test]

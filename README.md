@@ -17,6 +17,10 @@ SQLite inside):
   byte-identical files
 - ranked result verification, stored replays, optional re-simulation of
   disputed matches (`--features resim`)
+- matches that end early: a player who flees forfeits at once (a normal
+  loss); a win claimed because the other player fled or disconnected is
+  settled only on the server's own relay view (that slot said BYE or went
+  silent first), after a 15 s grace for the other report
 - **official vs community servers**: the official server (`play.rugen.dev`,
   holder of the official Ed25519 key) is the global ranking and publishes a
   signed truth feed (cheat blocklist + character ratings) that every

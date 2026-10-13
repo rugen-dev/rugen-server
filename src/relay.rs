@@ -36,6 +36,22 @@ const MAX_SESSIONS: usize = 10_000;
 pub const ACTIVE: Duration = Duration::from_secs(10);
 /// Outbound frames queued per `/relay` WebSocket (~2 s of a match).
 pub const WS_QUEUE: usize = 256;
+/// How long a closed session's [`Presence`] stays known (a flee claim is
+/// checked against it after both players left).
+const ENDED_KEEP: Duration = Duration::from_secs(3600);
+
+/// What the relay saw of one slot: when it was last heard from and how it
+/// left. The server's own view of who left a match first (a claim that the
+/// other player fled is checked against it, never taken on trust).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presence {
+    /// The slot sent at least one valid datagram.
+    pub joined: bool,
+    /// Last valid datagram (the session's creation before the first).
+    pub heard: Instant,
+    /// Its last word was BYE (it left the session).
+    pub bye: bool,
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -86,6 +102,8 @@ struct Slot {
     heard: Instant,
     /// Said BYE (and nothing since).
     bye: bool,
+    /// Sent at least one valid datagram.
+    joined: bool,
 }
 
 struct Session {
@@ -108,6 +126,17 @@ impl Session {
     fn alive(&self, now: Instant) -> bool {
         now.duration_since(self.last) < IDLE && now.duration_since(self.created) < MAX_AGE
     }
+
+    fn presence(&self) -> Vec<Presence> {
+        self.slots
+            .iter()
+            .map(|s| Presence {
+                joined: s.joined,
+                heard: s.heard,
+                bye: s.bye,
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -120,6 +149,8 @@ pub struct Relay {
     pub dropped: AtomicU64,
     /// Frames dropped because a WebSocket client's outbound queue was full.
     pub queue_drops: AtomicU64,
+    /// [`Presence`] of sessions closed or expired in the last [`ENDED_KEEP`].
+    ended: Mutex<HashMap<u32, (Instant, Vec<Presence>)>>,
 }
 
 pub fn random_token() -> [u8; TOKEN_LEN] {
@@ -170,6 +201,7 @@ impl Relay {
                 turn: (0, 0),
                 heard: now,
                 bye: false,
+                joined: false,
             })
             .collect();
         let tokens = slots.iter().map(|s| s.token).collect();
@@ -190,9 +222,29 @@ impl Relay {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id);
-        if gone.is_some() {
+        if let Some(s) = gone {
+            self.remember(id, &lock(&s));
             log::debug!("relay session {id:08x} closed");
         }
+    }
+
+    /// Keep what a session saw of its slots after it is gone.
+    fn remember(&self, id: u32, s: &Session) {
+        let now = Instant::now();
+        let mut ended = lock(&self.ended);
+        ended.retain(|_, (t, _)| now.duration_since(*t) < ENDED_KEEP);
+        if ended.len() < MAX_SESSIONS {
+            ended.insert(id, (now, s.presence()));
+        }
+    }
+
+    /// What the relay saw of each slot of session `id`, live or (for an
+    /// hour) after it closed; `None` when it never knew the session.
+    pub fn presence(&self, id: u32) -> Option<Vec<Presence>> {
+        if let Some(s) = self.get(id) {
+            return Some(lock(&s).presence());
+        }
+        lock(&self.ended).get(&id).map(|(_, p)| p.clone())
     }
 
     /// TURN bytes (received, sent) slot `slot` of session `id` reported;
@@ -271,9 +323,25 @@ impl Relay {
     /// Drop idle / ancient sessions; returns how many went.
     pub fn expire(&self, now: Instant) -> usize {
         let mut map = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        let before = map.len();
-        map.retain(|_, s| lock(s).alive(now));
-        before - map.len()
+        let mut gone = Vec::new();
+        map.retain(|id, s| {
+            let s = lock(s);
+            let keep = s.alive(now);
+            if !keep {
+                gone.push((*id, s.presence()));
+            }
+            keep
+        });
+        std::mem::drop(map);
+        let n = gone.len();
+        let mut ended = lock(&self.ended);
+        ended.retain(|_, (t, _)| now.duration_since(*t) < ENDED_KEEP);
+        for (id, p) in gone {
+            if ended.len() < MAX_SESSIONS {
+                ended.insert(id, (now, p));
+            }
+        }
+        n
     }
 
     fn send(&self, route: &Route, bytes: Vec<u8>) {
@@ -346,6 +414,7 @@ impl Relay {
         }
         let moved = slot.route.as_ref() != Some(from);
         slot.heard = now;
+        slot.joined = true;
         if h.kind == wire::BYE {
             slot.route = None;
             slot.bye = true;
