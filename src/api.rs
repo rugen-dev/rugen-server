@@ -336,7 +336,7 @@ fn clean_id(s: &str) -> String {
 
 fn clean_name(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | '!' | '?' | '.'))
+        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | '!' | '?' | '.' | '\''))
         .take(24)
         .collect::<String>()
         .trim()
@@ -2731,7 +2731,13 @@ pub(crate) mod tests {
         let api = api();
         let (_, ka) = register(&api);
         let (_, kb) = register(&api);
-        let room = json_of(api.handle(req("POST", "/room", json!({"key": ka}))));
+        let room = json_of(api.handle(req(
+            "POST",
+            "/room",
+            json!({"key": ka, "name": "AXEL'S ROOM"}),
+        )));
+        // apostrophes survive ("PLAYER'S ROOM", not "PLAYERS ROOM")
+        assert_eq!(room["name"], "AXEL'S ROOM");
         let code = room["code"].as_str().unwrap().to_string();
         assert_eq!(code.len(), 5);
         assert!(
