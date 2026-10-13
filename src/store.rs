@@ -1503,6 +1503,20 @@ impl Store {
         Ok(settled)
     }
 
+    /// What the re-simulation said about a match (`None`: not run).
+    #[cfg(test)]
+    pub fn resim_note(&self, match_id: u64) -> DbResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT resim FROM matches WHERE id = ?1",
+                [match_id as i64],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Setup JSON, ranked flag, players and the reports (reporter, data) of a match.
     #[allow(clippy::type_complexity)]
     pub fn match_evidence(
