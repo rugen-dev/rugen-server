@@ -1897,14 +1897,15 @@ pub fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Room / match codes: 5 unambiguous upper-case characters.
+/// Room / match codes: 5 upper-case characters without lookalikes (no
+/// `0 O 1 I 5 S 2 Z 8 B`, see [`rugen_proto::room_code`]). Codes of older
+/// servers stay valid: lookups only upper-case what players type.
 pub fn random_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut buf = [0u8; 5];
-    let _ = getrandom::getrandom(&mut buf);
-    buf.iter()
-        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-        .collect()
+    rugen_proto::room_code::generate(|| {
+        let mut b = [0u8; 1];
+        let _ = getrandom::getrandom(&mut b);
+        b[0]
+    })
 }
 
 #[cfg(test)]

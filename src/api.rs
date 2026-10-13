@@ -2727,6 +2727,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn room_codes_skip_lookalikes_and_ignore_case() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let room = json_of(api.handle(req("POST", "/room", json!({"key": ka}))));
+        let code = room["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 5);
+        assert!(
+            code.chars()
+                .all(|c| rugen_proto::room_code::ALPHABET.contains(c)),
+            "{code}"
+        );
+        // typed in lower case, with stray spaces
+        let joined = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{}/join", code.to_ascii_lowercase()),
+            json!({"key": kb}),
+        )));
+        assert_eq!(joined["code"], code.as_str());
+        for _ in 0..200 {
+            let c = random_code();
+            assert!(
+                !c.contains(['0', 'O', '1', 'I', '5', 'S', '2', 'Z', '8', 'B']),
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
     fn room_lifecycle_password_spectators_kick() {
         let kit = Kit::new();
         let api = api();
