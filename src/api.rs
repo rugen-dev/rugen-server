@@ -1157,6 +1157,10 @@ impl Api {
                 return Err(err(409, "queue full"));
             }
             q.retain(|e| e.id != a.id);
+            // a match found earlier and learned from the hub push (the
+            // `found` entry only clears on a poll) is over for a player who
+            // queues again: never hand it back as this search's result
+            lock(&self.found).remove(&a.id);
             q.push(QueueEntry {
                 id: a.id,
                 rating: a.rating,
@@ -2562,6 +2566,33 @@ pub(crate) mod tests {
         json_of(upload(api, keys[0], &kit.stage.0, &kit.stage.1, 1 << 20));
         let last = json_of(upload(api, keys[1], &kit.b.0, &kit.b.1, 1 << 20));
         assert_eq!(last["complete"], true);
+    }
+
+    /// A match learned from the hub push leaves its `found` entry behind
+    /// (only a poll clears it): queueing again must start a new search,
+    /// not hand back that old match.
+    #[test]
+    fn queueing_again_never_returns_an_old_match() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (_, kc) = register(&api);
+        let q = |k: &str| {
+            json_of(api.handle(req("POST", "/queue", json!({"key": k, "ranked": false}))))
+        };
+        q(&ka);
+        let first = q(&kb)["found"]["match_id"].as_u64().unwrap();
+        // A never polls (it saw the push), leaves that matchup and queues again
+        let again = q(&ka);
+        assert!(
+            again["found"].is_null(),
+            "old match {first} handed back: {again}"
+        );
+        assert_eq!(again["queued"], true);
+        let next = q(&kc)["found"]["match_id"].as_u64().unwrap();
+        assert_ne!(next, first);
+        let fa = json_of(api.handle(req("GET", &format!("/queue?key={ka}"), Value::Null)));
+        assert_eq!(fa["found"]["match_id"].as_u64(), Some(next));
     }
 
     #[test]
