@@ -2,9 +2,8 @@
 # no per-push builds); arm64 is opt-in on manual runs because it builds
 # under QEMU and takes much longer.
 name: Server image
+# Manual only (the official server is built by Dokploy from main).
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       arm64:

@@ -1,9 +1,8 @@
 # Standalone rugen-server binaries for people who don't use Docker.
 # Tags only (free tier); the container image is server-image.yml.
 name: Release
+# Manual only: run by hand on a tag when standalone binaries are needed.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 env:

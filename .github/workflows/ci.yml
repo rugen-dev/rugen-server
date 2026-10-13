@@ -1,7 +1,7 @@
 name: CI
+# Pull requests and manual runs only: pushes to main build and test locally.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   pull_request:
 
 env:
