@@ -361,6 +361,10 @@ async fn any(
                 .get(crate::compat::API_HEADER)
                 .and_then(|v| v.to_str().ok()),
         ),
+        engine: headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::compat::engine_version),
         bearer: headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())

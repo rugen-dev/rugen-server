@@ -121,6 +121,9 @@ pub struct Request {
     pub ip: Option<std::net::IpAddr>,
     /// The client's lobby API ([`crate::compat::api_of`]: 4 unless it says).
     pub api: u32,
+    /// The client's game version from its `User-Agent`
+    /// ([`crate::compat::engine_version`]); `None` for other clients.
+    pub engine: Option<String>,
     /// `Authorization: Bearer` (admin calls).
     pub bearer: Option<String>,
 }
@@ -179,6 +182,9 @@ struct Room {
     matchup: Option<u64>,
     /// The host's API: only clients of the same API may join.
     api: u32,
+    /// The host's game version: only clients of the same version may join
+    /// (both sides run the same simulation).
+    engine: Option<String>,
 }
 
 impl Room {
@@ -206,6 +212,8 @@ struct QueueEntry {
     last_poll: Instant,
     /// Only entries of the same API meet.
     api: u32,
+    /// Only entries of the same game version meet (unknown meets anyone).
+    engine: Option<String>,
 }
 
 #[derive(Default)]
@@ -531,6 +539,19 @@ impl Api {
         if let Some(session) = session {
             self.relay.close(session);
             log::info!("match {match_id}: result settled, relay session {session:08x} closed");
+        }
+        // the players were in the fight, not polling the room: they are
+        // fresh members now (a match outlasts MEMBER_TIMEOUT_SECS, and the
+        // challenger used to be dropped from the room, no REMATCH possible)
+        let now = Instant::now();
+        for r in lock(&self.rooms).values_mut() {
+            let Some(run) = r.running.as_ref().filter(|run| run.match_id == match_id) else {
+                continue;
+            };
+            let slots = run.slots.clone();
+            for m in r.members.iter_mut().filter(|m| slots.contains(&m.account)) {
+                m.last_seen = m.last_seen.max(now);
+            }
         }
     }
 
@@ -958,6 +979,7 @@ impl Api {
             running: None,
             matchup: None,
             api: req.api,
+            engine: req.engine.clone(),
         };
         let view = self.room_view(&s, &code, &room, me.id);
         rooms.insert(code.clone(), room);
@@ -983,6 +1005,12 @@ impl Api {
             // players and spectators alike need to read the host's fighters
             if r.api != req.api {
                 return Err(err(409, &crate::compat::room_refusal(req.api, r.api)));
+            }
+            // and simulate them the same way
+            if let (Some(mine), Some(host)) = (&req.engine, &r.engine)
+                && mine != host
+            {
+                return Err(err(409, &crate::compat::engine_refusal(mine, host)));
             }
             if let Some(phc) = &r.password {
                 let given = str_field(v, "password", 64).unwrap_or_default();
@@ -1142,6 +1170,10 @@ impl Api {
                 return Err(err(409, "queue full"));
             }
             q.retain(|e| e.id != a.id);
+            // a match found earlier and learned from the hub push (the
+            // `found` entry only clears on a poll) is over for a player who
+            // queues again: never hand it back as this search's result
+            lock(&self.found).remove(&a.id);
             q.push(QueueEntry {
                 id: a.id,
                 rating: a.rating,
@@ -1152,6 +1184,7 @@ impl Api {
                 since: Instant::now(),
                 last_poll: Instant::now(),
                 api: req.api,
+                engine: req.engine.clone(),
             });
         }
         log::info!(
@@ -1223,6 +1256,7 @@ impl Api {
                     max_ping: e.max_ping,
                     ranked: e.ranked,
                     api: e.api,
+                    engine: e.engine.clone(),
                 })
                 .collect()
         };
@@ -1691,6 +1725,16 @@ impl Api {
 
 // ---- matchup phase, packages, desync, re-simulation
 
+/// The game version a match was played with (its setup's `engine`,
+/// recorded since 0.6.2 servers; older setups have none).
+fn setup_engine(setup: &str) -> Option<String> {
+    serde_json::from_str::<Value>(setup)
+        .ok()?
+        .get("engine")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// What may put a fingerprint on the blocklist automatically.
 enum AutoCause<'a> {
     Liar,
@@ -1941,6 +1985,9 @@ impl Api {
             "p1_fp": p1, "p2_fp": p2, "stage_fp": st,
             "rules": m.rules,
             "verdict": m.verdict.as_ref().map(|v| v.kind),
+            // the game version both clients run (equal, see ready_agreed):
+            // only a server simulating that version may re-simulate it
+            "engine": m.ready[0].as_ref().and_then(|r| crate::compat::engine_version(&r.engine)),
         })
         .to_string();
         db(store.set_setup(m.id, &setup))?;
@@ -2239,6 +2286,22 @@ impl Api {
             let Some((_, longest)) = reports.iter().max_by_key(|(_, r)| r.inputs.len()) else {
                 return;
             };
+            // another engine version may simulate the match differently:
+            // its result stays as the reports leave it (an ordinary
+            // dispute), nobody is judged by a simulation they did not run
+            let engine = setup_engine(&setup);
+            if !crate::compat::can_resimulate(engine.as_deref()) {
+                let note = format!(
+                    "unverified (version): played on rugen {}, this server simulates rugen {}",
+                    engine.as_deref().unwrap_or("?"),
+                    crate::compat::SIM_ENGINE.unwrap_or("?")
+                );
+                log::info!("match {match_id}: {note}");
+                if let Err(e) = lock(&api.store).resolve_dispute(match_id, None, &note) {
+                    log::error!("match {match_id}: {e}");
+                }
+                return;
+            }
             let note;
             let winner =
                 match crate::resim::replay(&api.packages, &cfg, &setup, &longest.inputs, None) {
@@ -2301,6 +2364,16 @@ pub(crate) mod tests {
         static CLIENT_API: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::compat::API) };
     }
 
+    thread_local! {
+        /// The game version test requests announce (`None`: no `User-Agent`).
+        static CLIENT_ENGINE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Requests of the rest of this test come from rugen `v` (`None`: unknown).
+    pub fn client_engine(v: Option<&str>) {
+        CLIENT_ENGINE.with(|c| *c.borrow_mut() = v.map(str::to_string));
+    }
+
     /// Requests of the rest of this test come from clients of `api`.
     pub fn client_api(api: u32) {
         CLIENT_API.with(|c| c.set(api));
@@ -2328,6 +2401,7 @@ pub(crate) mod tests {
             body,
             ip: None,
             api: CLIENT_API.with(|c| c.get()),
+            engine: CLIENT_ENGINE.with(|c| c.borrow().clone()),
             bearer: None,
         }
     }
@@ -2505,6 +2579,33 @@ pub(crate) mod tests {
         json_of(upload(api, keys[0], &kit.stage.0, &kit.stage.1, 1 << 20));
         let last = json_of(upload(api, keys[1], &kit.b.0, &kit.b.1, 1 << 20));
         assert_eq!(last["complete"], true);
+    }
+
+    /// A match learned from the hub push leaves its `found` entry behind
+    /// (only a poll clears it): queueing again must start a new search,
+    /// not hand back that old match.
+    #[test]
+    fn queueing_again_never_returns_an_old_match() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (_, kc) = register(&api);
+        let q = |k: &str| {
+            json_of(api.handle(req("POST", "/queue", json!({"key": k, "ranked": false}))))
+        };
+        q(&ka);
+        let first = q(&kb)["found"]["match_id"].as_u64().unwrap();
+        // A never polls (it saw the push), leaves that matchup and queues again
+        let again = q(&ka);
+        assert!(
+            again["found"].is_null(),
+            "old match {first} handed back: {again}"
+        );
+        assert_eq!(again["queued"], true);
+        let next = q(&kc)["found"]["match_id"].as_u64().unwrap();
+        assert_ne!(next, first);
+        let fa = json_of(api.handle(req("GET", &format!("/queue?key={ka}"), Value::Null)));
+        assert_eq!(fa["found"]["match_id"].as_u64(), Some(next));
     }
 
     #[test]
@@ -3051,12 +3152,10 @@ pub(crate) mod tests {
     #[cfg(feature = "resim")]
     #[test]
     fn disputed_match_is_resimulated_and_settled() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../reference/mugen-1.1b1");
-        if !root.join("chars/kfm/kfm.def").exists() {
+        let Some(root) = crate::e2e::reference() else {
             eprintln!("reference tree missing; skipping");
             return;
-        }
+        };
         let data = root.join("data");
         let api = Api::new(
             Store::open(None).unwrap(),
@@ -3148,7 +3247,9 @@ pub(crate) mod tests {
         );
         let (aid, ka) = register(&api);
         let (bid, kb) = register(&api);
-        let setup = json!({"p1_fp": fps[0], "p2_fp": fps[0], "stage_fp": fps[1], "rules": Rules::default()});
+        // played on the version this server simulates
+        let setup = json!({"p1_fp": fps[0], "p2_fp": fps[0], "stage_fp": fps[1],
+            "rules": Rules::default(), "engine": crate::compat::SIM_ENGINE});
         let mid = lock(&api.store)
             .new_match([aid, bid], true, &setup.to_string())
             .unwrap();
@@ -3178,6 +3279,116 @@ pub(crate) mod tests {
         let a = lock(&api.store).by_id(aid).unwrap().unwrap();
         assert_eq!(a.wins, 1);
         assert!(a.rating > 1200);
+    }
+
+    /// A disputed match played on another game version (or one recorded
+    /// before setups carried it) is never re-simulated: it stays an
+    /// ordinary dispute, noted "unverified (version)", nobody's rating moves
+    /// and nothing is flagged or blocked.
+    #[test]
+    fn other_versions_are_not_resimulated() {
+        let api = Api::new(
+            Store::open(None).unwrap(),
+            ApiConfig {
+                name: "t".into(),
+                resim: Some(ResimConfig {
+                    data: "/nonexistent".into(),
+                    motif: "/nonexistent".into(),
+                }),
+                ..Default::default()
+            },
+            Arc::new(Relay::default()),
+        );
+        let fp = |c: char| format!("rugen-fp-2:{}", c.to_string().repeat(64));
+        for engine in [json!("0.0.1"), Value::Null] {
+            let (aid, ka) = register(&api);
+            let (bid, kb) = register(&api);
+            let setup = json!({"p1_fp": fp('a'), "p2_fp": fp('b'), "stage_fp": fp('c'),
+                "rules": Rules::default(), "engine": engine});
+            let mid = lock(&api.store)
+                .new_match([aid, bid], true, &setup.to_string())
+                .unwrap();
+            for (key, winner, checksum) in [(&ka, aid, 1u64), (&kb, bid, 2u64)] {
+                json_of(api.handle(req(
+                    "POST",
+                    "/result",
+                    json!({"key": key, "match_id": mid, "winner": winner,
+                    "inputs": "00000000", "frames": 1, "checksum": checksum}),
+                )));
+            }
+            let t = Instant::now();
+            let note = loop {
+                if let Some(n) = lock(&api.store).resim_note(mid).unwrap() {
+                    break n;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "resim never answered"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(note.starts_with("unverified (version)"), "{note}");
+            let s = lock(&api.store);
+            assert!(s.is_disputed(mid).unwrap(), "stays an ordinary dispute");
+            for id in [aid, bid] {
+                let a = s.by_id(id).unwrap().unwrap();
+                assert_eq!((a.wins, a.losses, a.rating), (0, 0, 1200));
+            }
+            for f in [fp('a'), fp('b'), fp('c')] {
+                assert_eq!(s.desyncs_for(&f).unwrap(), 0);
+                assert_eq!(s.liars_for(&f).unwrap(), 0);
+            }
+            assert!(s.blocklist().unwrap().is_empty());
+        }
+    }
+
+    /// Players on different game versions never meet: the queue keeps them
+    /// apart and a room refuses the other version, with who must update.
+    #[test]
+    fn other_game_versions_never_meet() {
+        let api = api();
+        let (_, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (_, kc) = register(&api);
+        let queue = |key: &str, engine: Option<&str>| {
+            client_engine(engine);
+            json_of(api.handle(req(
+                "POST",
+                "/queue",
+                json!({"key": key, "char": "kfm", "ranked": true}),
+            )))
+        };
+        assert!(queue(&ka, Some("0.6.1"))["found"].is_null());
+        assert!(
+            queue(&kb, Some("0.6.2"))["found"].is_null(),
+            "0.6.1 vs 0.6.2"
+        );
+        assert!(
+            !queue(&kc, Some("0.6.2"))["found"].is_null(),
+            "0.6.2 vs 0.6.2"
+        );
+        // rooms: a 0.6.2 host
+        let (_, kh) = register(&api);
+        client_engine(Some("0.6.2"));
+        let room = json_of(api.handle(req("POST", "/room", json!({"key": kh, "name": "R"}))));
+        let code = room["code"].as_str().unwrap().to_string();
+        let (_, kj) = register(&api);
+        client_engine(Some("0.6.1"));
+        let r = api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kj, "char": "kfm"}),
+        ));
+        assert_eq!(r.status, 409);
+        assert!(String::from_utf8_lossy(&r.body).contains("NEWER RUGEN (0.6.2)"));
+        client_engine(Some("0.6.2"));
+        let r = api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": kj, "char": "kfm"}),
+        ));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        client_engine(None);
     }
 
     // ---- official vs community servers
@@ -3830,6 +4041,43 @@ pub(crate) mod tests {
         silent();
         json_of(api.handle(req("GET", "/rooms", Value::Null)));
         assert!(!lock(&api.rooms).contains_key(&code));
+    }
+
+    /// A match longer than the member timeout (nobody polls the room while
+    /// fighting) keeps both players in the room once the results settle it:
+    /// REMATCH needs the challenger still there.
+    #[test]
+    fn players_stay_in_the_room_after_a_long_match() {
+        let kit = Kit::new();
+        let api = api();
+        let (aid, ka) = register(&api);
+        let (_, kb) = register(&api);
+        let (code, id) = started_room(&api, &ka, &kb, &kit);
+        // a long fight: the last poll is older than the timeout
+        for m in lock(&api.rooms).get_mut(&code).unwrap().members.iter_mut() {
+            m.last_seen = Instant::now() - Duration::from_secs(MEMBER_TIMEOUT_SECS + 30);
+        }
+        for k in [&ka, &kb] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": id, "winner": aid}),
+            )));
+        }
+        assert_eq!(api.relay.session_count(), 0, "settled, session closed");
+        json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(lock(&api.rooms)[&code].members.len(), 2, "challenger kept");
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": ka}),
+        )));
+        let v = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/rematch"),
+            json!({"key": kb}),
+        )));
+        assert!(v["matchup"]["id"].as_u64().is_some_and(|n| n != id), "{v}");
     }
 
     #[test]

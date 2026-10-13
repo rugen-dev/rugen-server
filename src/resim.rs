@@ -96,6 +96,15 @@ pub fn replay(
         let fighter_size = rule("fighter_size")
             .and_then(rugen_sim::scale::FighterSize::parse)
             .unwrap_or_default();
+        // the room's TIME and ROUNDS, as the clients simulate them (rugen
+        // 0.6.2; only matches of this version are re-simulated)
+        let num = |k: &str| {
+            v.get("rules")
+                .and_then(|r| r.get(k))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let round_time = num("round_time").map(|t| if t == 0 { -1 } else { t as i32 });
+        let match_wins = num("rounds").map(|n| n.clamp(1, 9) as u8);
         let spec = rugen_sim::headless::MatchSpec {
             p1: &defs[0],
             p2: &defs[1],
@@ -108,11 +117,14 @@ pub fn replay(
                 air_dash: arena,
                 fast_fall: arena,
             },
-            round_time: None,
+            round_time,
             ai: [0, 0],
             fighter_size,
         };
         let mut world = rugen_sim::headless::build_world(&spec).map_err(|e| e.to_string())?;
+        if let Some(w) = match_wins {
+            world.round.config.match_wins = w;
+        }
         let r = rugen_sim::headless::replay(&mut world, inputs, stop_frame);
         Ok(Outcome {
             frames: r.frames,

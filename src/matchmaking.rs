@@ -30,6 +30,9 @@ pub struct Candidate {
     /// Lobby API of the client: players of different APIs cannot share
     /// fighters, so they never meet ([`crate::compat`]).
     pub api: u32,
+    /// Game version: both sides must run the same simulation, so only
+    /// equal versions meet (unknown meets anyone, see [`crate::compat::same_engine`]).
+    pub engine: Option<String>,
 }
 
 /// Acceptable estimated round trip between the two players after waiting
@@ -51,7 +54,10 @@ pub fn estimate(a: Option<u32>, b: Option<u32>) -> u32 {
 
 /// The pair's estimated round trip when they may meet now.
 fn acceptable(a: &Candidate, b: &Candidate) -> Option<u32> {
-    if a.ranked != b.ranked || a.api != b.api {
+    if a.ranked != b.ranked
+        || a.api != b.api
+        || !crate::compat::same_engine(a.engine.as_deref(), b.engine.as_deref())
+    {
         return None;
     }
     let gap = (a.rating - b.rating).abs();
@@ -114,6 +120,7 @@ mod tests {
             max_ping: None,
             ranked: true,
             api: 5,
+            engine: None,
         }
     }
 
@@ -128,6 +135,24 @@ mod tests {
         old2.api = 4;
         old2.ranked = true;
         assert_eq!(pairs(&[old, new, old2]), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn different_game_versions_never_meet() {
+        // 0.6.1 and 0.6.2 simulate differently: a match between them desyncs
+        let v = |id, e: Option<&str>| {
+            let mut x = c(id, 1200, Some(10), 999);
+            x.engine = e.map(str::to_string);
+            x
+        };
+        let (a, b) = (v(1, Some("0.6.1")), v(2, Some("0.6.2")));
+        assert!(pairs(&[a.clone(), b.clone()]).is_empty());
+        assert_eq!(
+            pairs(&[a.clone(), b.clone(), v(3, Some("0.6.2"))]),
+            vec![(1, 2)]
+        );
+        // a client that does not say its version meets anyone
+        assert_eq!(pairs(&[a, v(4, None)]), vec![(0, 1)]);
     }
 
     #[test]

@@ -63,6 +63,62 @@ pub fn room_refusal(mine: u32, host: u32) -> String {
     }
 }
 
+/// The engine version this server re-simulates matches with (the
+/// `rugen-sim` of `Cargo.lock`, see `build.rs`); `None` when unknown.
+pub const SIM_ENGINE: Option<&str> = option_env!("RUGEN_SIM_ENGINE");
+
+/// The game version (`0.6.2`) in a client's `User-Agent` (`rugen/0.6.2`,
+/// sent by every 0.5+ client) or a ready report's `engine` (`rugen 0.6.2`).
+/// `None` for anything else (tools, tests): such clients are never refused
+/// over their version, and their matches are never re-simulated.
+pub fn engine_version(s: &str) -> Option<String> {
+    let v = s
+        .trim()
+        .strip_prefix("rugen")?
+        .trim_start_matches(['/', ' '])
+        .split_whitespace()
+        .next()?;
+    let ok = v.split('.').count() >= 2
+        && v.split('.').all(|p| !p.is_empty())
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    (ok && v.len() <= 32 && v.starts_with(|c: char| c.is_ascii_digit())).then(|| v.to_string())
+}
+
+/// Whether two clients may play each other: the simulation must be the
+/// same on both sides, so equal game versions (unknown matches anything).
+pub fn same_engine(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Whether the server's simulation is the one a match was played with:
+/// the match's game version equals [`SIM_ENGINE`]. Anything else
+/// (another version, or unknown) is not re-simulated: replaying it with
+/// another engine could settle it wrongly and flag honest players.
+pub fn can_resimulate(match_engine: Option<&str>) -> bool {
+    matches!((match_engine, SIM_ENGINE), (Some(m), Some(s)) if m == s)
+}
+
+fn version_key(v: &str) -> Vec<u64> {
+    v.split(['.', '-'])
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+/// Why a player on game version `mine` cannot join a room whose host runs `host`.
+pub fn engine_refusal(mine: &str, host: &str) -> String {
+    if version_key(host) < version_key(mine) {
+        format!(
+            "THIS ROOM'S HOST RUNS AN OLDER RUGEN ({host}). BOTH PLAYERS NEED THE SAME VERSION."
+        )
+    } else {
+        format!("THIS ROOM'S HOST RUNS A NEWER RUGEN ({host}). UPDATE YOUR GAME TO JOIN.")
+    }
+}
+
 /// Why a package of the other generation cannot go to a client of `mine`.
 pub fn package_refusal(mine: u32) -> String {
     if is_legacy(mine) {
@@ -95,6 +151,35 @@ mod tests {
         assert_eq!(api_of(Some(" 5 ")), 5);
         assert_eq!(api_of(Some("9")), API);
         assert!(is_legacy(4) && !is_legacy(5));
+    }
+
+    #[test]
+    fn engine_versions_from_user_agent_and_ready_report() {
+        assert_eq!(engine_version("rugen/0.6.2").as_deref(), Some("0.6.2"));
+        assert_eq!(engine_version("rugen 0.6.0").as_deref(), Some("0.6.0"));
+        assert_eq!(
+            engine_version(" rugen 0.7.0-rc1 ").as_deref(),
+            Some("0.7.0-rc1")
+        );
+        assert_eq!(engine_version("rugen-server/0.6.0"), None);
+        assert_eq!(engine_version("reqwest/0.12"), None);
+        assert_eq!(engine_version("rugen/"), None);
+        assert_eq!(engine_version("rugen/x"), None);
+        assert_eq!(engine_version(""), None);
+        assert!(same_engine(Some("0.6.2"), Some("0.6.2")));
+        assert!(!same_engine(Some("0.6.1"), Some("0.6.2")));
+        assert!(same_engine(None, Some("0.6.2")));
+        assert!(engine_refusal("0.6.2", "0.6.1").contains("OLDER RUGEN (0.6.1)"));
+        assert!(engine_refusal("0.6.1", "0.6.2").contains("UPDATE YOUR GAME"));
+        assert!(engine_refusal("0.6.9", "0.6.10").contains("NEWER"));
+    }
+
+    #[test]
+    fn only_the_compiled_sim_version_is_resimulated() {
+        let sim = SIM_ENGINE.expect("build.rs reads rugen-sim from Cargo.lock");
+        assert!(can_resimulate(Some(sim)));
+        assert!(!can_resimulate(None));
+        assert!(!can_resimulate(Some("0.0.1")));
     }
 
     #[test]

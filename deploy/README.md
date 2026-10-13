@@ -303,6 +303,19 @@ result when one report matches the simulation. Matches between two rugen
 0.5 players (RGPK packages, see below) are not re-simulated: this engine
 is not theirs, so a disputed one settles as an unresolved dispute.
 
+The simulation is the engine version pinned in `Cargo.lock` (the
+`rugen-sim` tag), and two game versions may simulate the same inputs
+differently. So the server only re-simulates a match whose two clients ran
+exactly that version (the clients' version is recorded with the match when
+both report ready); a match played on any other version settles as an
+ordinary unresolved dispute, noted `unverified (version)`, and is never
+used to flag or block anyone. Rebuild and redeploy the server whenever the
+engine tag changes. Players of different game versions never meet: the
+queue pairs equal versions only (from the `User-Agent: rugen/<version>`
+every client sends) and a room refuses players and spectators of another
+version (`THIS ROOM'S HOST RUNS A NEWER RUGEN (0.6.2). UPDATE YOUR GAME TO
+JOIN.`).
+
 ### rugen 0.5 and 0.6 players on one server
 
 Since rugen 0.6 (lobby API 5) fighters travel as `.rgc` / `.rgs` with

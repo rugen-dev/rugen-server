@@ -598,7 +598,8 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     let resim = resim::ResimConfig::from_env();
     if let Some(r) = &resim {
         log::info!(
-            "disputed matches are re-simulated with {}",
+            "disputed matches of rugen {} are re-simulated with {}",
+            compat::SIM_ENGINE.unwrap_or("? (none: no rugen-sim in Cargo.lock)"),
             r.data.display()
         );
     }

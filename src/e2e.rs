@@ -34,7 +34,7 @@ fn engine_dir() -> PathBuf {
         .unwrap_or_else(|| here.join("../rugen-engine"))
 }
 
-fn reference() -> Option<PathBuf> {
+pub(crate) fn reference() -> Option<PathBuf> {
     let root = engine_dir().join("reference/mugen-1.1b1");
     root.join("chars/kfm/kfm.def").exists().then_some(root)
 }
