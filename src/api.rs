@@ -45,6 +45,10 @@
 //! GET  /v1/admin/blocklist?token=
 //! POST /v1/admin/reset_password {token, username} → {username, password} (temporary;
 //!                               every key of the account is revoked)
+//! POST /v1/admin/backup         {token} → 202 {job} | 409 running | 429 (1 per 10 min)
+//! GET  /v1/admin/backups?token= backups in the bucket {backups: [{key, name, time, size, complete}]}
+//! GET  /v1/admin/backup/status?token=  the health `backup` object + job, includes
+//!   (admin calls also take `Authorization: Bearer <RUGEN_ADMIN_TOKEN>`; see crate::backup)
 //!
 //! named accounts, API 5 only (see crate::api::accounts, rugen_proto::account)
 //! POST /v1/account/register     {username, password}             → Session
@@ -65,6 +69,8 @@
 //! MatchInfo (`found` of GET/POST /queue and the `found` push)
 //!                                high_ping: bool
 //! GET /health                    relay: {sessions, forwarded, dropped, queue_drops}
+//!                                backup: {configured, status, provider, retention_days,
+//!                                  last_success, last_error, last_size_bytes, next_at, running}
 //! ```
 //!
 //! `high_ping` is true when the estimated player ↔ player round trip is
@@ -91,6 +97,7 @@ use rugen_proto::{
 };
 use serde_json::{Value, json};
 
+use crate::backup::{BackupSetting, Backups, Snapshot, StartError, Trigger};
 use crate::hub::Hub;
 use crate::matchmaking::{self, Candidate};
 use crate::matchup::{Matchup, Running, check_decl};
@@ -114,6 +121,8 @@ pub struct Request {
     pub ip: Option<std::net::IpAddr>,
     /// The client's lobby API ([`crate::compat::api_of`]: 4 unless it says).
     pub api: u32,
+    /// `Authorization: Bearer` (admin calls).
+    pub bearer: Option<String>,
 }
 
 pub struct Response {
@@ -217,6 +226,8 @@ pub struct ApiConfig {
     /// `RUGEN_HIGH_PING_MS`: queue pairs estimated above this are flagged
     /// `high_ping` (0 = [`matchmaking::HIGH_PING_MS`]).
     pub high_ping_ms: u32,
+    /// `RUGEN_BACKUP_*` ([`crate::backup`]).
+    pub backup: BackupSetting,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -275,6 +286,8 @@ pub struct Api {
     health: Mutex<Option<(Instant, Value)>>,
     /// Failed logins per username / address ([`accounts`]).
     logins: Mutex<LoginGuard>,
+    /// S3 backups: configuration, running job, schedule.
+    pub backups: Arc<Backups>,
 }
 
 /// How long a computed `/health` body is served from the cache.
@@ -407,6 +420,7 @@ impl Api {
             })
             .expect("a temporary packages directory");
         let turn = cfg.turn.clone().map(Turn::new);
+        let backups = Backups::new(std::mem::take(&mut cfg.backup), cfg.data.as_deref());
         Arc::new_cyclic(|me| Self {
             store: Mutex::new(store),
             rooms: Mutex::new(HashMap::new()),
@@ -424,7 +438,36 @@ impl Api {
             seen: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
             logins: Mutex::new(LoginGuard::default()),
+            backups,
         })
+    }
+
+    /// A consistent copy of the database at `out`: through a second
+    /// connection when the store is on disk (the store lock is never held),
+    /// else (in-memory tests) through the store itself.
+    pub fn snapshot(&self, out: &std::path::Path) -> Result<(), String> {
+        match &self.cfg.data {
+            Some(d) => crate::backup::snapshot_file(&d.join("rugen.db"), out),
+            None => {
+                let _ = std::fs::remove_file(out);
+                lock(&self.store)
+                    .backup_to(out)
+                    .map_err(|e| format!("snapshot: {e}"))
+            }
+        }
+    }
+
+    fn snapshotter(&self) -> Snapshot {
+        let me = self.me.clone();
+        Arc::new(move |out: &std::path::Path| match me.upgrade() {
+            Some(api) => api.snapshot(out),
+            None => Err("server stopping".into()),
+        })
+    }
+
+    /// Start the daily backup schedule (no-op when backups are off).
+    pub fn start_backup_schedule(&self) {
+        self.backups.spawn_scheduler(self.snapshotter());
     }
 
     fn high_ping_ms(&self) -> u32 {
@@ -568,6 +611,8 @@ impl Api {
                     "dropped": self.relay.dropped.load(std::sync::atomic::Ordering::Relaxed),
                     "queue_drops": self.relay.queue_drops.load(std::sync::atomic::Ordering::Relaxed),
                 });
+                // backup state: no endpoint, bucket or credentials
+                v["backup"] = self.backups.health();
                 *lock(&self.health) = Some((Instant::now(), v.clone()));
                 Ok(Response::json(200, &v))
             }
@@ -663,6 +708,8 @@ impl Api {
             ("POST", ["v1", "account", op]) => self.account(&req, &v, op),
             ("POST", ["v1", "admin", op]) => self.admin(&req, &v, op),
             ("GET", ["v1", "admin", "blocklist"]) => self.admin(&req, &v, "blocklist"),
+            ("GET", ["v1", "admin", "backups"]) => self.admin(&req, &v, "backups"),
+            ("GET", ["v1", "admin", "backup", "status"]) => self.admin(&req, &v, "backup_status"),
             _ => Err(err(404, "no such route")),
         }
     }
@@ -1466,14 +1513,29 @@ impl Api {
         if self.truth.cfg.admin_token.is_none() {
             return Err(err(404, "admin api disabled (set RUGEN_ADMIN_TOKEN)"));
         }
-        let token = v
-            .get("token")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let token = req
+            .bearer
+            .clone()
+            .or_else(|| v.get("token").and_then(Value::as_str).map(str::to_string))
             .or_else(|| req.query.get("token").cloned())
             .unwrap_or_default();
         if !self.truth.admin_ok(&token) {
             return Err(err(403, "bad admin token"));
+        }
+        match op {
+            "backup" => return self.backup_now(),
+            "backups" => {
+                if self.backups.config().is_none() {
+                    return Err(err(404, "backups are not configured (RUGEN_BACKUP_S3)"));
+                }
+                return self
+                    .backups
+                    .list()
+                    .map(|l| Response::json(200, &l))
+                    .map_err(|e| err(502, &e));
+            }
+            "backup_status" => return ok(&self.backups.status()),
+            _ => {}
         }
         if op == "reset_password" {
             let username = str_field(v, "username", 64).unwrap_or_default();
@@ -1524,6 +1586,31 @@ impl Api {
                 "sequence": f.sequence, "issued_at": f.issued_at, "blocked": f.blocked.len(),
             })),
         }))
+    }
+
+    /// `POST /v1/admin/backup`: start one now (202 + job id).
+    fn backup_now(&self) -> Res {
+        match self.backups.start(Trigger::Manual, self.snapshotter()) {
+            Ok(job) => {
+                log::info!("admin: backup {job} started");
+                Ok(Response::json(
+                    202,
+                    &json!({ "job": job, "state": "running" }),
+                ))
+            }
+            Err(StartError::Running(job)) => Err(Response::json(
+                409,
+                &json!({ "error": "a backup is running", "job": job }),
+            )),
+            Err(StartError::Cooldown(secs)) => Err(Response::json(
+                429,
+                &json!({ "error": "one manual backup per 10 minutes", "retry_after": secs }),
+            )),
+            Err(StartError::Off) => Err(match &self.backups.setting {
+                BackupSetting::Invalid(e) => err(503, e),
+                _ => err(404, "backups are not configured (RUGEN_BACKUP_S3)"),
+            }),
+        }
     }
 
     /// Re-judge every matchup still being decided (the blocklist or the
@@ -2241,6 +2328,7 @@ pub(crate) mod tests {
             body,
             ip: None,
             api: CLIENT_API.with(|c| c.get()),
+            bearer: None,
         }
     }
 
@@ -4384,6 +4472,107 @@ pub(crate) mod tests {
             json_of(login(&api, "manydevices", "simple"));
         }
         assert!(!key_works(&api, &first), "the oldest device was dropped");
+    }
+
+    #[test]
+    fn admin_backup_endpoints() {
+        let fake = crate::s3_fake::FakeS3::start("bk", "AKID", "SECRET", "us-east-1");
+        let url = format!("s3+http://AKID:SECRET@127.0.0.1:{}/bk/srv", fake.port);
+        let api = Api::new(
+            Store::open(None).unwrap(),
+            ApiConfig {
+                truth: TruthConfig {
+                    admin_token: Some("tok".into()),
+                    ..TruthConfig::default()
+                },
+                backup: BackupSetting::parse(Some(&url), Some("30"), None),
+                ..Default::default()
+            },
+            Arc::new(Relay::default()),
+        );
+        register(&api);
+        let health = json_of(api.handle(req("GET", "/health", Value::Null)));
+        let b = &health["backup"];
+        assert_eq!(b["configured"], true);
+        assert_eq!(b["provider"], "other");
+        assert_eq!(b["retention_days"], 30);
+        assert!(b.get("interval_hours").is_none());
+        let text = b.to_string();
+        assert!(!text.contains("127.0.0.1") && !text.contains("bk") && !text.contains("AKID"));
+
+        let post = |bearer: Option<&str>| {
+            let mut r = req("POST", "/v1/admin/backup", json!({}));
+            r.bearer = bearer.map(str::to_string);
+            api.handle(r)
+        };
+        assert_eq!(post(None).status, 403);
+        assert_eq!(post(Some("nope")).status, 403);
+        let r = post(Some("tok"));
+        assert_eq!(r.status, 202, "{}", String::from_utf8_lossy(&r.body));
+        let job = serde_json::from_slice::<Value>(&r.body).unwrap()["job"].clone();
+        // running → 409; done → 429 (one manual backup per 10 minutes)
+        assert!(matches!(post(Some("tok")).status, 409 | 429));
+        let status =
+            || json_of(api.handle(req("GET", "/v1/admin/backup/status?token=tok", Value::Null)));
+        let t = Instant::now();
+        while status()["running"] == true && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let st = status();
+        assert_eq!(st["job"]["id"], job);
+        assert_eq!(st["job"]["state"], "done", "{st}");
+        assert!(st["last_success"].is_string() && st["next_at"].is_string());
+        assert!(st["last_error"].is_null());
+        assert!(st["last_size_bytes"].as_u64().unwrap() > 0);
+        let r = post(Some("tok"));
+        assert_eq!(r.status, 429);
+        assert!(
+            serde_json::from_slice::<Value>(&r.body).unwrap()["retry_after"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let list = json_of(api.handle(req("GET", "/v1/admin/backups?token=tok", Value::Null)));
+        let rows = list["backups"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]["key"]
+                .as_str()
+                .unwrap()
+                .starts_with("srv/rugen-backup-")
+        );
+        assert_eq!(rows[0]["complete"], true);
+        assert_eq!(fake.keys().len(), 2, "database + manifest");
+        assert_eq!(*fake.rejected.lock().unwrap(), 0);
+        assert_eq!(
+            api.handle(req("GET", "/v1/admin/backups?token=bad", Value::Null))
+                .status,
+            403
+        );
+
+        // without RUGEN_BACKUP_S3: 404; misconfigured: 503 with the reason
+        let off = official_api();
+        let mut r = req("POST", "/v1/admin/backup", json!({"token": "tok"}));
+        r.bearer = None;
+        assert_eq!(off.handle(r).status, 404);
+        let health = json_of(off.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(health["backup"]["configured"], false);
+        assert_eq!(health["backup"]["status"], "off");
+        let bad = Api::new(
+            Store::open(None).unwrap(),
+            ApiConfig {
+                truth: TruthConfig {
+                    admin_token: Some("tok".into()),
+                    ..TruthConfig::default()
+                },
+                backup: BackupSetting::parse(Some("s3://k:SECRET@h"), None, None),
+                ..Default::default()
+            },
+            Arc::new(Relay::default()),
+        );
+        let r = bad.handle(req("POST", "/v1/admin/backup", json!({"token": "tok"})));
+        assert_eq!(r.status, 503);
+        assert!(!String::from_utf8_lossy(&r.body).contains("SECRET"));
     }
 
     #[test]

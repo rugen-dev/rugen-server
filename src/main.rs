@@ -58,12 +58,23 @@
 //! RUGEN_RATE_REGISTER           registrations per IP per minute    30
 //! RUGEN_RATE_RELAY              /relay upgrades per IP per 10 s    300 (never charged to the API)
 //! RUGEN_HIGH_PING_MS            queue pairs above this: high_ping  200
+//! RUGEN_RATE_ADMIN              admin calls per IP per minute      30
+//!
+//! backups to any S3-compatible bucket (see `backup`), one automatic backup a day at 03:00 UTC
+//! RUGEN_BACKUP_S3               s3://KEY:SECRET@HOST/BUCKET[/prefix][?region=auto]   (off)
+//!                               s3+http:// for plain HTTP (local MinIO), ?style=virtual
+//! RUGEN_BACKUP_RETENTION_DAYS   days backups are kept (the newest always)  7
+//! RUGEN_BACKUP_INCLUDE          extras: packages, signing-key       (none)
 //! ```
 //!
 //! A server is **official** when its signing key is the official key;
 //! otherwise it is a community server that enforces the official feed.
 //!
 //! `rugen-server --backup out.db` writes a consistent copy of the database.
+//! `rugen-server --backup-now` uploads one backup to `RUGEN_BACKUP_S3` now.
+//! `rugen-server --restore <object key | name | latest>` downloads a backup,
+//! verifies its sha256 and swaps it in as `rugen.db` (the old one is kept as
+//! `rugen.db.<time>.bak`); the server must be stopped.
 //! `rugen-server --healthcheck` probes `GET /health` on the bind port and
 //! exits 0 / 1 (container health checks without curl).
 //! `rugen-server --gen-key` prints a new signing key pair.
@@ -79,6 +90,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod backup;
 mod compat;
 #[cfg(test)]
 mod e2e;
@@ -92,6 +104,9 @@ mod packages;
 mod password;
 mod relay;
 mod resim;
+mod s3;
+#[cfg(test)]
+mod s3_fake;
 mod store;
 #[cfg(test)]
 mod testkit;
@@ -223,12 +238,14 @@ fn main() {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
             "rugen-server [--bind 0.0.0.0:8080] [--udp-bind 0.0.0.0:7001|off] [--data /data] [--name NAME] [--healthcheck] [--backup out.db]\n\
+             rugen-server --backup-now | --restore <object key|name|latest>\n\
              rugen-server --gen-key | --block <fingerprint> [--reason text] | --unblock <fingerprint> | --blocklist\n\
              rugen-server --delete-accounts <name prefix> [--yes] | --reset-password <username>\n\
              env: RUGEN_BIND RUGEN_UDP_BIND RUGEN_UDP_PUBLIC RUGEN_PUBLIC_URL RUGEN_DATA RUGEN_NAME RUGEN_MOTD RUST_LOG\n\
              \x20    RUGEN_SIGNING_KEY RUGEN_SIGNING_KEY_FILE RUGEN_OFFICIAL_KEY RUGEN_OFFICIAL_URL RUGEN_OFFICIAL_PULL\n\
              \x20    RUGEN_ADMIN_TOKEN RUGEN_AUTO_BLOCK_LIARS RUGEN_AUTO_BLOCK_DESYNCS RUGEN_AUTO_BLOCK_ANALYSIS\n\
-             \x20    RUGEN_WORKERS RUGEN_RATE_ACCOUNT RUGEN_RATE_IP RUGEN_RATE_ANON RUGEN_RATE_REGISTER RUGEN_RATE_RELAY RUGEN_HIGH_PING_MS"
+             \x20    RUGEN_WORKERS RUGEN_RATE_ACCOUNT RUGEN_RATE_IP RUGEN_RATE_ANON RUGEN_RATE_REGISTER RUGEN_RATE_RELAY RUGEN_RATE_ADMIN RUGEN_HIGH_PING_MS\n\
+             \x20    RUGEN_BACKUP_S3 RUGEN_BACKUP_RETENTION_DAYS RUGEN_BACKUP_INCLUDE"
         );
         return;
     }
@@ -418,7 +435,88 @@ fn cgroup_cpus() -> Option<usize> {
     best.map(|c| c.ceil() as usize)
 }
 
+/// `--restore <which>`: download, verify and swap in a backup (server
+/// stopped). True when it ran.
+fn restore_cli(s: &Settings) -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(i) = args.iter().position(|a| a == "--restore") else {
+        return Ok(false);
+    };
+    let which = args
+        .get(i + 1)
+        .filter(|p| !p.starts_with("--"))
+        .ok_or("--restore needs an object key, a backup name or `latest`")?;
+    let cfg = match backup::BackupSetting::from_env() {
+        backup::BackupSetting::On(c) => c,
+        backup::BackupSetting::Off => return Err("--restore: set RUGEN_BACKUP_S3".into()),
+        backup::BackupSetting::Invalid(e) => return Err(format!("--restore: {e}").into()),
+    };
+    // a running server keeps the database open: refuse
+    if healthcheck_quiet(&s.bind) {
+        return Err(format!(
+            "--restore: a server answers on {}; stop it first (the database is swapped on disk)",
+            s.bind
+        )
+        .into());
+    }
+    let report = backup::restore(&cfg, &s.data, which).map_err(|e| format!("--restore: {e}"))?;
+    println!("{report}");
+    Ok(true)
+}
+
+/// `--backup-now`: one backup to the bucket, in this process. True when it ran.
+fn backup_now_cli(s: &Settings) -> Result<bool, Box<dyn std::error::Error>> {
+    if !std::env::args().any(|a| a == "--backup-now") {
+        return Ok(false);
+    }
+    let cfg = match backup::BackupSetting::from_env() {
+        backup::BackupSetting::On(c) => c,
+        backup::BackupSetting::Off => return Err("--backup-now: set RUGEN_BACKUP_S3".into()),
+        backup::BackupSetting::Invalid(e) => return Err(format!("--backup-now: {e}").into()),
+    };
+    let s3 = s3::S3::new(cfg.target.clone());
+    let db = s.data.join("rugen.db");
+    let work = s.data.join("backup-tmp-cli");
+    let r = backup::Runner {
+        cfg: &cfg,
+        s3: &s3,
+        data: Some(&s.data),
+        work: &work,
+    }
+    .run(&|out| backup::snapshot_file(&db, out));
+    let _ = std::fs::remove_dir(&work);
+    let r = r.map_err(|e| format!("--backup-now: {e}"))?;
+    println!(
+        "backup uploaded: {} ({} bytes, {} raw{}; {} old backups deleted)",
+        r.db_key,
+        r.size,
+        r.raw_size,
+        if r.packages_uploaded > 0 {
+            format!(", {} packages sent", r.packages_uploaded)
+        } else {
+            String::new()
+        },
+        r.deleted
+    );
+    Ok(true)
+}
+
+/// Whether something answers `GET /health` on the bind port.
+fn healthcheck_quiet(bind: &str) -> bool {
+    let port = bind
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+}
+
 fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
+    // before the store opens the database it replaces
+    if restore_cli(&s)? {
+        return Ok(());
+    }
     let mut store = store::Store::open(Some(&s.data))
         .map_err(|e| format!("database in {}: {e}", s.data.display()))?;
     if let Some(i) = std::env::args().position(|a| a == "--backup") {
@@ -427,6 +525,9 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("--backup needs an output file")?;
         store.backup_to(std::path::Path::new(&out))?;
         log::info!("backup written to {out}");
+        return Ok(());
+    }
+    if backup_now_cli(&s)? {
         return Ok(());
     }
     if blocklist_cli(&mut store)?
@@ -503,7 +604,16 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         truth: truth_cfg,
         turn: turn::TurnConfig::from_env(),
         high_ping_ms: env_f("RUGEN_HIGH_PING_MS").map_or(0, |v| v.max(1.0) as u32),
+        backup: backup::BackupSetting::from_env(),
     };
+    if let backup::BackupSetting::Invalid(e) = &cfg.backup {
+        log::error!(
+            "backups: MISCONFIGURED, disabled: {e} (value {}); the server runs without backups",
+            std::env::var("RUGEN_BACKUP_S3")
+                .map(|v| backup::redact(&v))
+                .unwrap_or_default()
+        );
+    }
     if let Some(bind) = &s.udp_bind {
         let socket = Arc::new(
             std::net::UdpSocket::bind(bind.as_str())
@@ -530,6 +640,10 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     }
     let api = api::Api::new(store, cfg, relay);
     api.sweep_packages();
+    if !matches!(api.backups.setting, backup::BackupSetting::Invalid(_)) {
+        log::info!("{}", api.backups.describe());
+    }
+    api.start_backup_schedule();
     match &api.turn {
         Some(t) => t.log_startup(&api.store_lock()),
         None => log::info!("turn: off (set RUGEN_CF_TURN_KEY_ID + RUGEN_CF_TURN_TOKEN)"),

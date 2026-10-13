@@ -57,6 +57,9 @@ pub struct Limits {
     pub register: u32,
     /// `RUGEN_RATE_RELAY`: `/relay` WebSocket upgrades per IP per 10 s.
     pub relay: u32,
+    /// `RUGEN_RATE_ADMIN`: admin calls (`/v1/admin/*`) per IP per minute
+    /// (token guessing, bucket listings).
+    pub admin: u32,
 }
 
 impl Default for Limits {
@@ -67,6 +70,7 @@ impl Default for Limits {
             anon: 300,
             register: 30,
             relay: 300,
+            admin: 30,
         }
     }
 }
@@ -87,6 +91,7 @@ impl Limits {
             anon: n("RUGEN_RATE_ANON", d.anon),
             register: n("RUGEN_RATE_REGISTER", d.register),
             relay: n("RUGEN_RATE_RELAY", d.relay),
+            admin: n("RUGEN_RATE_ADMIN", d.admin),
         }
     }
 }
@@ -97,6 +102,7 @@ enum Bucket {
     Anon(IpAddr),
     Register(IpAddr),
     Relay(IpAddr),
+    Admin(IpAddr),
     /// Hash of the account key (no database lookup in the limiter; random
     /// keys only buy the per-IP ceiling).
     Account(u64),
@@ -108,6 +114,7 @@ enum Call<'a> {
     Api { key: Option<&'a str> },
     Register,
     Relay,
+    Admin,
 }
 
 struct RateLimiter {
@@ -130,6 +137,10 @@ impl RateLimiter {
         let l = &self.limits;
         match call {
             Call::Relay => vec![(Bucket::Relay(ip), l.relay, RATE_WINDOW)],
+            Call::Admin => vec![
+                (Bucket::Ip(ip), l.ip, RATE_WINDOW),
+                (Bucket::Admin(ip), l.admin, REGISTER_WINDOW),
+            ],
             Call::Register => vec![
                 (Bucket::Ip(ip), l.ip, RATE_WINDOW),
                 (Bucket::Register(ip), l.register, REGISTER_WINDOW),
@@ -315,6 +326,8 @@ async fn any(
             || (method == Method::POST && path.starts_with("/v1/account/"))
         {
             Call::Register
+        } else if path.starts_with("/v1/admin/") {
+            Call::Admin
         } else {
             Call::Api {
                 key: key.as_deref(),
@@ -348,6 +361,11 @@ async fn any(
                 .get(crate::compat::API_HEADER)
                 .and_then(|v| v.to_str().ok()),
         ),
+        bearer: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.trim().to_string()),
     };
     let api = st.api.clone();
     match tokio::task::spawn_blocking(move || api.handle(req)).await {
@@ -805,6 +823,7 @@ mod tests {
             anon: 3,
             register: 2,
             relay: 4,
+            admin: 3,
         };
         let mut l = RateLimiter::new(limits);
         let ip: IpAddr = "100.64.0.1".parse().unwrap();
@@ -845,6 +864,16 @@ mod tests {
             "per minute"
         );
         assert!(l.allow_at(third, Call::Register, t + REGISTER_WINDOW));
+        // admin calls: their own per-minute budget per IP
+        let fourth: IpAddr = "198.51.100.5".parse().unwrap();
+        for _ in 0..3 {
+            assert!(l.allow_at(fourth, Call::Admin, t));
+        }
+        assert!(
+            !l.allow_at(fourth, Call::Admin, t + RATE_WINDOW),
+            "per minute"
+        );
+        assert!(l.allow_at(fourth, Call::Admin, t + REGISTER_WINDOW));
     }
 
     #[test]
