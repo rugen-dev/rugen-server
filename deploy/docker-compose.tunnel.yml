@@ -43,6 +43,10 @@ services:
       # empty = generated community key in /data/signing.key, admin API off
       RUGEN_SIGNING_KEY: ${RUGEN_SIGNING_KEY:-}
       RUGEN_ADMIN_TOKEN: ${RUGEN_ADMIN_TOKEN:-}
+      # daily off-site backups to an S3-compatible bucket (secret URL; empty = off)
+      RUGEN_BACKUP_S3: ${RUGEN_BACKUP_S3:-}
+      RUGEN_BACKUP_RETENTION_DAYS: ${RUGEN_BACKUP_RETENTION_DAYS:-7}
+      RUGEN_BACKUP_INCLUDE: ${RUGEN_BACKUP_INCLUDE:-}
     volumes:
       - rugen-data:/data
     # no "ports:": only the tunnel reaches the server

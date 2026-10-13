@@ -507,26 +507,107 @@ again (it is at least the current Unix time).
 | `RUGEN_RATE_REGISTER` | `30`            | registrations, logins and other `POST /v1/account/*` calls per client IP per minute |
 | `RUGEN_RATE_RELAY` | `300`              | `/relay` WebSocket upgrades per client IP per 10 s (not charged to the API budgets) |
 | `RUGEN_HIGH_PING_MS` | `200`            | queue pairs estimated above this round trip are flagged `high_ping` |
+| `RUGEN_RATE_ADMIN` | `30`               | `/v1/admin/*` calls per client IP per minute |
+| `RUGEN_BACKUP_S3`  | –                  | S3-compatible bucket for daily backups, `s3://KEY:SECRET@HOST/BUCKET[/prefix][?region=…]` (secret; see Backups) |
+| `RUGEN_BACKUP_RETENTION_DAYS` | `7`     | days backups are kept (any whole number ≥ 1; the newest is always kept) |
+| `RUGEN_BACKUP_INCLUDE` | –              | extras in backups: `packages`, `signing-key` (comma-separated) |
 
 ## Backups
 
 All state is one SQLite database (WAL mode) in the `rugen-data` volume.
-Character packages live next to it in `packages/`; they are caches and need
-no backup (size the volume for `RUGEN_PKG_MAX_TOTAL`).
+Character packages live next to it in `packages/`; they are caches that
+players upload again on demand.
+
+### Off-site: any S3-compatible bucket (daily, automatic)
+
+Create a bucket and an API key that can **read, write, list and delete
+objects in that bucket only**, then set one variable (Dokploy: Environment
+tab, it is a secret):
+
+```sh
+# Cloudflare R2 (free tier: 10 GB, no egress fees)
+RUGEN_BACKUP_S3=s3://ACCESS_KEY_ID:SECRET_ACCESS_KEY@<accountid>.r2.cloudflarestorage.com/rugen-backups?region=auto
+# AWS S3
+RUGEN_BACKUP_S3=s3://AKIA...:SECRET@s3.eu-west-1.amazonaws.com/rugen-backups?region=eu-west-1
+# MinIO on the LAN, plain HTTP, with a key prefix
+RUGEN_BACKUP_S3=s3+http://minio:minio-secret@minio.lan:9000/rugen/play-rugen-dev
+```
+
+Backblaze B2 (`s3.<region>.backblazeb2.com`) and Wasabi
+(`s3.<region>.wasabisys.com`) work the same way. Path-style addressing is
+used; add `style=virtual` (`?region=x&style=virtual`) for stores that only
+take `bucket.host`. **Percent-encode** `/ + @ : ? %` in the key or secret
+(`/` → `%2F`, `+` → `%2B`).
+
+- One backup a day at **03:00 UTC**. After a restart (every deploy), the
+  bucket is listed: if the newest backup is older than 24 h one runs 5
+  minutes after boot, otherwise the next 03:00 is waited for. Never more
+  than one automatic backup a day; a failed one is retried once an hour later.
+- `RUGEN_BACKUP_RETENTION_DAYS` (7): after each backup, backups older than
+  this are deleted; the newest one always stays. Only objects named
+  `rugen-backup-*` (and `packages/`) under the prefix are ever touched.
+- What a backup is: a consistent snapshot of `rugen.db` (`VACUUM INTO`
+  on a second connection: the server keeps serving), zstd-compressed and
+  streamed up, plus a manifest with sha256 sums, sizes and the schema
+  version:
+  `<prefix>/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.db.zst` + `.json`.
+- Not included unless asked for with `RUGEN_BACKUP_INCLUDE`:
+  - `packages`: uploaded incrementally to `<prefix>/packages/` (a package
+    already in the bucket is not sent again); can be gigabytes.
+  - `signing-key`: `<data>/signing.key`, the generated key of a community
+    server. **Risk:** anyone who can read the bucket can then sign as your
+    server. The official key normally comes from `RUGEN_SIGNING_KEY` and is
+    never in the data directory: keep it in your secret store instead.
+- Invalid settings are logged at start (credentials redacted) and shown on
+  `/health`; the server runs without backups.
+- Light by design: one copy buffer of memory for any size, streaming zstd
+  level 3, no extra process.
+
+Admin API (with `RUGEN_ADMIN_TOKEN`, as `Authorization: Bearer <token>`,
+`?token=` or `{"token": …}`):
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backup        # 202 {job}; 409 running; 429 (1 per 10 min)
+curl -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backups               # key, time, size of each backup
+curl -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backup/status
+```
+
+`GET /health` carries a `backup` object without endpoint, bucket or keys:
+`configured`, `status` (`off` / `misconfigured` / `ok` / `failing`),
+`provider` (`r2` / `aws` / `other`), `retention_days`, `last_success`,
+`last_error`, `last_size_bytes`, `next_at`, `running`.
+
+One-off from the shell: `rugen-server --backup-now`.
+
+### Restore
+
+The server must be **stopped** (Dokploy: Stop). Then, on the host, run the
+image once against the volume (enter the URL without leaving it in the shell
+history):
+
+```sh
+read -rs RUGEN_BACKUP_S3 && export RUGEN_BACKUP_S3
+docker run --rm -e RUGEN_BACKUP_S3 -v rugen_rugen-data:/data rugen-server:local --restore latest
+# or a given backup: --restore rugen-backup-20261013T030000Z-0.6.0  (a name or key from GET /v1/admin/backups)
+```
+
+It downloads the backup, checks the sha256 sums from the manifest and
+SQLite's integrity check, then swaps it in: the old database stays as
+`rugen.db.<time>.bak` (with its `-wal` / `-shm`). A backed-up signing key
+and packages are restored too (the old key is kept as `.bak`). Start the
+server again; schema migrations of newer versions apply on start.
+
+### Local copy
 
 ```sh
 # consistent online copy, from inside the container (no sqlite3 needed)
 docker compose exec rugen-server /rugen-server --backup /data/backup.db
 docker compose cp rugen-server:/data/backup.db ./rugen-$(date +%F).db
-
-# or with sqlite3 on the host, against the volume directory
-sqlite3 /var/lib/docker/volumes/rugen_rugen-data/_data/rugen.db ".backup rugen.db.bak"
 ```
 
-Restore: stop the stack, copy the file over `rugen.db` in the volume
-(delete `rugen.db-wal` / `rugen.db-shm`), start again. Schema migrations
-are embedded and applied on start; a `state.json` from the old JSON store
-is imported once automatically.
+Restore by hand: stop the stack, copy the file over `rugen.db` in the
+volume (delete `rugen.db-wal` / `rugen.db-shm`), start again. A
+`state.json` from the old JSON store is imported once automatically.
 
 ## Updating
 
