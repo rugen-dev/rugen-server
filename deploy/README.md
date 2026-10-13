@@ -537,7 +537,30 @@ Backblaze B2 (`s3.<region>.backblazeb2.com`) and Wasabi
 (`s3.<region>.wasabisys.com`) work the same way. Path-style addressing is
 used; add `style=virtual` (`?region=x&style=virtual`) for stores that only
 take `bucket.host`. **Percent-encode** `/ + @ : ? %` in the key or secret
-(`/` → `%2F`, `+` → `%2B`).
+(`/` → `%2F`, `+` → `%2B`). Surrounding whitespace and one pair of quotes
+(`"…"` or `'…'`) around `RUGEN_BACKUP_S3` and `RUGEN_BACKUP_RETENTION_DAYS`
+are ignored.
+
+The server keeps its own tree under the prefix (the part of the URL after
+the bucket; it may be empty, then the tree starts at the bucket root), with
+year / month folders:
+
+```text
+<prefix>/
+├── backups/                                   everything backups write, nothing else
+│   ├── db/2026/10/
+│   │   ├── rugen-backup-20261013T141050Z-0.6.0.db.zst   database (zstd)
+│   │   └── rugen-backup-20261013T141050Z-0.6.0.json     manifest (sha256, sizes, schema)
+│   ├── keys/2026/10/
+│   │   └── rugen-backup-20261013T141050Z-0.6.0.signing.key   with RUGEN_BACKUP_INCLUDE=signing-key
+│   └── packages/
+│       └── <fingerprint>.rgc | .rgs | .rgpk   with RUGEN_BACKUP_INCLUDE=packages
+├── chars/                                     reserved: content uploads (later)
+└── stages/                                    reserved: content uploads (later)
+```
+
+Backups never touch anything outside `<prefix>/backups/`, so the same
+bucket can hold other things.
 
 - One backup a day at **03:00 UTC**. After a restart (every deploy), the
   bucket is listed: if the newest backup is older than 24 h one runs 5
@@ -545,14 +568,23 @@ take `bucket.host`. **Percent-encode** `/ + @ : ? %` in the key or secret
   than one automatic backup a day; a failed one is retried once an hour later.
 - `RUGEN_BACKUP_RETENTION_DAYS` (7): after each backup, backups older than
   this are deleted; the newest one always stays. Only objects named
-  `rugen-backup-*` (and `packages/`) under the prefix are ever touched.
+  `rugen-backup-*` under `<prefix>/backups/` (and `backups/packages/`) are
+  ever touched.
 - What a backup is: a consistent snapshot of `rugen.db` (`VACUUM INTO`
   on a second connection: the server keeps serving), zstd-compressed and
   streamed up, plus a manifest with sha256 sums, sizes and the schema
   version:
-  `<prefix>/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.db.zst` + `.json`.
+  `<prefix>/backups/db/YYYY/MM/rugen-backup-YYYYMMDDTHHMMSSZ-<version>.db.zst` + `.json`.
+- **Old flat layout** (0.6.0 wrote `<prefix>/rugen-backup-*.db.zst` and
+  `.json` directly under the prefix): they still show up in
+  `GET /v1/admin/backups` (`"legacy": true`) and `--restore latest` falls
+  back to them while no backup of the new layout exists. After the first
+  successful backup in the new layout they are deleted automatically:
+  exactly `<prefix>/rugen-backup-*.db.zst` and `<prefix>/rugen-backup-*.json`,
+  nothing else (an old flat `.signing.key` or `<prefix>/packages/` stays;
+  delete those by hand if you had them).
 - Not included unless asked for with `RUGEN_BACKUP_INCLUDE`:
-  - `packages`: uploaded incrementally to `<prefix>/packages/` (a package
+  - `packages`: uploaded incrementally to `<prefix>/backups/packages/` (a package
     already in the bucket is not sent again); can be gigabytes.
   - `signing-key`: `<data>/signing.key`, the generated key of a community
     server. **Risk:** anyone who can read the bucket can then sign as your
@@ -568,7 +600,7 @@ Admin API (with `RUGEN_ADMIN_TOKEN`, as `Authorization: Bearer <token>`,
 
 ```sh
 curl -X POST -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backup        # 202 {job}; 409 running; 429 (1 per 10 min)
-curl -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backups               # key, time, size of each backup
+curl -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backups               # key, name, time, size, complete, legacy of each backup
 curl -H "Authorization: Bearer $TOKEN" https://play.example.com/v1/admin/backup/status
 ```
 
@@ -588,7 +620,9 @@ history):
 ```sh
 read -rs RUGEN_BACKUP_S3 && export RUGEN_BACKUP_S3
 docker run --rm -e RUGEN_BACKUP_S3 -v rugen_rugen-data:/data rugen-server:local --restore latest
-# or a given backup: --restore rugen-backup-20261013T030000Z-0.6.0  (a name or key from GET /v1/admin/backups)
+# or a given backup by name or key (from GET /v1/admin/backups):
+#   --restore rugen-backup-20261013T030000Z-0.6.0
+#   --restore backups/db/2026/10/rugen-backup-20261013T030000Z-0.6.0.db.zst
 ```
 
 It downloads the backup, checks the sha256 sums from the manifest and
