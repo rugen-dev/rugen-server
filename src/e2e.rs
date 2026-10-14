@@ -224,6 +224,8 @@ fn play(
                     // as the game does: the room's size, missing / unknown = normal
                     fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
                         .unwrap_or_default(),
+                    // as the game does: the seed of the match id
+                    seed: rugen_sim::headless::online_seed(view.id),
                 };
                 let mut w = rugen_sim::headless::build_world(&spec).unwrap();
                 let ticket = view.ticket.unwrap();
@@ -614,6 +616,8 @@ fn turn_match_through_a_tunnel_only_server() {
                     // as the game does: the room's size, missing / unknown = normal
                     fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
                         .unwrap_or_default(),
+                    // as the game does: the seed of the match id
+                    seed: rugen_sim::headless::online_seed(view.id),
                 };
                 let mut w = rugen_sim::headless::build_world(&spec).unwrap();
                 let ticket = view.ticket.unwrap();

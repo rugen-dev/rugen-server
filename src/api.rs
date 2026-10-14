@@ -2461,8 +2461,14 @@ impl Api {
             return;
         }
         let note;
-        let winner = match crate::resim::replay(&self.packages, &cfg, &setup, &longest.inputs, None)
-        {
+        let winner = match crate::resim::replay(
+            &self.packages,
+            &cfg,
+            match_id,
+            &setup,
+            &longest.inputs,
+            None,
+        ) {
             Ok(o) => {
                 // which report's checksum the simulation reproduces
                 let honest: Vec<u64> = reports
@@ -2472,6 +2478,7 @@ impl Api {
                             crate::resim::replay(
                                 &self.packages,
                                 &cfg,
+                                match_id,
                                 &setup,
                                 &longest.inputs,
                                 Some(r.frames),
@@ -3364,6 +3371,15 @@ pub(crate) mod tests {
                 .unwrap();
             fps.push(fp);
         }
+        let (aid, ka) = register(&api);
+        let (bid, kb) = register(&api);
+        // played on the version this server simulates
+        let setup = json!({"p1_fp": fps[0], "p2_fp": fps[0], "stage_fp": fps[1],
+            "rules": Rules::default(), "engine": crate::compat::SIM_ENGINE});
+        let mid = api
+            .store
+            .new_match([aid, bid], true, &setup.to_string())
+            .unwrap();
         // play it locally: P1 walks in and punches, P2 stands
         let spec = rugen_sim::headless::MatchSpec {
             p1: &root.join("chars/kfm/kfm.def"),
@@ -3376,6 +3392,8 @@ pub(crate) mod tests {
             round_time: None,
             ai: [0, 0],
             fighter_size: rugen_sim::scale::FighterSize::Normal,
+            // as the clients do: the seed of the match id
+            seed: rugen_sim::headless::online_seed(mid),
         };
         let mut world = rugen_sim::headless::build_world(&spec).unwrap();
         let mut inputs = Vec::new();
@@ -3402,15 +3420,6 @@ pub(crate) mod tests {
             again.round.wins,
             again.players.iter().map(|p| p.life).collect::<Vec<_>>()
         );
-        let (aid, ka) = register(&api);
-        let (bid, kb) = register(&api);
-        // played on the version this server simulates
-        let setup = json!({"p1_fp": fps[0], "p2_fp": fps[0], "stage_fp": fps[1],
-            "rules": Rules::default(), "engine": crate::compat::SIM_ENGINE});
-        let mid = api
-            .store
-            .new_match([aid, bid], true, &setup.to_string())
-            .unwrap();
         let hex = to_hex(&inputs);
         // A tells the truth, B claims the win with a wrong checksum
         json_of(api.handle(req(

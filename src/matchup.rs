@@ -221,7 +221,10 @@ impl Matchup {
                 .unwrap_or_default()
         };
         let (na, nb) = (name(0), name(1));
-        let mut v = verdict([&a, &b], [ra.as_ref(), rb.as_ref()], [&na, &nb], t);
+        // the match's FIGHTER SIZE changes reach (rugen 0.6.2 verdicts)
+        let size =
+            rugen_proto::size::FighterSize::parse(&self.rules.fighter_size).unwrap_or_default();
+        let mut v = verdict([&a, &b], [ra.as_ref(), rb.as_ref()], [&na, &nb], size, t);
         let mut blocked = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for (i, n) in [(0, &na), (1, &nb)] {

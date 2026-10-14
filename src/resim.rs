@@ -51,12 +51,15 @@ pub struct Outcome {
     pub match_over: bool,
 }
 
-/// Replay `inputs` of a match set up by `setup` (JSON with `p1_fp`,
-/// `p2_fp`, `stage_fp`, `rules`), stopping at `stop_frame` when given.
+/// Replay `inputs` of match `match_id` set up by `setup` (JSON with
+/// `p1_fp`, `p2_fp`, `stage_fp`, `rules`), stopping at `stop_frame` when
+/// given. The match seed comes from the id, as both clients derive it
+/// (`rugen_sim::headless::online_seed`).
 #[cfg(feature = "resim")]
 pub fn replay(
     packages: &Packages,
     cfg: &ResimConfig,
+    match_id: u64,
     setup: &str,
     inputs: &[u8],
     stop_frame: Option<u32>,
@@ -120,6 +123,8 @@ pub fn replay(
             round_time,
             ai: [0, 0],
             fighter_size,
+            // the clients' seed: derived from the match id on both sides
+            seed: rugen_sim::headless::online_seed(match_id),
         };
         let mut world = rugen_sim::headless::build_world(&spec).map_err(|e| e.to_string())?;
         if let Some(w) = match_wins {
@@ -139,6 +144,7 @@ pub fn replay(
 pub fn replay(
     _packages: &Packages,
     _cfg: &ResimConfig,
+    _match_id: u64,
     _setup: &str,
     _inputs: &[u8],
     _stop_frame: Option<u32>,
