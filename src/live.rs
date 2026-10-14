@@ -218,6 +218,7 @@ impl Live {
     /// Up to `max` frames from `from` (the header too when `from` is 0);
     /// `viewer` counts as watching. `None`: no such live match, or not
     /// allowed (a private room's match for an outsider).
+    #[cfg(test)]
     pub fn chunk(&self, match_id: u64, from: u32, max: usize, viewer: u64) -> Option<Chunk> {
         self.chunk_for(match_id, from, max, viewer).ok()
     }
