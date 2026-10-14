@@ -17,7 +17,11 @@ server: `play.rugen.dev`
 - **Match relay**: UDP with a WebSocket fallback; players never see each
   other's IP. Optional Cloudflare TURN inside the free tier.
 - **Bring your own character**: matchup verdicts and verified temporary
-  packages, so both players fight with identical files.
+  packages, so both players fight with identical files. Sent only with
+  the player's consent, deleted 3 days after upload, optionally served
+  from Cloudflare R2 through short-lived presigned URLs.
+- **Live viewers**: capped per match (500 by default), measurable with the
+  self-benchmark.
 - **Fair ranked**: result checks, stored replays, re-simulation of disputed
   matches.
 - **Live watching and shared replays**: the server keeps every match's
