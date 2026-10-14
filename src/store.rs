@@ -365,6 +365,20 @@ pub fn reports_agree(a: &ReportData, b: &ReportData) -> bool {
     rugen_proto::evidence::checksums_agree(&a.checksums, &b.checksums, below)
 }
 
+/// Page cache per connection, KiB (negative `cache_size` = KiB).
+const CACHE_KIB: i64 = 16_000;
+/// Memory-mapped I/O window: reads come straight from the OS page cache.
+const MMAP_BYTES: i64 = 64 << 20;
+
+/// Pragmas of every file connection (on top of WAL + `synchronous=NORMAL`):
+/// a 16 MB page cache, 64 MB of mmap, temporary tables / sorts in memory.
+fn tune(c: &Connection) -> DbResult<()> {
+    c.pragma_update(None, "cache_size", -CACHE_KIB)?;
+    c.pragma_update(None, "mmap_size", MMAP_BYTES)?;
+    c.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
+}
+
 /// Prepared statements kept per connection (the store has about 100
 /// distinct queries; rusqlite's default of 16 would keep re-parsing them).
 const STATEMENT_CACHE: usize = 256;
@@ -409,6 +423,7 @@ impl Store {
                 let c = Connection::open(d.join("rugen.db"))?;
                 c.pragma_update(None, "journal_mode", "WAL")?;
                 c.pragma_update(None, "synchronous", "NORMAL")?;
+                tune(&c)?;
                 c
             }
             None => Connection::open_in_memory()?,
@@ -2180,6 +2195,30 @@ mod tests {
         assert_eq!(s.schema_version().unwrap(), 6);
         let a = s.by_key(&"cd".repeat(32)).unwrap().unwrap();
         assert_eq!((a.name.as_str(), a.rating, a.username), ("OLD", 1300, None));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_connections_are_tuned() {
+        let dir = temp_dir("tuned");
+        let s = Store::open(Some(&dir)).unwrap();
+        let get = |k: &str| -> String {
+            s.conn
+                .pragma_query_value(None, k, |r| {
+                    r.get::<_, rusqlite::types::Value>(0).map(|v| match v {
+                        rusqlite::types::Value::Integer(i) => i.to_string(),
+                        rusqlite::types::Value::Text(t) => t,
+                        other => format!("{other:?}"),
+                    })
+                })
+                .unwrap()
+        };
+        assert_eq!(get("journal_mode"), "wal");
+        assert_eq!(get("synchronous"), "1", "NORMAL");
+        assert_eq!(get("cache_size"), (-CACHE_KIB).to_string());
+        assert_eq!(get("mmap_size"), MMAP_BYTES.to_string());
+        assert_eq!(get("temp_store"), "2", "MEMORY");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
