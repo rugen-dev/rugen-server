@@ -365,6 +365,10 @@ pub fn reports_agree(a: &ReportData, b: &ReportData) -> bool {
     rugen_proto::evidence::checksums_agree(&a.checksums, &b.checksums, below)
 }
 
+/// Prepared statements kept per connection (the store has about 100
+/// distinct queries; rusqlite's default of 16 would keep re-parsing them).
+const STATEMENT_CACHE: usize = 256;
+
 pub struct Store {
     conn: Connection,
 }
@@ -411,6 +415,8 @@ impl Store {
         };
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // every query goes through `prepare_cached`: keep all of them parsed
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         let mut s = Self { conn };
         let fresh = s.migrate()?;
         s.ensure_turn_schema()?;
@@ -458,7 +464,7 @@ impl Store {
         )?;
         let has = self
             .conn
-            .prepare("SELECT 1 FROM pragma_table_info('reports') WHERE name = 'checksums'")?
+            .prepare_cached("SELECT 1 FROM pragma_table_info('reports') WHERE name = 'checksums'")?
             .exists([])?;
         if !has {
             self.conn
@@ -470,11 +476,10 @@ impl Store {
     /// P1 and P2 of a match.
     pub fn match_players(&self, match_id: u64) -> DbResult<Option<[u64; 2]>> {
         self.conn
-            .query_row(
-                "SELECT p1, p2 FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| Ok([r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64]),
-            )
+            .prepare_cached("SELECT p1, p2 FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| {
+                Ok([r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64])
+            })
             .optional()
     }
 
@@ -482,9 +487,7 @@ impl Store {
     pub fn turn_usage(&self, month: &str) -> DbResult<TurnMonth> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT reserved, reported, cloudflare, credentials FROM turn_usage WHERE month = ?1",
-                [month],
+            .prepare_cached("SELECT reserved, reported, cloudflare, credentials FROM turn_usage WHERE month = ?1")?.query_row([month],
                 |r| {
                     Ok(TurnMonth {
                         reserved: r.get::<_, i64>(0)?.max(0) as u64,
@@ -492,8 +495,7 @@ impl Store {
                         cloudflare: r.get::<_, i64>(2)?.max(0) as u64,
                         credentials: r.get::<_, i64>(3)?.max(0) as u64,
                     })
-                },
-            )
+                })
             .optional()?
             .unwrap_or_default())
     }
@@ -507,22 +509,20 @@ impl Store {
         reported: u64,
         credentials: u64,
     ) -> DbResult<()> {
-        self.conn.execute(
-            "INSERT INTO turn_usage (month, reserved, reported, credentials) VALUES (?1, MAX(?2, 0), ?3, ?4)
+        self.conn.prepare_cached("INSERT INTO turn_usage (month, reserved, reported, credentials) VALUES (?1, MAX(?2, 0), ?3, ?4)
              ON CONFLICT(month) DO UPDATE SET reserved = MAX(reserved + ?2, 0),
-                 reported = reported + ?3, credentials = credentials + ?4",
-            params![month, reserved, reported as i64, credentials as i64],
-        )?;
+                 reported = reported + ?3, credentials = credentials + ?4")?.execute(params![month, reserved, reported as i64, credentials as i64])?;
         Ok(())
     }
 
     /// Usage Cloudflare's analytics report for a month (bytes, both ways).
     pub fn turn_set_cloudflare(&self, month: &str, bytes: u64) -> DbResult<()> {
-        self.conn.execute(
-            "INSERT INTO turn_usage (month, cloudflare) VALUES (?1, ?2)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO turn_usage (month, cloudflare) VALUES (?1, ?2)
              ON CONFLICT(month) DO UPDATE SET cloudflare = MAX(cloudflare, ?2)",
-            params![month, bytes as i64],
-        )?;
+            )?
+            .execute(params![month, bytes as i64])?;
         Ok(())
     }
 
@@ -533,15 +533,17 @@ impl Store {
 
     fn meta(&self, k: &str) -> DbResult<Option<i64>> {
         self.conn
-            .query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0))
+            .prepare_cached("SELECT v FROM meta WHERE k = ?1")?
+            .query_row([k], |r| r.get(0))
             .optional()
     }
 
     fn set_meta(&self, k: &str, v: i64) -> DbResult<()> {
-        self.conn.execute(
-            "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
-            params![k, v],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
+            )?
+            .execute(params![k, v])?;
         Ok(())
     }
 
@@ -602,19 +604,14 @@ impl Store {
         };
         let tx = self.conn.transaction()?;
         for a in &old.accounts {
-            tx.execute(
-                &format!("INSERT OR IGNORE INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
-                params![
+            tx.prepare_cached(&format!("INSERT OR IGNORE INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"))?.execute(params![
                     a.id as i64, a.key, a.name, a.avatar, a.rating, a.best_rating, a.wins,
                     a.losses, a.created as i64, a.last_seen as i64
-                ],
-            )?;
+                ])?;
         }
         for m in &old.matches {
-            tx.execute(
-                "INSERT OR IGNORE INTO matches (id, p1, p2, ranked, created, resolved, winner, delta1, delta2)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
+            tx.prepare_cached("INSERT OR IGNORE INTO matches (id, p1, p2, ranked, created, resolved, winner, delta1, delta2)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(params![
                     m.id as i64,
                     m.players[0] as i64,
                     m.players[1] as i64,
@@ -624,20 +621,16 @@ impl Store {
                     m.winner.map(|w| w as i64),
                     m.deltas[0],
                     m.deltas[1]
-                ],
-            )?;
+                ])?;
             for r in &m.reports {
-                tx.execute(
-                    "INSERT OR IGNORE INTO reports (match_id, reporter, winner) VALUES (?1, ?2, ?3)",
-                    params![m.id as i64, r.reporter as i64, r.winner as i64],
-                )?;
+                tx.prepare_cached("INSERT OR IGNORE INTO reports (match_id, reporter, winner) VALUES (?1, ?2, ?3)")?.execute(params![m.id as i64, r.reporter as i64, r.winner as i64])?;
             }
         }
         let set = |k: &str, v: i64| {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
-                params![k, v],
-            )
+            )?
+            .execute(params![k, v])
         };
         if old.season > 0 {
             set("season", old.season as i64)?;
@@ -665,10 +658,11 @@ impl Store {
         while now() as i64 >= start + SEASON_SECS as i64 {
             season += 1;
             start += SEASON_SECS as i64;
-            self.conn.execute(
-                "UPDATE accounts SET rating = (rating + ?1) / 2, wins = 0, losses = 0",
-                [elo::START_RATING],
-            )?;
+            self.conn
+                .prepare_cached(
+                    "UPDATE accounts SET rating = (rating + ?1) / 2, wins = 0, losses = 0",
+                )?
+                .execute([elo::START_RATING])?;
         }
         if season != before {
             self.set_meta("season", season)?;
@@ -689,17 +683,17 @@ impl Store {
     }
 
     fn fresh_id(&self) -> DbResult<u64> {
-        let id = self.conn.query_row(
-            "UPDATE meta SET v = v + 1 WHERE k = 'next_id' RETURNING v - 1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?;
+        let id = self
+            .conn
+            .prepare_cached("UPDATE meta SET v = v + 1 WHERE k = 'next_id' RETURNING v - 1")?
+            .query_row([], |r| r.get::<_, i64>(0))?;
         Ok(id as u64)
     }
 
     pub fn account_count(&self) -> DbResult<usize> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0))
+            .prepare_cached("SELECT COUNT(*) FROM accounts")?
+            .query_row([], |r| r.get::<_, i64>(0))
             .map(|n| n as usize)
     }
 
@@ -724,30 +718,27 @@ impl Store {
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS doomed (id INTEGER PRIMARY KEY); DELETE FROM doomed;",
         )?;
-        let accounts = tx.execute(
-            "INSERT INTO doomed (id) SELECT id FROM accounts WHERE name LIKE ?1 ESCAPE '\\'",
-            [&pattern],
-        )?;
-        let matches: usize = tx.query_row(
-            "SELECT COUNT(*) FROM matches WHERE ranked = 0
+        let accounts = tx
+            .prepare_cached(
+                "INSERT INTO doomed (id) SELECT id FROM accounts WHERE name LIKE ?1 ESCAPE '\\'",
+            )?
+            .execute([&pattern])?;
+        let matches: usize = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM matches WHERE ranked = 0
                AND (p1 IN (SELECT id FROM doomed) OR p2 IN (SELECT id FROM doomed))",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as usize;
+            )?
+            .query_row([], |r| r.get::<_, i64>(0))? as usize;
         if !dry_run {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM matches WHERE ranked = 0
                    AND (p1 IN (SELECT id FROM doomed) OR p2 IN (SELECT id FROM doomed))",
-                [],
-            )?;
-            tx.execute(
-                "DELETE FROM flags WHERE account IN (SELECT id FROM doomed)",
-                [],
-            )?;
-            tx.execute(
-                "DELETE FROM accounts WHERE id IN (SELECT id FROM doomed)",
-                [],
-            )?;
+            )?
+            .execute([])?;
+            tx.prepare_cached("DELETE FROM flags WHERE account IN (SELECT id FROM doomed)")?
+                .execute([])?;
+            tx.prepare_cached("DELETE FROM accounts WHERE id IN (SELECT id FROM doomed)")?
+                .execute([])?;
         }
         tx.execute_batch("DROP TABLE doomed;")?;
         tx.commit()?;
@@ -779,13 +770,10 @@ impl Store {
             last_seen: t,
             username: None,
         };
-        self.conn.execute(
-            &format!("INSERT INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
-            params![
+        self.conn.prepare_cached(&format!("INSERT INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"))?.execute(params![
                 a.id as i64, a.key, a.name, a.avatar, a.rating, a.best_rating, a.wins, a.losses,
                 a.created as i64, a.last_seen as i64
-            ],
-        )?;
+            ])?;
         Ok(a)
     }
 
@@ -883,19 +871,21 @@ impl Store {
         }
         let id = self.fresh_id()?;
         let t = now();
-        let inserted = self.conn.execute(
-            "INSERT INTO accounts (id, key, name, avatar, rating, best_rating, wins, losses,
+        let inserted = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO accounts (id, key, name, avatar, rating, best_rating, wins, losses,
                  created, last_seen, username, password)
              VALUES (?1, ?2, ?3, 0, ?4, ?4, 0, 0, ?5, ?5, ?3, ?6)",
-            params![
+            )?
+            .execute(params![
                 id as i64,
                 dead_key("named"),
                 username,
                 elo::START_RATING,
                 t as i64,
                 phc
-            ],
-        );
+            ]);
         match inserted {
             Ok(_) => {}
             // lost a race for the name
@@ -927,11 +917,13 @@ impl Store {
         if self.username_taken(username)? {
             return Ok(Err(NameError::Taken));
         }
-        let r = self.conn.execute(
-            "UPDATE accounts SET username = ?2, name = ?2, password = ?3
+        let r = self
+            .conn
+            .prepare_cached(
+                "UPDATE accounts SET username = ?2, name = ?2, password = ?3
              WHERE id = ?1 AND username IS NULL",
-            params![id as i64, username, phc],
-        );
+            )?
+            .execute(params![id as i64, username, phc]);
         match r {
             Ok(1) => {}
             Ok(_) => return Ok(Err(NameError::AlreadyNamed)),
@@ -953,61 +945,58 @@ impl Store {
         let key = random_hex(32);
         let t = now() as i64;
         let tx = self.conn.transaction()?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO account_keys (hash, account, created, last_used) VALUES (?1, ?2, ?3, ?3)",
-            params![key_hash(&key), id as i64, t],
-        )?;
-        tx.execute(
+        )?
+        .execute(params![key_hash(&key), id as i64, t])?;
+        tx.prepare_cached(
             "DELETE FROM account_keys WHERE account = ?1 AND hash NOT IN (
                  SELECT hash FROM account_keys WHERE account = ?1
                  ORDER BY last_used DESC, created DESC LIMIT ?2)",
-            params![id as i64, MAX_SESSIONS],
-        )?;
+        )?
+        .execute(params![id as i64, MAX_SESSIONS])?;
         tx.commit()?;
         Ok(key)
     }
 
     /// Revoke one key (log out this device).
     pub fn revoke_key(&mut self, id: u64, key: &str) -> DbResult<()> {
-        self.conn.execute(
-            "UPDATE accounts SET key = ?3 WHERE id = ?1 AND key = ?2",
-            params![id as i64, key, dead_key("revoked")],
-        )?;
-        self.conn.execute(
-            "DELETE FROM account_keys WHERE account = ?1 AND hash = ?2",
-            params![id as i64, key_hash(key)],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE accounts SET key = ?3 WHERE id = ?1 AND key = ?2")?
+            .execute(params![id as i64, key, dead_key("revoked")])?;
+        self.conn
+            .prepare_cached("DELETE FROM account_keys WHERE account = ?1 AND hash = ?2")?
+            .execute(params![id as i64, key_hash(key)])?;
         Ok(())
     }
 
     /// Revoke every key of account `id` (log out everywhere).
     pub fn revoke_all(&mut self, id: u64) -> DbResult<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "UPDATE accounts SET key = ?2 WHERE id = ?1",
-            params![id as i64, dead_key("revoked")],
-        )?;
-        tx.execute("DELETE FROM account_keys WHERE account = ?1", [id as i64])?;
+        tx.prepare_cached("UPDATE accounts SET key = ?2 WHERE id = ?1")?
+            .execute(params![id as i64, dead_key("revoked")])?;
+        tx.prepare_cached("DELETE FROM account_keys WHERE account = ?1")?
+            .execute([id as i64])?;
         tx.commit()
     }
 
     /// Replace the password hash of account `id` (callers revoke keys).
     pub fn set_password(&mut self, id: u64, phc: &str) -> DbResult<()> {
-        self.conn.execute(
-            "UPDATE accounts SET password = ?2 WHERE id = ?1",
-            params![id as i64, phc],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE accounts SET password = ?2 WHERE id = ?1")?
+            .execute(params![id as i64, phc])?;
         Ok(())
     }
 
     /// Keys (devices) able to act for account `id`.
     pub fn sessions(&self, id: u64) -> DbResult<u32> {
-        let n: i64 = self.conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM account_keys WHERE account = ?1)
+        let n: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT (SELECT COUNT(*) FROM account_keys WHERE account = ?1)
                   + (SELECT COUNT(*) FROM accounts WHERE id = ?1 AND length(key) = 64)",
-            [id as i64],
-            |r| r.get(0),
-        )?;
+            )?
+            .query_row([id as i64], |r| r.get(0))?;
         Ok(n as u32)
     }
 
@@ -1036,17 +1025,15 @@ impl Store {
                 .collect();
             // nobody else may wear a username (API 4 players keep their own name)
             if !clean.trim().is_empty() && !self.username_taken(clean.trim())? {
-                self.conn.execute(
-                    "UPDATE accounts SET name = ?2 WHERE id = ?1",
-                    params![id as i64, clean.trim()],
-                )?;
+                self.conn
+                    .prepare_cached("UPDATE accounts SET name = ?2 WHERE id = ?1")?
+                    .execute(params![id as i64, clean.trim()])?;
             }
         }
         if let Some(av) = avatar {
-            self.conn.execute(
-                "UPDATE accounts SET avatar = ?2 WHERE id = ?1",
-                params![id as i64, av.min(99)],
-            )?;
+            self.conn
+                .prepare_cached("UPDATE accounts SET avatar = ?2 WHERE id = ?1")?
+                .execute(params![id as i64, av.min(99)])?;
         }
         self.by_id(id)
     }
@@ -1054,26 +1041,22 @@ impl Store {
     /// A new match row. `setup` (JSON: characters, stage, rules) is kept for replays.
     pub fn new_match(&mut self, players: [u64; 2], ranked: bool, setup: &str) -> DbResult<u64> {
         let id = self.fresh_id()?;
-        self.conn.execute(
-            "INSERT INTO matches (id, p1, p2, ranked, created, setup) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+        self.conn.prepare_cached("INSERT INTO matches (id, p1, p2, ranked, created, setup) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![
                 id as i64,
                 players[0] as i64,
                 players[1] as i64,
                 ranked,
                 now() as i64,
                 setup
-            ],
-        )?;
+            ])?;
         Ok(id)
     }
 
     /// Replace a match's setup JSON (fingerprints become known at start).
     pub fn set_setup(&mut self, match_id: u64, setup: &str) -> DbResult<()> {
-        self.conn.execute(
-            "UPDATE matches SET setup = ?2 WHERE id = ?1",
-            params![match_id as i64, setup],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE matches SET setup = ?2 WHERE id = ?1")?
+            .execute(params![match_id as i64, setup])?;
         Ok(())
     }
 
@@ -1089,9 +1072,7 @@ impl Store {
         let rejected = ReportOutcome::default();
         let tx = self.conn.transaction()?;
         let m = tx
-            .query_row(
-                "SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed, desync, setup FROM matches WHERE id = ?1",
-                [match_id as i64],
+            .prepare_cached("SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed, desync, setup FROM matches WHERE id = ?1")?.query_row([match_id as i64],
                 |r| {
                     Ok((
                         [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
@@ -1103,8 +1084,7 @@ impl Store {
                         r.get::<_, bool>(8)?,
                         r.get::<_, String>(9)?,
                     ))
-                },
-            )
+                })
             .optional()?;
         let Some((players, ranked, resolved, deltas, winner_set, disputed, desync, setup)) = m
         else {
@@ -1121,10 +1101,8 @@ impl Store {
                 disputed,
             });
         }
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs, checksums, ending, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+        let inserted = tx.prepare_cached("INSERT OR IGNORE INTO reports (match_id, reporter, winner, frames, checksum, inputs, checksums, ending, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(params![
                 match_id as i64,
                 reporter as i64,
                 data.winner as i64,
@@ -1135,8 +1113,7 @@ impl Store {
                     .then(|| rugen_proto::evidence::encode_checksums(&data.checksums)),
                 data.ending.map(|e| e.as_str()),
                 now() as i64
-            ],
-        )?;
+            ])?;
         if inserted == 0 {
             tx.commit()?;
             return Ok(ReportOutcome {
@@ -1145,7 +1122,7 @@ impl Store {
             });
         }
         let reports: Vec<ReportData> = {
-            let mut st = tx.prepare(
+            let mut st = tx.prepare_cached(
                 "SELECT winner, frames, checksum, inputs, checksums, ending FROM reports WHERE match_id = ?1 ORDER BY reporter",
             )?;
             st.query_map([match_id as i64], report_row)?
@@ -1180,10 +1157,8 @@ impl Store {
             });
         }
         if desync || !reports_agree(&reports[0], &reports[1]) {
-            tx.execute(
-                "UPDATE matches SET resolved = 1, disputed = 1 WHERE id = ?1",
-                [match_id as i64],
-            )?;
+            tx.prepare_cached("UPDATE matches SET resolved = 1, disputed = 1 WHERE id = ?1")?
+                .execute([match_id as i64])?;
             tx.commit()?;
             log::warn!("match {match_id}: reports disagree, marked disputed");
             return Ok(ReportOutcome {
@@ -1246,48 +1221,33 @@ impl Store {
                 ((f2, name("p2_char")), (f1, name("p1_char")))
             };
             for (f, n) in [(&fw, &nw), (&fl, &nl)] {
-                tx.execute(
-                    "INSERT OR IGNORE INTO char_ratings (fingerprint, name, rating) VALUES (?1, ?2, ?3)",
-                    params![f, n, CHAR_START_RATING],
-                )?;
+                tx.prepare_cached("INSERT OR IGNORE INTO char_ratings (fingerprint, name, rating) VALUES (?1, ?2, ?3)")?.execute(params![f, n, CHAR_START_RATING])?;
             }
             let get = |f: &str| -> DbResult<i32> {
-                tx.query_row(
-                    "SELECT rating FROM char_ratings WHERE fingerprint = ?1",
-                    [f],
-                    |r| r.get(0),
-                )
+                tx.prepare_cached("SELECT rating FROM char_ratings WHERE fingerprint = ?1")?
+                    .query_row([f], |r| r.get(0))
             };
             let (rw, rl) = elo::update_k(get(&fw)?, get(&fl)?, CHAR_K);
-            tx.execute(
-                "UPDATE char_ratings SET rating = ?2, games = games + 1, wins = wins + 1 WHERE fingerprint = ?1",
-                params![fw, rw],
-            )?;
-            tx.execute(
+            tx.prepare_cached("UPDATE char_ratings SET rating = ?2, games = games + 1, wins = wins + 1 WHERE fingerprint = ?1")?.execute(params![fw, rw])?;
+            tx.prepare_cached(
                 "UPDATE char_ratings SET rating = ?2, games = games + 1 WHERE fingerprint = ?1",
-                params![fl, rl],
-            )?;
+            )?
+            .execute(params![fl, rl])?;
         }
         let mut deltas = [0, 0];
         if ranked {
             let rating = |id: u64| -> DbResult<Option<i32>> {
-                tx.query_row(
-                    "SELECT rating FROM accounts WHERE id = ?1",
-                    [id as i64],
-                    |r| r.get(0),
-                )
-                .optional()
+                tx.prepare_cached("SELECT rating FROM accounts WHERE id = ?1")?
+                    .query_row([id as i64], |r| r.get(0))
+                    .optional()
             };
             if let (Some(rw), Some(rl)) = (rating(winner)?, rating(loser)?) {
                 let (nw, nl) = elo::update(rw, rl);
-                tx.execute(
-                    "UPDATE accounts SET rating = ?2, best_rating = MAX(best_rating, ?2), wins = wins + 1 WHERE id = ?1",
-                    params![winner as i64, nw],
-                )?;
-                tx.execute(
+                tx.prepare_cached("UPDATE accounts SET rating = ?2, best_rating = MAX(best_rating, ?2), wins = wins + 1 WHERE id = ?1")?.execute(params![winner as i64, nw])?;
+                tx.prepare_cached(
                     "UPDATE accounts SET rating = ?2, losses = losses + 1 WHERE id = ?1",
-                    params![loser as i64, nl],
-                )?;
+                )?
+                .execute(params![loser as i64, nl])?;
                 let (dw, dl) = (nw - rw, nl - rl);
                 deltas = if players[0] == winner {
                     [dw, dl]
@@ -1296,28 +1256,19 @@ impl Store {
                 };
             }
             if !inputs.is_empty() {
-                tx.execute(
-                    "INSERT OR REPLACE INTO replays (match_id, created, inputs) VALUES (?1, ?2, ?3)",
-                    params![match_id as i64, now() as i64, inputs],
-                )?;
-                tx.execute(
+                tx.prepare_cached("INSERT OR REPLACE INTO replays (match_id, created, inputs) VALUES (?1, ?2, ?3)")?.execute(params![match_id as i64, now() as i64, inputs])?;
+                tx.prepare_cached(
                     "DELETE FROM replays WHERE match_id NOT IN
                      (SELECT match_id FROM replays ORDER BY created DESC, match_id DESC LIMIT ?1)",
-                    [REPLAY_RETENTION],
-                )?;
+                )?
+                .execute([REPLAY_RETENTION])?;
                 // the replay's files stay on the server longer
                 for f in &fps {
-                    tx.execute(
-                        "UPDATE packages SET keep_until = MAX(keep_until, ?2) WHERE fingerprint = ?1",
-                        params![f, (now() + replay_keep_secs()) as i64],
-                    )?;
+                    tx.prepare_cached("UPDATE packages SET keep_until = MAX(keep_until, ?2) WHERE fingerprint = ?1")?.execute(params![f, (now() + replay_keep_secs()) as i64])?;
                 }
             }
         }
-        tx.execute(
-            "UPDATE matches SET resolved = 1, disputed = 0, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1",
-            params![match_id as i64, winner as i64, deltas[0], deltas[1]],
-        )?;
+        tx.prepare_cached("UPDATE matches SET resolved = 1, disputed = 0, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1")?.execute(params![match_id as i64, winner as i64, deltas[0], deltas[1]])?;
         Ok(deltas)
     }
 
@@ -1327,21 +1278,19 @@ impl Store {
         ending: Option<rugen_proto::Ending>,
         fled: Option<u64>,
     ) -> DbResult<()> {
-        tx.execute(
-            "UPDATE matches SET ending = ?2, fled = ?3 WHERE id = ?1",
-            params![
+        tx.prepare_cached("UPDATE matches SET ending = ?2, fled = ?3 WHERE id = ?1")?
+            .execute(params![
                 match_id as i64,
                 ending.map(|e| e.as_str()),
                 fled.map(|f| f as i64)
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
     /// Unsettled matches with a single report, from the player who says it
     /// won because the other one fled or disconnected.
     pub fn pending_claims(&self) -> DbResult<Vec<Claim>> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare_cached(
             "SELECT r.match_id, r.reporter, r.ending, r.at FROM reports r
              JOIN matches m ON m.id = r.match_id
              WHERE m.resolved = 0 AND r.ending IS NOT NULL AND r.winner = r.reporter
@@ -1379,22 +1328,18 @@ impl Store {
         if !Self::pending_claims_tx(&tx, c)? {
             return Ok(None);
         }
-        let (players, ranked, setup) = tx.query_row(
-            "SELECT p1, p2, ranked, setup FROM matches WHERE id = ?1",
-            [c.match_id as i64],
-            |r| {
+        let (players, ranked, setup) = tx
+            .prepare_cached("SELECT p1, p2, ranked, setup FROM matches WHERE id = ?1")?
+            .query_row([c.match_id as i64], |r| {
                 Ok((
                     [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
                     r.get::<_, bool>(2)?,
                     r.get::<_, String>(3)?,
                 ))
-            },
-        )?;
-        let inputs: Option<Vec<u8>> = tx.query_row(
-            "SELECT inputs FROM reports WHERE match_id = ?1 AND reporter = ?2",
-            params![c.match_id as i64, c.winner as i64],
-            |r| r.get(0),
-        )?;
+            })?;
+        let inputs: Option<Vec<u8>> = tx
+            .prepare_cached("SELECT inputs FROM reports WHERE match_id = ?1 AND reporter = ?2")?
+            .query_row(params![c.match_id as i64, c.winner as i64], |r| r.get(0))?;
         let deltas = Self::settle(
             &tx,
             c.match_id,
@@ -1412,13 +1357,13 @@ impl Store {
 
     /// Still unsettled with only the claimant's report?
     fn pending_claims_tx(tx: &rusqlite::Transaction<'_>, c: &Claim) -> DbResult<bool> {
-        let n: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM reports r JOIN matches m ON m.id = r.match_id
+        let n: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM reports r JOIN matches m ON m.id = r.match_id
              WHERE r.match_id = ?1 AND m.resolved = 0 AND r.reporter = ?2 AND r.ending IS NOT NULL
                AND (SELECT COUNT(*) FROM reports x WHERE x.match_id = r.match_id) = 1",
-            params![c.match_id as i64, c.winner as i64],
-            |r| r.get(0),
-        )?;
+            )?
+            .query_row(params![c.match_id as i64, c.winner as i64], |r| r.get(0))?;
         Ok(n == 1)
     }
 
@@ -1426,11 +1371,10 @@ impl Store {
     pub fn match_ending(&self, match_id: u64) -> DbResult<EndingRow> {
         let row = self
             .conn
-            .query_row(
-                "SELECT ending, fled FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
-            )
+            .prepare_cached("SELECT ending, fled FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
             .optional()?;
         Ok(row.and_then(|(e, f)| e.map(|e| (e, f.map(|f| f as u64)))))
     }
@@ -1438,15 +1382,12 @@ impl Store {
     /// A client saw a desync (ggrs checksum mismatch): the match can no
     /// longer resolve by agreement.
     pub fn report_desync(&mut self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
-        let n = self.conn.execute(
-            "UPDATE matches SET desync = 1 WHERE id = ?1 AND (p1 = ?2 OR p2 = ?2)",
-            params![match_id as i64, reporter as i64],
-        )?;
+        let n = self
+            .conn
+            .prepare_cached("UPDATE matches SET desync = 1 WHERE id = ?1 AND (p1 = ?2 OR p2 = ?2)")?
+            .execute(params![match_id as i64, reporter as i64])?;
         if n > 0 {
-            self.conn.execute(
-                "UPDATE matches SET disputed = 1 WHERE id = ?1 AND resolved = 1 AND winner IS NULL",
-                [match_id as i64],
-            )?;
+            self.conn.prepare_cached("UPDATE matches SET disputed = 1 WHERE id = ?1 AND resolved = 1 AND winner IS NULL")?.execute([match_id as i64])?;
             log::warn!("match {match_id}: desync reported by {reporter} at frame {frame}");
         }
         Ok(n > 0)
@@ -1462,36 +1403,32 @@ impl Store {
     ) -> DbResult<bool> {
         let tx = self.conn.transaction()?;
         let m = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT p1, p2, ranked, setup, disputed, winner FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| {
-                    Ok((
-                        [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
-                        r.get::<_, bool>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, bool>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                    ))
-                },
-            )
+            )?
+            .query_row([match_id as i64], |r| {
+                Ok((
+                    [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, bool>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
+            })
             .optional()?;
         let Some((players, ranked, setup, disputed, set)) = m else {
             return Ok(false);
         };
-        tx.execute(
-            "UPDATE matches SET resim = ?2 WHERE id = ?1",
-            params![match_id as i64, note],
-        )?;
+        tx.prepare_cached("UPDATE matches SET resim = ?2 WHERE id = ?1")?
+            .execute(params![match_id as i64, note])?;
         let settled = match winner {
             Some(w) if disputed && set.is_none() && players.contains(&w) => {
                 let inputs: Vec<u8> = tx
-                    .query_row(
+                    .prepare_cached(
                         "SELECT inputs FROM reports WHERE match_id = ?1 AND inputs IS NOT NULL
                          ORDER BY length(inputs) DESC LIMIT 1",
-                        [match_id as i64],
-                        |r| r.get(0),
-                    )
+                    )?
+                    .query_row([match_id as i64], |r| r.get(0))
                     .optional()?
                     .unwrap_or_default();
                 Self::settle(&tx, match_id, players, ranked, &setup, w, &inputs)?;
@@ -1508,11 +1445,8 @@ impl Store {
     pub fn resim_note(&self, match_id: u64) -> DbResult<Option<String>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT resim FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| r.get::<_, Option<String>>(0),
-            )
+            .prepare_cached("SELECT resim FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| r.get::<_, Option<String>>(0))
             .optional()?
             .flatten())
     }
@@ -1525,22 +1459,19 @@ impl Store {
     ) -> DbResult<Option<(String, bool, [u64; 2], Vec<(u64, ReportData)>)>> {
         let Some((setup, ranked, players)) = self
             .conn
-            .query_row(
-                "SELECT setup, ranked, p1, p2 FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, bool>(1)?,
-                        [r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64],
-                    ))
-                },
-            )
+            .prepare_cached("SELECT setup, ranked, p1, p2 FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    [r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64],
+                ))
+            })
             .optional()?
         else {
             return Ok(None);
         };
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare_cached(
             "SELECT reporter, winner, frames, checksum, inputs, checksums FROM reports WHERE match_id = ?1 ORDER BY reporter",
         )?;
         let reports = st
@@ -1564,11 +1495,8 @@ impl Store {
     /// Is a match disputed (and unresolved by agreement)?
     pub fn is_disputed(&self, match_id: u64) -> DbResult<bool> {
         self.conn
-            .query_row(
-                "SELECT disputed FROM matches WHERE id = ?1",
-                [match_id as i64],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT disputed FROM matches WHERE id = ?1")?
+            .query_row([match_id as i64], |r| r.get(0))
             .optional()
             .map(|d| d.unwrap_or(false))
     }
@@ -1577,11 +1505,10 @@ impl Store {
 
     pub fn package(&self, fp: &str) -> DbResult<Option<PackageRow>> {
         self.conn
-            .query_row(
-                &format!("SELECT {PACKAGE_COLS} FROM packages WHERE fingerprint = ?1"),
-                [fp],
-                PackageRow::from_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {PACKAGE_COLS} FROM packages WHERE fingerprint = ?1"
+            ))?
+            .query_row([fp], PackageRow::from_row)
             .optional()
     }
 
@@ -1590,11 +1517,9 @@ impl Store {
             .profile
             .as_ref()
             .and_then(|p| serde_json::to_string(p).ok());
-        self.conn.execute(
-            &format!(
+        self.conn.prepare_cached(&format!(
                 "INSERT OR REPLACE INTO packages ({PACKAGE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
-            ),
-            params![
+            ))?.execute(params![
                 p.fingerprint,
                 p.kind,
                 p.size as i64,
@@ -1606,25 +1531,23 @@ impl Store {
                 p.created as i64,
                 p.last_used as i64,
                 p.keep_until as i64
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
     /// Mark packages as used now (TTL / LRU bookkeeping).
     pub fn touch_packages(&mut self, fps: &[&str]) -> DbResult<()> {
         for f in fps {
-            self.conn.execute(
-                "UPDATE packages SET last_used = ?2 WHERE fingerprint = ?1",
-                params![f, now() as i64],
-            )?;
+            self.conn
+                .prepare_cached("UPDATE packages SET last_used = ?2 WHERE fingerprint = ?1")?
+                .execute(params![f, now() as i64])?;
         }
         Ok(())
     }
 
     /// All packages, least recently used first.
     pub fn packages_lru(&self) -> DbResult<Vec<PackageRow>> {
-        let mut st = self.conn.prepare(&format!(
+        let mut st = self.conn.prepare_cached(&format!(
             "SELECT {PACKAGE_COLS} FROM packages ORDER BY last_used ASC, fingerprint"
         ))?;
         st.query_map([], PackageRow::from_row)?.collect()
@@ -1632,23 +1555,21 @@ impl Store {
 
     pub fn delete_package(&mut self, fp: &str) -> DbResult<()> {
         self.conn
-            .execute("DELETE FROM packages WHERE fingerprint = ?1", [fp])?;
+            .prepare_cached("DELETE FROM packages WHERE fingerprint = ?1")?
+            .execute([fp])?;
         Ok(())
     }
 
     pub fn char_rating(&self, fp: &str) -> DbResult<Option<rugen_proto::CharRating>> {
         self.conn
-            .query_row(
-                "SELECT rating, games, wins FROM char_ratings WHERE fingerprint = ?1",
-                [fp],
-                |r| {
-                    Ok(rugen_proto::CharRating {
-                        rating: r.get(0)?,
-                        games: r.get(1)?,
-                        wins: r.get(2)?,
-                    })
-                },
-            )
+            .prepare_cached("SELECT rating, games, wins FROM char_ratings WHERE fingerprint = ?1")?
+            .query_row([fp], |r| {
+                Ok(rugen_proto::CharRating {
+                    rating: r.get(0)?,
+                    games: r.get(1)?,
+                    wins: r.get(2)?,
+                })
+            })
             .optional()
     }
 
@@ -1662,35 +1583,30 @@ impl Store {
         fingerprint: Option<&str>,
     ) -> DbResult<()> {
         log::warn!("flag: account {account}: {reason}");
-        self.conn.execute(
-            "INSERT INTO flags (account, match_id, reason, created, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        self.conn.prepare_cached("INSERT INTO flags (account, match_id, reason, created, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![
                 account as i64,
                 match_id.map(|m| m as i64),
                 reason,
                 now() as i64,
                 fingerprint
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
     /// Distinct accounts flagged for a false profile of `fp`.
     pub fn liars_for(&self, fp: &str) -> DbResult<u32> {
-        self.conn.query_row(
-            "SELECT COUNT(DISTINCT account) FROM flags WHERE fingerprint = ?1",
-            [fp],
-            |r| r.get(0),
-        )
+        self.conn
+            .prepare_cached("SELECT COUNT(DISTINCT account) FROM flags WHERE fingerprint = ?1")?
+            .query_row([fp], |r| r.get(0))
     }
 
     /// Matches with a reported desync that `fp` was part of.
     pub fn desyncs_for(&self, fp: &str) -> DbResult<u32> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM matches WHERE desync = 1 AND instr(setup, ?1) > 0",
-            [fp],
-            |r| r.get(0),
-        )
+        self.conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM matches WHERE desync = 1 AND instr(setup, ?1) > 0",
+            )?
+            .query_row([fp], |r| r.get(0))
     }
 
     // ---- blocklist (published in the truth feed)
@@ -1710,21 +1626,15 @@ impl Store {
 
     /// Block a fingerprint (operator): replaces any entry, clears `allowed`.
     pub fn block(&mut self, fp: &str, reason: &str, source: &str) -> DbResult<()> {
-        self.conn.execute(
-            "INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(fingerprint) DO UPDATE SET reason = ?2, source = ?3, allowed = 0, created = ?4",
-            params![fp, reason, source, now() as i64],
-        )?;
+        self.conn.prepare_cached("INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(fingerprint) DO UPDATE SET reason = ?2, source = ?3, allowed = 0, created = ?4")?.execute(params![fp, reason, source, now() as i64])?;
         self.bump_truth_seq()
     }
 
     /// Automatic block: only when the fingerprint has no entry at all (an
     /// operator-cleared one stays cleared). True when it was added.
     pub fn auto_block(&mut self, fp: &str, reason: &str) -> DbResult<bool> {
-        let n = self.conn.execute(
-            "INSERT OR IGNORE INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, 'auto', 0, ?3)",
-            params![fp, reason, now() as i64],
-        )?;
+        let n = self.conn.prepare_cached("INSERT OR IGNORE INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, 'auto', 0, ?3)")?.execute(params![fp, reason, now() as i64])?;
         if n > 0 {
             log::warn!(
                 "blocklist: {} auto-blocked: {reason}",
@@ -1739,28 +1649,22 @@ impl Store {
     /// automatic rules never block it again. True when it was blocked.
     pub fn unblock(&mut self, fp: &str) -> DbResult<bool> {
         let was = self.blocked(fp)?.is_some();
-        self.conn.execute(
-            "INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, 'cleared', 'admin', 1, ?2)
-             ON CONFLICT(fingerprint) DO UPDATE SET allowed = 1",
-            params![fp, now() as i64],
-        )?;
+        self.conn.prepare_cached("INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, 'cleared', 'admin', 1, ?2)
+             ON CONFLICT(fingerprint) DO UPDATE SET allowed = 1")?.execute(params![fp, now() as i64])?;
         self.bump_truth_seq()?;
         Ok(was)
     }
 
     pub fn blocked(&self, fp: &str) -> DbResult<Option<rugen_proto::BlockEntry>> {
         self.conn
-            .query_row(
-                "SELECT fingerprint, reason, created, source FROM blocklist WHERE fingerprint = ?1 AND allowed = 0",
-                [fp],
-                Self::block_row,
-            )
+            .prepare_cached("SELECT fingerprint, reason, created, source FROM blocklist WHERE fingerprint = ?1 AND allowed = 0")?.query_row([fp],
+                Self::block_row)
             .optional()
     }
 
     /// Every blocked fingerprint, oldest first.
     pub fn blocklist(&self) -> DbResult<Vec<rugen_proto::BlockEntry>> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare_cached(
             "SELECT fingerprint, reason, created, source FROM blocklist WHERE allowed = 0 ORDER BY created, fingerprint",
         )?;
         st.query_map([], Self::block_row)?.collect()
@@ -1777,7 +1681,7 @@ impl Store {
 
     /// Community ratings for the feed, most played first.
     pub fn feed_ratings(&self, limit: usize) -> DbResult<Vec<rugen_proto::FeedRating>> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare_cached(
             "SELECT fingerprint, rating, games, wins FROM char_ratings WHERE games > 0
              ORDER BY games DESC, fingerprint LIMIT ?1",
         )?;
@@ -1802,9 +1706,7 @@ impl Store {
     ) -> DbResult<Option<(bool, [u64; 2], Option<u64>, i32, bool)>> {
         let row = self
             .conn
-            .query_row(
-                "SELECT ranked, p1, p2, winner, delta1, delta2, disputed FROM matches WHERE id = ?1",
-                [match_id as i64],
+            .prepare_cached("SELECT ranked, p1, p2, winner, delta1, delta2, disputed FROM matches WHERE id = ?1")?.query_row([match_id as i64],
                 |r| {
                     Ok((
                         r.get::<_, bool>(0)?,
@@ -1813,8 +1715,7 @@ impl Store {
                         [r.get::<_, i32>(4)?, r.get::<_, i32>(5)?],
                         r.get::<_, bool>(6)?,
                     ))
-                },
-            )
+                })
             .optional()?;
         Ok(row.and_then(|(ranked, players, winner, deltas, disputed)| {
             let side = players.iter().position(|&p| p == account)?;
@@ -1825,10 +1726,9 @@ impl Store {
     /// Test: make a match's reports `secs` older.
     #[cfg(test)]
     pub fn age_reports(&self, match_id: u64, secs: i64) -> DbResult<()> {
-        self.conn.execute(
-            "UPDATE reports SET at = at - ?2 WHERE match_id = ?1",
-            params![match_id as i64, secs],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE reports SET at = at - ?2 WHERE match_id = ?1")?
+            .execute(params![match_id as i64, secs])?;
         Ok(())
     }
 
@@ -1836,7 +1736,7 @@ impl Store {
     pub fn flags_of(&self, account: u64) -> DbResult<Vec<String>> {
         let mut st = self
             .conn
-            .prepare("SELECT reason FROM flags WHERE account = ?1 ORDER BY id")?;
+            .prepare_cached("SELECT reason FROM flags WHERE account = ?1 ORDER BY id")?;
         st.query_map([account as i64], |r| r.get(0))?.collect()
     }
 
@@ -1847,31 +1747,31 @@ impl Store {
         match_id: u64,
     ) -> DbResult<Option<([u64; 2], String, Option<u64>, u64, Vec<u8>)>> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT m.p1, m.p2, m.setup, m.winner, r.created, r.inputs
                  FROM replays r JOIN matches m ON m.id = r.match_id WHERE r.match_id = ?1",
-                [match_id as i64],
-                |r| {
-                    Ok((
-                        [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
-                        r.get(2)?,
-                        r.get::<_, Option<i64>>(3)?.map(|w| w as u64),
-                        r.get::<_, i64>(4)? as u64,
-                        r.get(5)?,
-                    ))
-                },
-            )
+            )?
+            .query_row([match_id as i64], |r| {
+                Ok((
+                    [r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64],
+                    r.get(2)?,
+                    r.get::<_, Option<i64>>(3)?.map(|w| w as u64),
+                    r.get::<_, i64>(4)? as u64,
+                    r.get(5)?,
+                ))
+            })
             .optional()
     }
 
     #[cfg(test)]
     pub fn replay_count(&self) -> DbResult<i64> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM replays", [], |r| r.get(0))
+            .prepare_cached("SELECT COUNT(*) FROM replays")?
+            .query_row([], |r| r.get(0))
     }
 
     pub fn leaderboard(&self, limit: usize) -> DbResult<Vec<ProfileInfo>> {
-        let mut st = self.conn.prepare(&format!(
+        let mut st = self.conn.prepare_cached(&format!(
             "SELECT {ACCOUNT_SELECT} FROM accounts WHERE wins + losses > 0
              ORDER BY rating DESC, id ASC LIMIT ?1"
         ))?;
@@ -1888,19 +1788,21 @@ impl Store {
         if a.wins + a.losses == 0 {
             return Ok(None);
         }
-        let ahead: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM accounts WHERE wins + losses > 0
+        let ahead: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM accounts WHERE wins + losses > 0
              AND (rating > ?1 OR (rating = ?1 AND id < ?2))",
-            params![a.rating, id as i64],
-            |r| r.get(0),
-        )?;
+            )?
+            .query_row(params![a.rating, id as i64], |r| r.get(0))?;
         Ok(Some(ahead as usize + 1))
     }
 
     /// Consistent online copy of the database (`VACUUM INTO`), for backups.
     pub fn backup_to(&self, path: &Path) -> DbResult<()> {
         self.conn
-            .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+            .prepare_cached("VACUUM INTO ?1")?
+            .execute([path.to_string_lossy().as_ref()])?;
         Ok(())
     }
 }
