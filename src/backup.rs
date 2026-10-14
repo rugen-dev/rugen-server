@@ -15,8 +15,8 @@
 //! survives restarts: on start the bucket is listed, and when the newest
 //! backup is older than a day one runs [`BOOT_DELAY`] after boot; otherwise
 //! the next slot is waited for. A slot is skipped when a backup already
-//! succeeded in the [`MIN_GAP`] before it, so there is never more than one
-//! automatic backup a day. Manual backups (`POST /v1/admin/backup`,
+//! succeeded in the [`MIN_GAP`] (6 h) before it, so a catch-up or a manual
+//! backup just before 03:00 doesn't cause a second one. Manual backups (`POST /v1/admin/backup`,
 //! `--backup-now`) come on top.
 //!
 //! A backup is a consistent snapshot of `rugen.db` (`VACUUM INTO` on a
@@ -70,8 +70,10 @@ pub const STALE: u64 = 24 * 3600;
 /// The first automatic backup after boot waits this long (a redeploy
 /// should not add a backup to its own start-up load).
 pub const BOOT_DELAY: u64 = 5 * 60;
-/// A daily slot is skipped when a backup succeeded this recently.
-pub const MIN_GAP: u64 = 20 * 3600;
+/// A daily slot is skipped when a backup succeeded this recently (a boot
+/// catch-up or a manual backup just before 03:00). Short enough that a
+/// backup made in the afternoon never skips the next night.
+pub const MIN_GAP: u64 = 6 * 3600;
 /// A failed automatic backup is retried once after this long.
 pub const RETRY_AFTER: u64 = 3600;
 /// Manual backups: at most one per this long.
@@ -1677,7 +1679,17 @@ mod tests {
         // a boot catch-up at 02:58 skips the 03:00 slot two minutes later
         let catchup = at("20261013T025800Z");
         assert_eq!(next_after(catchup, Some(catchup)), at("20261014T030000Z"));
-        // a manual backup at 23:00 pushes the next slot by a day
+        // the first backup in the afternoon (14:24) keeps the next night
+        let afternoon = at("20261013T142408Z");
+        assert_eq!(
+            next_after(afternoon, Some(afternoon)),
+            at("20261014T030000Z")
+        );
+        assert_eq!(
+            first_run(at("20261014T090000Z"), Some(afternoon)),
+            at("20261015T030000Z")
+        );
+        // a manual backup at 23:00 is within MIN_GAP of 03:00: skipped
         let manual = at("20261013T230000Z");
         assert_eq!(next_after(manual, Some(manual)), at("20261015T030000Z"));
         // never two automatic backups within MIN_GAP
