@@ -1796,7 +1796,7 @@ mod tests {
         let s3 = S3::new(cfg.target.clone());
         let data = temp_dir("legacy");
         {
-            let mut store = crate::store::Store::open(Some(&data)).unwrap();
+            let store = crate::store::Store::open(Some(&data)).unwrap();
             store.register().unwrap();
         }
         let db = data.join("rugen.db");
@@ -1905,7 +1905,7 @@ mod tests {
         let data = temp_dir("data");
         let fp = "ab".repeat(32);
         {
-            let mut store = crate::store::Store::open(Some(&data)).unwrap();
+            let store = crate::store::Store::open(Some(&data)).unwrap();
             let a = store.register().unwrap();
             store.register().unwrap();
             store
@@ -2056,7 +2056,7 @@ mod tests {
         // restore the newest into a fresh box that has a different database
         let target = temp_dir("restore");
         {
-            let mut other = crate::store::Store::open(Some(&target)).unwrap();
+            let other = crate::store::Store::open(Some(&target)).unwrap();
             for _ in 0..5 {
                 other.register().unwrap();
             }

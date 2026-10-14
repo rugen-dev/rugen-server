@@ -189,8 +189,8 @@ impl Api {
             "login" => self.account_login(req, v),
             "claim" => self.account_claim(req, v),
             "info" => {
-                let mut s = lock(&self.store);
-                let a = self.auth(&mut s, req, v)?;
+                let s = &self.store;
+                let a = self.auth(s, req, v)?;
                 ok(&AccountInfo {
                     id: a.id,
                     username: a.username.clone().unwrap_or_default(),
@@ -200,8 +200,8 @@ impl Api {
             }
             "password" => self.account_password(req, v),
             "logout" | "logout_all" => {
-                let mut s = lock(&self.store);
-                let a = self.auth(&mut s, req, v)?;
+                let s = &self.store;
+                let a = self.auth(s, req, v)?;
                 if a.username.is_none() {
                     // its key is all there is: revoking it would lose the account
                     return Err(err(409, "THIS ACCOUNT HAS NO PASSWORD YET: CLAIM IT FIRST"));
@@ -222,7 +222,7 @@ impl Api {
     fn account_register(&self, v: &Value) -> Res {
         let (username, password) = new_credentials(v)?;
         {
-            let s = lock(&self.store);
+            let s = &self.store;
             if db(s.account_count())? >= 1_000_000 {
                 return Err(err(409, "server full"));
             }
@@ -231,7 +231,7 @@ impl Api {
             }
         }
         let phc = hash(&password)?;
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let (a, key) = db(s.register_named(&username, &phc))?.map_err(name_error)?;
         log::info!("accounts: {} registered as {username}", a.id);
         session(&a, key)
@@ -246,7 +246,7 @@ impl Api {
             .map_err(locked_out)?;
         let password = field(v, "password", rugen_proto::account::PASSWORD_MAX);
         let creds = if username_error(username).is_none() {
-            db(lock(&self.store).credentials(username))?
+            db(self.store.credentials(username))?
         } else {
             None
         };
@@ -263,7 +263,7 @@ impl Api {
             return Err(err(401, WRONG));
         };
         lock(&self.logins).success(&user);
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let key = db(s.issue_key(id))?;
         let a = db(s.by_id(id))?.ok_or_else(|| err(401, WRONG))?;
         self.note_seen(a.id);
@@ -276,11 +276,11 @@ impl Api {
             return Err(name_error(NameError::AlreadyNamed));
         }
         let (username, password) = new_credentials(v)?;
-        if db(lock(&self.store).username_taken(&username))? {
+        if db(self.store.username_taken(&username))? {
             return Err(name_error(NameError::Taken));
         }
         let phc = hash(&password)?;
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let a = db(s.claim(a.id, &username, &phc))?.map_err(name_error)?;
         log::info!("accounts: {} claimed as {username}", a.id);
         let key = super::request_key(req, v).unwrap_or_default();
@@ -303,17 +303,15 @@ impl Api {
             return Err(err(400, e));
         }
         let old = field(v, "password", rugen_proto::account::PASSWORD_MAX).unwrap_or("");
-        let phc = db(lock(&self.store).password_of(a.id))?;
+        let phc = db(self.store.password_of(a.id))?;
         if !password::verify_account(old, phc.as_deref()) {
             lock(&self.logins).fail_at(&user, req.ip, Instant::now());
             return Err(err(401, "WRONG PASSWORD"));
         }
         lock(&self.logins).success(&user);
         let phc = hash(new)?;
-        let mut s = lock(&self.store);
-        db(s.set_password(a.id, &phc))?;
-        db(s.revoke_all(a.id))?;
-        let key = db(s.issue_key(a.id))?;
+        // one transaction: no old key outlives the new password
+        let key = db(self.store.replace_password(a.id, &phc, true))?.unwrap_or_default();
         log::info!(
             "accounts: {} changed the password (other devices logged out)",
             a.id
@@ -324,13 +322,11 @@ impl Api {
     /// Operator reset (`/v1/admin/reset_password`, `--reset-password`): a
     /// temporary password, every key revoked. Returns (username, password).
     pub fn reset_password(&self, username: &str) -> Result<(String, String), Response> {
-        let a = db(lock(&self.store).by_username(username))?
-            .ok_or_else(|| err(404, "no such username"))?;
+        let a =
+            db(self.store.by_username(username))?.ok_or_else(|| err(404, "no such username"))?;
         let temp = password::temporary();
         let phc = hash(&temp)?;
-        let mut s = lock(&self.store);
-        db(s.set_password(a.id, &phc))?;
-        db(s.revoke_all(a.id))?;
+        db(self.store.replace_password(a.id, &phc, false))?;
         let name = a.username.unwrap_or_default();
         log::warn!("admin: password of {name} ({}) reset", a.id);
         Ok((name, temp))

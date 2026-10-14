@@ -717,7 +717,7 @@ fn turn_match_through_a_tunnel_only_server() {
     );
     let health = a.info().unwrap();
     assert_eq!(health.name, "e2e");
-    let st = srv.api.turn.as_ref().unwrap().status(&srv.api.store_lock());
+    let st = srv.api.turn.as_ref().unwrap().status(srv.api.store());
     assert_eq!(st["matches"], 1);
     eprintln!("turn status: {st}");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -738,7 +738,7 @@ fn named_account_moves_between_devices() {
     assert!(s.profile.verified);
     let opponent = OnlineClient::new(&srv.url, None).register().unwrap();
     {
-        let mut st = srv.api.store_lock();
+        let st = srv.api.store();
         let m = st.new_match([s.id, opponent.id], true, "{}").unwrap();
         let w = crate::store::ReportData {
             winner: s.id,

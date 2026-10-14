@@ -378,6 +378,9 @@ impl Truth {
         {
             return Ok(Some(blob.clone()));
         }
+        // sequence and lists from one snapshot (a block landing meanwhile
+        // comes with its new sequence)
+        let (seq, blocked, ratings) = store.feed(FEED_RATINGS)?;
         let now = trust::now();
         let feed = TruthFeed {
             v: TRUST_VERSION,
@@ -385,8 +388,8 @@ impl Truth {
             issued_at: now,
             expires_at: now + trust::FEED_VALIDITY,
             sequence: seq,
-            blocked: store.blocklist()?,
-            ratings: store.feed_ratings(FEED_RATINGS)?,
+            blocked,
+            ratings,
         };
         let blob = self.sign(rugen_proto::purpose::TRUTH, &feed);
         if let Some(b) = &blob {

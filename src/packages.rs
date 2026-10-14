@@ -426,7 +426,7 @@ impl Packages {
     /// Expire (TTL, unless kept for a replay) and evict (LRU above the total
     /// cap) packages, drop stale partial uploads and orphan files. Returns
     /// the fingerprints removed.
-    pub fn sweep(&self, store: &mut Store) -> Vec<String> {
+    pub fn sweep(&self, store: &Store) -> Vec<String> {
         let t = now();
         let mut removed = Vec::new();
         let rows = match store.packages_lru() {

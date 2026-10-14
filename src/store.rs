@@ -6,6 +6,7 @@
 //! renamed to `state.json.migrated`).
 
 use std::path::Path;
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rugen_proto::{ProfileInfo, Season, rank_name};
@@ -383,8 +384,71 @@ fn tune(c: &Connection) -> DbResult<()> {
 /// distinct queries; rusqlite's default of 16 would keep re-parsing them).
 const STATEMENT_CACHE: usize = 256;
 
+/// The database: one writer connection (every write goes through it) and,
+/// for a database file, a small pool of read-only connections for the
+/// read-only queries (WAL: readers never wait for the writer). An
+/// in-memory database (tests) reads through the writer connection.
+///
+/// Every method is one unit: a write runs in a savepoint and has
+/// committed when it returns, so a read that follows (from any
+/// connection) sees it; a read runs in one read transaction (one
+/// consistent snapshot).
 pub struct Store {
-    conn: Connection,
+    writer: std::sync::Arc<Mutex<Connection>>,
+    readers: Option<Pool>,
+}
+
+/// Read-only connections; a reader waits for an idle one.
+struct Pool {
+    idle: Mutex<Vec<Connection>>,
+    ready: Condvar,
+}
+
+/// Read-only connections of a database file.
+const READERS: usize = 3;
+
+/// A session key's hash and when it was last used (Unix seconds).
+type KeyUse = (String, u64);
+
+/// The queries, on one connection (the writer inside a write, a reader
+/// inside a read).
+struct Db<'c> {
+    conn: &'c Connection,
+}
+
+/// A savepoint that behaves like a transaction: [`Tx::commit`] releases
+/// it, dropping it uncommitted rolls it back. Savepoints nest, so a write
+/// can run inside a larger transaction.
+struct Tx<'c> {
+    conn: &'c Connection,
+    done: bool,
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Tx<'_> {
+    fn commit(mut self) -> DbResult<()> {
+        self.done = true;
+        self.conn.prepare_cached("RELEASE store")?.execute([])?;
+        Ok(())
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.conn.execute_batch("ROLLBACK TO store; RELEASE store");
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// One month of TURN accounting (bytes).
@@ -412,6 +476,57 @@ fn checksums_col(b: Option<Vec<u8>>) -> Vec<(u32, u64)> {
         .unwrap_or_default()
 }
 
+impl Pool {
+    fn open(path: &Path, n: usize) -> DbResult<Self> {
+        use rusqlite::OpenFlags;
+        let mut idle = Vec::with_capacity(n);
+        for _ in 0..n {
+            let c = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            c.busy_timeout(std::time::Duration::from_secs(5))?;
+            c.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+            tune(&c)?;
+            idle.push(c);
+        }
+        Ok(Self {
+            idle: Mutex::new(idle),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Run `f` on an idle connection (waits for one).
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        struct Back<'p> {
+            pool: &'p Pool,
+            conn: Option<Connection>,
+        }
+        impl Drop for Back<'_> {
+            fn drop(&mut self) {
+                if let Some(c) = self.conn.take() {
+                    lock(&self.pool.idle).push(c);
+                    self.pool.ready.notify_one();
+                }
+            }
+        }
+        let conn = {
+            let mut idle = lock(&self.idle);
+            loop {
+                if let Some(c) = idle.pop() {
+                    break c;
+                }
+                idle = self.ready.wait(idle).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        let back = Back {
+            pool: self,
+            conn: Some(conn),
+        };
+        f(back.conn.as_ref().expect("connection held"))
+    }
+}
+
 impl Store {
     /// Open (or create) `<dir>/rugen.db`; `None` keeps everything in memory (tests).
     pub fn open(dir: Option<&Path>) -> DbResult<Self> {
@@ -432,29 +547,526 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // every query goes through `prepare_cached`: keep all of them parsed
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
-        let mut s = Self { conn };
-        let fresh = s.migrate()?;
-        s.ensure_turn_schema()?;
-        if s.meta("season")?.is_none() {
-            s.set_meta("season", 1)?;
-            s.set_meta("season_start", now() as i64)?;
+        {
+            let s = Db { conn: &conn };
+            let fresh = s.migrate()?;
+            s.ensure_turn_schema()?;
+            if s.meta("season")?.is_none() {
+                s.set_meta("season", 1)?;
+                s.set_meta("season_start", now() as i64)?;
+            }
+            if s.meta("next_id")?.is_none() {
+                s.set_meta("next_id", 1000)?;
+            }
+            if fresh && let Some(d) = dir {
+                s.import_json(d)?;
+            }
+            s.roll_season()?;
         }
-        if s.meta("next_id")?.is_none() {
-            s.set_meta("next_id", 1000)?;
+        let readers = match dir {
+            Some(d) => Some(Pool::open(&d.join("rugen.db"), READERS)?),
+            None => None,
+        };
+        Ok(Self {
+            writer: std::sync::Arc::new(Mutex::new(conn)),
+            readers,
+        })
+    }
+
+    /// Run a read-only unit on a reader (one read transaction: a consistent
+    /// snapshot, and every write that returned before it is visible).
+    fn read<T>(&self, f: impl FnOnce(&Db<'_>) -> DbResult<T>) -> DbResult<T> {
+        match &self.readers {
+            Some(pool) => pool.with(|c| {
+                c.prepare_cached("BEGIN")?.execute([])?;
+                let out = f(&Db { conn: c });
+                match &out {
+                    Ok(_) => {
+                        c.prepare_cached("COMMIT")?.execute([])?;
+                    }
+                    Err(_) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                    }
+                }
+                out
+            }),
+            None => f(&Db {
+                conn: &lock(&self.writer),
+            }),
         }
-        if fresh && let Some(d) = dir {
-            s.import_json(d)?;
+    }
+
+    /// Run a write unit on the writer, atomically: it has committed when
+    /// this returns (or changed nothing when it failed).
+    fn write<T, F>(&self, f: F) -> DbResult<T>
+    where
+        F: FnOnce(&Db<'_>) -> DbResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let c = lock(&self.writer);
+        let d = Db { conn: &c };
+        let out = d.tx().and_then(|tx| {
+            let v = f(&d)?;
+            tx.commit()?;
+            Ok(v)
+        });
+        if !c.is_autocommit() {
+            // a failed COMMIT leaves the transaction open
+            let _ = c.execute_batch("ROLLBACK");
         }
-        s.roll_season()?;
-        Ok(s)
+        out
+    }
+
+    /// The writer connection (tests poke at the schema directly).
+    #[cfg(test)]
+    fn writer_conn(&self) -> MutexGuard<'_, Connection> {
+        lock(&self.writer)
+    }
+
+    /// P1 and P2 of a match.
+    pub fn match_players(&self, match_id: u64) -> DbResult<Option<[u64; 2]>> {
+        self.read(|d| d.match_players(match_id))
+    }
+
+    /// TURN usage of a month (`YYYY-MM`, UTC).
+    pub fn turn_usage(&self, month: &str) -> DbResult<TurnMonth> {
+        self.read(|d| d.turn_usage(month))
+    }
+
+    /// Add to a month's TURN accounting (`reserved` may be negative: a
+    /// settled credential gives back part of its reservation).
+    pub fn turn_add(
+        &self,
+        month: &str,
+        reserved: i64,
+        reported: u64,
+        credentials: u64,
+    ) -> DbResult<()> {
+        let month = month.to_string();
+        self.write(move |d| d.turn_add(&month, reserved, reported, credentials))
+    }
+
+    /// Usage Cloudflare's analytics report for a month (bytes, both ways).
+    pub fn turn_set_cloudflare(&self, month: &str, bytes: u64) -> DbResult<()> {
+        let month = month.to_string();
+        self.write(move |d| d.turn_set_cloudflare(&month, bytes))
+    }
+
+    pub fn schema_version(&self) -> DbResult<usize> {
+        self.read(|d| d.schema_version())
+    }
+
+    /// Start a new season when the current one is over: ratings soft-reset toward 1200.
+    pub fn roll_season(&self) -> DbResult<()> {
+        if self.read(|d| d.season_due())? {
+            self.write(|d| d.roll_season())?;
+        }
+        Ok(())
+    }
+
+    pub fn season(&self) -> DbResult<Season> {
+        self.read(|d| d.season())
+    }
+
+    pub fn account_count(&self) -> DbResult<usize> {
+        self.read(|d| d.account_count())
+    }
+
+    /// Accounts whose name starts with `prefix` (load-test leftovers) and
+    /// their unranked matches (reports / replays cascade): counted only when
+    /// `dry_run`, deleted otherwise. Ranked matches are kept (they moved
+    /// other players' ratings). Returns (accounts, matches).
+    pub fn delete_accounts_by_prefix(
+        &self,
+        prefix: &str,
+        dry_run: bool,
+    ) -> DbResult<(usize, usize)> {
+        let prefix = prefix.to_string();
+        self.write(move |d| d.delete_accounts_by_prefix(&prefix, dry_run))
+    }
+
+    /// Both sides reported (or the match was otherwise settled).
+    pub fn match_resolved(&self, match_id: u64) -> DbResult<bool> {
+        self.read(|d| d.match_resolved(match_id))
+    }
+
+    pub fn register(&self) -> DbResult<Account> {
+        self.write(|d| d.register())
+    }
+
+    /// The account owning `key` (an anonymous account's key, or a session
+    /// key of a named account); refreshes its `last_seen` (written at most
+    /// once a minute: this runs on every authenticated call).
+    pub fn by_key(&self, key: &str) -> DbResult<Option<Account>> {
+        if key.len() != 64 {
+            return Ok(None);
+        }
+        let Some((mut a, session)) = self.read(|d| d.lookup_key(key))? else {
+            return Ok(None);
+        };
+        let t = now();
+        let seen = a.last_seen + 60 <= t;
+        let used = session.filter(|(_, used)| used + 60 <= t).map(|(h, _)| h);
+        if seen || used.is_some() {
+            let id = a.id;
+            self.write(move |d| d.touch_key(id, seen, used.as_deref(), t))?;
+            if seen {
+                a.last_seen = t;
+            }
+        }
+        Ok(Some(a))
+    }
+
+    /// The named account called `username` (any case).
+    pub fn by_username(&self, username: &str) -> DbResult<Option<Account>> {
+        self.read(|d| d.by_username(username))
+    }
+
+    /// Account id and password hash of `username` (login).
+    pub fn credentials(&self, username: &str) -> DbResult<Option<(u64, Option<String>)>> {
+        self.read(|d| d.credentials(username))
+    }
+
+    /// Password hash of account `id`.
+    pub fn password_of(&self, id: u64) -> DbResult<Option<String>> {
+        self.read(|d| d.password_of(id))
+    }
+
+    pub fn username_taken(&self, username: &str) -> DbResult<bool> {
+        self.read(|d| d.username_taken(username))
+    }
+
+    /// A new named account (rating at the start, like an anonymous one).
+    /// `username` must already be valid ([`rugen_proto::account::username_error`])
+    /// and `phc` an Argon2id hash. Returns the account and its first key.
+    pub fn register_named(
+        &self,
+        username: &str,
+        phc: &str,
+    ) -> DbResult<Result<(Account, String), NameError>> {
+        let (username, phc) = (username.to_string(), phc.to_string());
+        self.write(move |d| d.register_named(&username, &phc))
+    }
+
+    /// Give anonymous account `id` a username and password: it keeps its
+    /// id, rating and history, and the key it already has.
+    pub fn claim(
+        &self,
+        id: u64,
+        username: &str,
+        phc: &str,
+    ) -> DbResult<Result<Account, NameError>> {
+        let (username, phc) = (username.to_string(), phc.to_string());
+        self.write(move |d| d.claim(id, &username, &phc))
+    }
+
+    /// A new session key for account `id` (login on a device). Only the
+    /// [`MAX_SESSIONS`] most recently used keys stay valid.
+    pub fn issue_key(&self, id: u64) -> DbResult<String> {
+        self.write(move |d| d.issue_key(id))
+    }
+
+    /// Revoke one key (log out this device).
+    pub fn revoke_key(&self, id: u64, key: &str) -> DbResult<()> {
+        let key = key.to_string();
+        self.write(move |d| d.revoke_key(id, &key))
+    }
+
+    /// Revoke every key of account `id` (log out everywhere).
+    pub fn revoke_all(&self, id: u64) -> DbResult<()> {
+        self.write(move |d| d.revoke_all(id))
+    }
+
+    /// Replace the password hash of account `id` and revoke every key it
+    /// has, in one transaction; `fresh_key` hands this device a new key.
+    pub fn replace_password(
+        &self,
+        id: u64,
+        phc: &str,
+        fresh_key: bool,
+    ) -> DbResult<Option<String>> {
+        let phc = phc.to_string();
+        self.write(move |d| {
+            d.set_password(id, &phc)?;
+            d.revoke_all(id)?;
+            fresh_key.then(|| d.issue_key(id)).transpose()
+        })
+    }
+
+    /// Keys (devices) able to act for account `id`.
+    pub fn sessions(&self, id: u64) -> DbResult<u32> {
+        self.read(|d| d.sessions(id))
+    }
+
+    pub fn by_id(&self, id: u64) -> DbResult<Option<Account>> {
+        self.read(|d| d.by_id(id))
+    }
+
+    pub fn set_profile(
+        &self,
+        id: u64,
+        name: Option<String>,
+        avatar: Option<u32>,
+    ) -> DbResult<Option<Account>> {
+        self.write(move |d| d.set_profile(id, name, avatar))
+    }
+
+    /// A new match row. `setup` (JSON: characters, stage, rules) is kept for replays.
+    pub fn new_match(&self, players: [u64; 2], ranked: bool, setup: &str) -> DbResult<u64> {
+        let setup = setup.to_string();
+        self.write(move |d| d.new_match(players, ranked, &setup))
+    }
+
+    /// Replace a match's setup JSON (fingerprints become known at start).
+    pub fn set_setup(&self, match_id: u64, setup: &str) -> DbResult<()> {
+        let setup = setup.to_string();
+        self.write(move |d| d.set_setup(match_id, &setup))
+    }
+
+    /// Record one side's report. The match resolves once both sides
+    /// reported: ratings move (ranked) only when the reports agree
+    /// ([`reports_agree`]); otherwise the match is marked disputed.
+    pub fn report(
+        &self,
+        reporter: u64,
+        match_id: u64,
+        data: &ReportData,
+    ) -> DbResult<ReportOutcome> {
+        let data = data.clone();
+        self.write(move |d| d.report(reporter, match_id, &data))
+    }
+
+    /// Unsettled matches with a single report, from the player who says it
+    /// won because the other one fled or disconnected.
+    pub fn pending_claims(&self) -> DbResult<Vec<Claim>> {
+        self.read(|d| d.pending_claims())
+    }
+
+    /// Settle a claim the server confirmed on its own view of the relay:
+    /// the claimant wins, the other player fled / disconnected. `None`
+    /// when the match is no longer a pending claim (settled meanwhile, or
+    /// the other report arrived: agreement or dispute decide then).
+    pub fn settle_claim(&self, c: &Claim) -> DbResult<Option<[i32; 2]>> {
+        let c = c.clone();
+        self.write(move |d| d.settle_claim(&c))
+    }
+
+    /// How a settled match ended early (`None` for a match played out).
+    pub fn match_ending(&self, match_id: u64) -> DbResult<EndingRow> {
+        self.read(|d| d.match_ending(match_id))
+    }
+
+    /// A client saw a desync (ggrs checksum mismatch): the match can no
+    /// longer resolve by agreement.
+    pub fn report_desync(&self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
+        self.write(move |d| d.report_desync(reporter, match_id, frame))
+    }
+
+    /// A disputed match the server re-simulated: settle it with the
+    /// simulated winner (`None` = undecidable, stays disputed).
+    pub fn resolve_dispute(
+        &self,
+        match_id: u64,
+        winner: Option<u64>,
+        note: &str,
+    ) -> DbResult<bool> {
+        let note = note.to_string();
+        self.write(move |d| d.resolve_dispute(match_id, winner, &note))
+    }
+
+    /// What the re-simulation said about a match (`None`: not run).
+    #[cfg(test)]
+    pub fn resim_note(&self, match_id: u64) -> DbResult<Option<String>> {
+        self.read(|d| d.resim_note(match_id))
+    }
+
+    /// Setup JSON, ranked flag, players and the reports (reporter, data) of a match.
+    #[allow(clippy::type_complexity)]
+    pub fn match_evidence(
+        &self,
+        match_id: u64,
+    ) -> DbResult<Option<(String, bool, [u64; 2], Vec<(u64, ReportData)>)>> {
+        self.read(|d| d.match_evidence(match_id))
+    }
+
+    /// Is a match disputed (and unresolved by agreement)?
+    pub fn is_disputed(&self, match_id: u64) -> DbResult<bool> {
+        self.read(|d| d.is_disputed(match_id))
+    }
+
+    pub fn package(&self, fp: &str) -> DbResult<Option<PackageRow>> {
+        self.read(|d| d.package(fp))
+    }
+
+    pub fn put_package(&self, p: &PackageRow) -> DbResult<()> {
+        let p = p.clone();
+        self.write(move |d| d.put_package(&p))
+    }
+
+    /// Mark packages as used now (TTL / LRU bookkeeping).
+    pub fn touch_packages(&self, fps: &[&str]) -> DbResult<()> {
+        let fps: Vec<String> = fps.iter().map(|f| f.to_string()).collect();
+        self.write(move |d| d.touch_packages(&fps.iter().map(String::as_str).collect::<Vec<_>>()))
+    }
+
+    /// All packages, least recently used first.
+    pub fn packages_lru(&self) -> DbResult<Vec<PackageRow>> {
+        self.read(|d| d.packages_lru())
+    }
+
+    pub fn delete_package(&self, fp: &str) -> DbResult<()> {
+        let fp = fp.to_string();
+        self.write(move |d| d.delete_package(&fp))
+    }
+
+    pub fn char_rating(&self, fp: &str) -> DbResult<Option<rugen_proto::CharRating>> {
+        self.read(|d| d.char_rating(fp))
+    }
+
+    /// Record an anti-cheat finding against an account; `fingerprint` =
+    /// the content a false profile was declared for (feeds auto-blocking).
+    pub fn flag(
+        &self,
+        account: u64,
+        match_id: Option<u64>,
+        reason: &str,
+        fingerprint: Option<&str>,
+    ) -> DbResult<()> {
+        let (reason, fingerprint) = (reason.to_string(), fingerprint.map(str::to_string));
+        self.write(move |d| d.flag(account, match_id, &reason, fingerprint.as_deref()))
+    }
+
+    /// Distinct accounts flagged for a false profile of `fp`.
+    pub fn liars_for(&self, fp: &str) -> DbResult<u32> {
+        self.read(|d| d.liars_for(fp))
+    }
+
+    /// Matches with a reported desync that `fp` was part of.
+    pub fn desyncs_for(&self, fp: &str) -> DbResult<u32> {
+        self.read(|d| d.desyncs_for(fp))
+    }
+
+    /// Changes whenever the blocklist does (feed `sequence`).
+    pub fn truth_seq(&self) -> DbResult<u64> {
+        self.read(|d| d.truth_seq())
+    }
+
+    /// Block a fingerprint (operator): replaces any entry, clears `allowed`.
+    pub fn block(&self, fp: &str, reason: &str, source: &str) -> DbResult<()> {
+        let (fp, reason, source) = (fp.to_string(), reason.to_string(), source.to_string());
+        self.write(move |d| d.block(&fp, &reason, &source))
+    }
+
+    /// Automatic block: only when the fingerprint has no entry at all (an
+    /// operator-cleared one stays cleared). True when it was added.
+    pub fn auto_block(&self, fp: &str, reason: &str) -> DbResult<bool> {
+        let (fp, reason) = (fp.to_string(), reason.to_string());
+        self.write(move |d| d.auto_block(&fp, &reason))
+    }
+
+    /// Clear a fingerprint (operator). The row stays as `allowed` so that
+    /// automatic rules never block it again. True when it was blocked.
+    pub fn unblock(&self, fp: &str) -> DbResult<bool> {
+        let fp = fp.to_string();
+        self.write(move |d| d.unblock(&fp))
+    }
+
+    pub fn blocked(&self, fp: &str) -> DbResult<Option<rugen_proto::BlockEntry>> {
+        self.read(|d| d.blocked(fp))
+    }
+
+    /// Every blocked fingerprint, oldest first.
+    pub fn blocklist(&self) -> DbResult<Vec<rugen_proto::BlockEntry>> {
+        self.read(|d| d.blocklist())
+    }
+
+    /// The feed's parts from one snapshot: sequence, blocklist and the
+    /// `limit` most played community ratings.
+    #[allow(clippy::type_complexity)]
+    pub fn feed(
+        &self,
+        limit: usize,
+    ) -> DbResult<(
+        u64,
+        Vec<rugen_proto::BlockEntry>,
+        Vec<rugen_proto::FeedRating>,
+    )> {
+        self.read(|d| Ok((d.truth_seq()?, d.blocklist()?, d.feed_ratings(limit)?)))
+    }
+
+    /// A match as seen by `account`: (ranked, players, winner, delta of the
+    /// account, disputed). None when it is not the account's match.
+    #[allow(clippy::type_complexity)]
+    pub fn match_result(
+        &self,
+        match_id: u64,
+        account: u64,
+    ) -> DbResult<Option<(bool, [u64; 2], Option<u64>, i32, bool)>> {
+        self.read(|d| d.match_result(match_id, account))
+    }
+
+    /// Test: make a match's reports `secs` older.
+    #[cfg(test)]
+    pub fn age_reports(&self, match_id: u64, secs: i64) -> DbResult<()> {
+        self.write(move |d| d.age_reports(match_id, secs))
+    }
+
+    #[cfg(test)]
+    pub fn flags_of(&self, account: u64) -> DbResult<Vec<String>> {
+        self.read(|d| d.flags_of(account))
+    }
+
+    /// A stored replay: (players, setup JSON, winner, created, inputs).
+    #[allow(clippy::type_complexity)]
+    pub fn replay(
+        &self,
+        match_id: u64,
+    ) -> DbResult<Option<([u64; 2], String, Option<u64>, u64, Vec<u8>)>> {
+        self.read(|d| d.replay(match_id))
+    }
+
+    #[cfg(test)]
+    pub fn replay_count(&self) -> DbResult<i64> {
+        self.read(|d| d.replay_count())
+    }
+
+    pub fn leaderboard(&self, limit: usize) -> DbResult<Vec<ProfileInfo>> {
+        self.read(|d| d.leaderboard(limit))
+    }
+
+    /// 1-based leaderboard position of a player who has played this season.
+    pub fn rank_of(&self, id: u64) -> DbResult<Option<usize>> {
+        self.read(|d| d.rank_of(id))
+    }
+
+    /// Consistent online copy of the database (`VACUUM INTO`), for backups.
+    pub fn backup_to(&self, path: &Path) -> DbResult<()> {
+        // outside a read transaction: VACUUM cannot run inside one
+        match &self.readers {
+            Some(pool) => pool.with(|c| Db { conn: c }.backup_to(path)),
+            None => Db {
+                conn: &lock(&self.writer),
+            }
+            .backup_to(path),
+        }
+    }
+}
+
+impl Db<'_> {
+    fn tx(&self) -> DbResult<Tx<'_>> {
+        self.conn.prepare_cached("SAVEPOINT store")?.execute([])?;
+        Ok(Tx {
+            conn: self.conn,
+            done: false,
+        })
     }
 
     /// Apply pending migrations. Returns true when the database was empty.
-    fn migrate(&mut self) -> DbResult<bool> {
+    fn migrate(&self) -> DbResult<bool> {
         let version: usize = self
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             tx.execute_batch(sql)?;
             tx.pragma_update(None, "user_version", i + 1)?;
@@ -563,7 +1175,7 @@ impl Store {
     }
 
     /// Import the former `state.json` (accounts, matches, season, id counter).
-    fn import_json(&mut self, dir: &Path) -> DbResult<()> {
+    fn import_json(&self, dir: &Path) -> DbResult<()> {
         #[derive(Deserialize)]
         struct OldAccount {
             id: u64,
@@ -617,7 +1229,7 @@ impl Store {
                 return Ok(());
             }
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         for a in &old.accounts {
             tx.prepare_cached(&format!("INSERT OR IGNORE INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"))?.execute(params![
                     a.id as i64, a.key, a.name, a.avatar, a.rating, a.best_rating, a.wins,
@@ -666,7 +1278,7 @@ impl Store {
     }
 
     /// Start a new season when the current one is over: ratings soft-reset toward 1200.
-    pub fn roll_season(&mut self) -> DbResult<()> {
+    pub fn roll_season(&self) -> DbResult<()> {
         let mut season = self.meta("season")?.unwrap_or(1);
         let mut start = self.meta("season_start")?.unwrap_or(now() as i64);
         let before = season;
@@ -685,6 +1297,12 @@ impl Store {
             log::info!("season {season} started");
         }
         Ok(())
+    }
+
+    /// The current season is over ([`Self::roll_season`] has work to do).
+    fn season_due(&self) -> DbResult<bool> {
+        let start = self.meta("season_start")?.unwrap_or(now() as i64);
+        Ok(now() as i64 >= start + SEASON_SECS as i64)
     }
 
     pub fn season(&self) -> DbResult<Season> {
@@ -717,7 +1335,7 @@ impl Store {
     /// `dry_run`, deleted otherwise. Ranked matches are kept (they moved
     /// other players' ratings). Returns (accounts, matches).
     pub fn delete_accounts_by_prefix(
-        &mut self,
+        &self,
         prefix: &str,
         dry_run: bool,
     ) -> DbResult<(usize, usize)> {
@@ -729,7 +1347,7 @@ impl Store {
             })
             .collect();
         let pattern = format!("{esc}%");
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS doomed (id INTEGER PRIMARY KEY); DELETE FROM doomed;",
         )?;
@@ -769,7 +1387,7 @@ impl Store {
             .map(|r| r.unwrap_or(false))
     }
 
-    pub fn register(&mut self) -> DbResult<Account> {
+    pub fn register(&self) -> DbResult<Account> {
         let id = self.fresh_id()?;
         let t = now();
         let a = Account {
@@ -793,50 +1411,46 @@ impl Store {
     }
 
     /// The account owning `key` (an anonymous account's key, or a session
-    /// key of a named account); refreshes its `last_seen` (written at most
-    /// once a minute: this runs on every authenticated call).
-    pub fn by_key(&mut self, key: &str) -> DbResult<Option<Account>> {
-        if key.len() != 64 {
-            return Ok(None);
-        }
-        let mut a = self
+    /// key of a named account) and, for a session key, its hash and when
+    /// it was last used.
+    fn lookup_key(&self, key: &str) -> DbResult<Option<(Account, Option<KeyUse>)>> {
+        let a = self
             .conn
             .prepare_cached(&format!(
                 "SELECT {ACCOUNT_SELECT} FROM accounts WHERE key = ?1"
             ))?
             .query_row([key], Account::from_row)
             .optional()?;
-        let mut session = None;
-        if a.is_none() {
-            let h = key_hash(key);
-            let row = self
-                .conn
-                .prepare_cached("SELECT account, last_used FROM account_keys WHERE hash = ?1")?
-                .query_row([&h], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
-                })
-                .optional()?;
-            if let Some((id, used)) = row {
-                a = self.by_id(id as u64)?;
-                session = Some((h, used));
-            }
+        if let Some(a) = a {
+            return Ok(Some((a, None)));
         }
-        let Some(mut a) = a else { return Ok(None) };
-        let t = now();
-        if a.last_seen + 60 <= t {
+        let h = key_hash(key);
+        let row = self
+            .conn
+            .prepare_cached("SELECT account, last_used FROM account_keys WHERE hash = ?1")?
+            .query_row([&h], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .optional()?;
+        let Some((id, used)) = row else {
+            return Ok(None);
+        };
+        Ok(self.by_id(id as u64)?.map(|a| (a, Some((h, used)))))
+    }
+
+    /// Refresh `last_seen` of an account and / or `last_used` of a session key.
+    fn touch_key(&self, id: u64, seen: bool, session: Option<&str>, t: u64) -> DbResult<()> {
+        if seen {
             self.conn
                 .prepare_cached("UPDATE accounts SET last_seen = ?2 WHERE id = ?1")?
-                .execute(params![a.id as i64, t as i64])?;
-            a.last_seen = t;
+                .execute(params![id as i64, t as i64])?;
         }
-        if let Some((h, used)) = session
-            && used + 60 <= t
-        {
+        if let Some(h) = session {
             self.conn
                 .prepare_cached("UPDATE account_keys SET last_used = ?2 WHERE hash = ?1")?
                 .execute(params![h, t as i64])?;
         }
-        Ok(Some(a))
+        Ok(())
     }
 
     /// The named account called `username` (any case).
@@ -877,7 +1491,7 @@ impl Store {
     /// `username` must already be valid ([`rugen_proto::account::username_error`])
     /// and `phc` an Argon2id hash. Returns the account and its first key.
     pub fn register_named(
-        &mut self,
+        &self,
         username: &str,
         phc: &str,
     ) -> DbResult<Result<(Account, String), NameError>> {
@@ -921,7 +1535,7 @@ impl Store {
     /// Give anonymous account `id` a username and password: it keeps its
     /// id, rating and history, and the key it already has.
     pub fn claim(
-        &mut self,
+        &self,
         id: u64,
         username: &str,
         phc: &str,
@@ -956,10 +1570,10 @@ impl Store {
 
     /// A new session key for account `id` (login on a device). Only the
     /// [`MAX_SESSIONS`] most recently used keys stay valid.
-    pub fn issue_key(&mut self, id: u64) -> DbResult<String> {
+    pub fn issue_key(&self, id: u64) -> DbResult<String> {
         let key = random_hex(32);
         let t = now() as i64;
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         tx.prepare_cached(
             "INSERT INTO account_keys (hash, account, created, last_used) VALUES (?1, ?2, ?3, ?3)",
         )?
@@ -975,7 +1589,7 @@ impl Store {
     }
 
     /// Revoke one key (log out this device).
-    pub fn revoke_key(&mut self, id: u64, key: &str) -> DbResult<()> {
+    pub fn revoke_key(&self, id: u64, key: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE accounts SET key = ?3 WHERE id = ?1 AND key = ?2")?
             .execute(params![id as i64, key, dead_key("revoked")])?;
@@ -986,8 +1600,8 @@ impl Store {
     }
 
     /// Revoke every key of account `id` (log out everywhere).
-    pub fn revoke_all(&mut self, id: u64) -> DbResult<()> {
-        let tx = self.conn.transaction()?;
+    pub fn revoke_all(&self, id: u64) -> DbResult<()> {
+        let tx = self.tx()?;
         tx.prepare_cached("UPDATE accounts SET key = ?2 WHERE id = ?1")?
             .execute(params![id as i64, dead_key("revoked")])?;
         tx.prepare_cached("DELETE FROM account_keys WHERE account = ?1")?
@@ -996,7 +1610,7 @@ impl Store {
     }
 
     /// Replace the password hash of account `id` (callers revoke keys).
-    pub fn set_password(&mut self, id: u64, phc: &str) -> DbResult<()> {
+    pub fn set_password(&self, id: u64, phc: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE accounts SET password = ?2 WHERE id = ?1")?
             .execute(params![id as i64, phc])?;
@@ -1025,7 +1639,7 @@ impl Store {
     }
 
     pub fn set_profile(
-        &mut self,
+        &self,
         id: u64,
         name: Option<String>,
         avatar: Option<u32>,
@@ -1054,7 +1668,7 @@ impl Store {
     }
 
     /// A new match row. `setup` (JSON: characters, stage, rules) is kept for replays.
-    pub fn new_match(&mut self, players: [u64; 2], ranked: bool, setup: &str) -> DbResult<u64> {
+    pub fn new_match(&self, players: [u64; 2], ranked: bool, setup: &str) -> DbResult<u64> {
         let id = self.fresh_id()?;
         self.conn.prepare_cached("INSERT INTO matches (id, p1, p2, ranked, created, setup) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![
                 id as i64,
@@ -1068,7 +1682,7 @@ impl Store {
     }
 
     /// Replace a match's setup JSON (fingerprints become known at start).
-    pub fn set_setup(&mut self, match_id: u64, setup: &str) -> DbResult<()> {
+    pub fn set_setup(&self, match_id: u64, setup: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE matches SET setup = ?2 WHERE id = ?1")?
             .execute(params![match_id as i64, setup])?;
@@ -1079,13 +1693,13 @@ impl Store {
     /// reported: ratings move (ranked) only when the reports agree
     /// ([`reports_agree`]); otherwise the match is marked disputed.
     pub fn report(
-        &mut self,
+        &self,
         reporter: u64,
         match_id: u64,
         data: &ReportData,
     ) -> DbResult<ReportOutcome> {
         let rejected = ReportOutcome::default();
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         let m = tx
             .prepare_cached("SELECT p1, p2, ranked, resolved, delta1, delta2, winner, disputed, desync, setup FROM matches WHERE id = ?1")?.query_row([match_id as i64],
                 |r| {
@@ -1205,7 +1819,7 @@ impl Store {
     /// ratings of both character fingerprints, the replay (ranked, keeping
     /// its packages longer) and the resolved flag.
     fn settle(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &Connection,
         match_id: u64,
         players: [u64; 2],
         ranked: bool,
@@ -1288,7 +1902,7 @@ impl Store {
     }
 
     fn set_ending(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &Connection,
         match_id: u64,
         ending: Option<rugen_proto::Ending>,
         fled: Option<u64>,
@@ -1338,8 +1952,8 @@ impl Store {
     /// the claimant wins, the other player fled / disconnected. `None`
     /// when the match is no longer a pending claim (settled meanwhile, or
     /// the other report arrived: agreement or dispute decide then).
-    pub fn settle_claim(&mut self, c: &Claim) -> DbResult<Option<[i32; 2]>> {
-        let tx = self.conn.transaction()?;
+    pub fn settle_claim(&self, c: &Claim) -> DbResult<Option<[i32; 2]>> {
+        let tx = self.tx()?;
         if !Self::pending_claims_tx(&tx, c)? {
             return Ok(None);
         }
@@ -1371,7 +1985,7 @@ impl Store {
     }
 
     /// Still unsettled with only the claimant's report?
-    fn pending_claims_tx(tx: &rusqlite::Transaction<'_>, c: &Claim) -> DbResult<bool> {
+    fn pending_claims_tx(tx: &Connection, c: &Claim) -> DbResult<bool> {
         let n: i64 = tx
             .prepare_cached(
                 "SELECT COUNT(*) FROM reports r JOIN matches m ON m.id = r.match_id
@@ -1396,7 +2010,7 @@ impl Store {
 
     /// A client saw a desync (ggrs checksum mismatch): the match can no
     /// longer resolve by agreement.
-    pub fn report_desync(&mut self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
+    pub fn report_desync(&self, reporter: u64, match_id: u64, frame: u32) -> DbResult<bool> {
         let n = self
             .conn
             .prepare_cached("UPDATE matches SET desync = 1 WHERE id = ?1 AND (p1 = ?2 OR p2 = ?2)")?
@@ -1411,12 +2025,12 @@ impl Store {
     /// A disputed match the server re-simulated: settle it with the
     /// simulated winner (`None` = undecidable, stays disputed).
     pub fn resolve_dispute(
-        &mut self,
+        &self,
         match_id: u64,
         winner: Option<u64>,
         note: &str,
     ) -> DbResult<bool> {
-        let tx = self.conn.transaction()?;
+        let tx = self.tx()?;
         let m = tx
             .prepare_cached(
                 "SELECT p1, p2, ranked, setup, disputed, winner FROM matches WHERE id = ?1",
@@ -1527,7 +2141,7 @@ impl Store {
             .optional()
     }
 
-    pub fn put_package(&mut self, p: &PackageRow) -> DbResult<()> {
+    pub fn put_package(&self, p: &PackageRow) -> DbResult<()> {
         let profile = p
             .profile
             .as_ref()
@@ -1551,7 +2165,7 @@ impl Store {
     }
 
     /// Mark packages as used now (TTL / LRU bookkeeping).
-    pub fn touch_packages(&mut self, fps: &[&str]) -> DbResult<()> {
+    pub fn touch_packages(&self, fps: &[&str]) -> DbResult<()> {
         for f in fps {
             self.conn
                 .prepare_cached("UPDATE packages SET last_used = ?2 WHERE fingerprint = ?1")?
@@ -1568,7 +2182,7 @@ impl Store {
         st.query_map([], PackageRow::from_row)?.collect()
     }
 
-    pub fn delete_package(&mut self, fp: &str) -> DbResult<()> {
+    pub fn delete_package(&self, fp: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("DELETE FROM packages WHERE fingerprint = ?1")?
             .execute([fp])?;
@@ -1591,7 +2205,7 @@ impl Store {
     /// Record an anti-cheat finding against an account; `fingerprint` =
     /// the content a false profile was declared for (feeds auto-blocking).
     pub fn flag(
-        &mut self,
+        &self,
         account: u64,
         match_id: Option<u64>,
         reason: &str,
@@ -1640,7 +2254,7 @@ impl Store {
     }
 
     /// Block a fingerprint (operator): replaces any entry, clears `allowed`.
-    pub fn block(&mut self, fp: &str, reason: &str, source: &str) -> DbResult<()> {
+    pub fn block(&self, fp: &str, reason: &str, source: &str) -> DbResult<()> {
         self.conn.prepare_cached("INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT(fingerprint) DO UPDATE SET reason = ?2, source = ?3, allowed = 0, created = ?4")?.execute(params![fp, reason, source, now() as i64])?;
         self.bump_truth_seq()
@@ -1648,7 +2262,7 @@ impl Store {
 
     /// Automatic block: only when the fingerprint has no entry at all (an
     /// operator-cleared one stays cleared). True when it was added.
-    pub fn auto_block(&mut self, fp: &str, reason: &str) -> DbResult<bool> {
+    pub fn auto_block(&self, fp: &str, reason: &str) -> DbResult<bool> {
         let n = self.conn.prepare_cached("INSERT OR IGNORE INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, ?2, 'auto', 0, ?3)")?.execute(params![fp, reason, now() as i64])?;
         if n > 0 {
             log::warn!(
@@ -1662,7 +2276,7 @@ impl Store {
 
     /// Clear a fingerprint (operator). The row stays as `allowed` so that
     /// automatic rules never block it again. True when it was blocked.
-    pub fn unblock(&mut self, fp: &str) -> DbResult<bool> {
+    pub fn unblock(&self, fp: &str) -> DbResult<bool> {
         let was = self.blocked(fp)?.is_some();
         self.conn.prepare_cached("INSERT INTO blocklist (fingerprint, reason, source, allowed, created) VALUES (?1, 'cleared', 'admin', 1, ?2)
              ON CONFLICT(fingerprint) DO UPDATE SET allowed = 1")?.execute(params![fp, now() as i64])?;
@@ -1870,7 +2484,7 @@ mod tests {
 
     #[test]
     fn agreed_result_moves_ratings_once() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         let m = s.new_match([a, b], true, "{}").unwrap();
@@ -1901,7 +2515,7 @@ mod tests {
     #[test]
     fn a_forfeit_settles_at_once_as_a_loss() {
         use rugen_proto::Ending;
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         let m = s.new_match([a, b], true, "{}").unwrap();
@@ -1933,7 +2547,7 @@ mod tests {
     #[test]
     fn a_claim_waits_for_the_server_and_yields_to_the_other_report() {
         use rugen_proto::Ending;
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         // a says b disconnected: nothing moves on its word alone
@@ -1987,7 +2601,7 @@ mod tests {
 
     #[test]
     fn disagreement_is_disputed_and_outsiders_rejected() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         let c = s.register().unwrap().id;
@@ -2004,7 +2618,7 @@ mod tests {
 
     #[test]
     fn periodic_checksums_catch_a_forged_match() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         let honest = ReportData {
@@ -2040,7 +2654,7 @@ mod tests {
 
     #[test]
     fn input_streams_verify_results_and_become_replays() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
         let b = s.register().unwrap().id;
         // same inputs (one side a few unconfirmed frames short), same checksum
@@ -2104,7 +2718,7 @@ mod tests {
 
     #[test]
     fn profile_names_are_sanitized() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let id = s.register().unwrap().id;
         let a = s
             .set_profile(id, Some("<script>Bob Z".into()), Some(500))
@@ -2116,7 +2730,7 @@ mod tests {
 
     #[test]
     fn named_accounts_store_hashes_only() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let (a, key) = s.register_named("Axel", "$argon2id$fake").unwrap().unwrap();
         assert_eq!(
             (a.name.as_str(), a.username.as_deref()),
@@ -2127,7 +2741,7 @@ mod tests {
         assert_eq!(s.by_key(&key).unwrap().unwrap().id, a.id);
         // session keys are stored hashed
         let stored: String = s
-            .conn
+            .writer_conn()
             .query_row("SELECT hash FROM account_keys", [], |r| r.get(0))
             .unwrap();
         assert_ne!(stored, key);
@@ -2168,7 +2782,7 @@ mod tests {
         s.delete_accounts_by_prefix("loadtest-", false).unwrap();
         assert!(s.by_key(&k).unwrap().is_none());
         let left: i64 = s
-            .conn
+            .writer_conn()
             .query_row("SELECT COUNT(*) FROM account_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 1, "only Axel's key is left");
@@ -2191,7 +2805,7 @@ mod tests {
             .unwrap();
             tx.commit().unwrap();
         }
-        let mut s = Store::open(Some(&dir)).unwrap();
+        let s = Store::open(Some(&dir)).unwrap();
         assert_eq!(s.schema_version().unwrap(), 6);
         let a = s.by_key(&"cd".repeat(32)).unwrap().unwrap();
         assert_eq!((a.name.as_str(), a.rating, a.username), ("OLD", 1300, None));
@@ -2204,7 +2818,7 @@ mod tests {
         let dir = temp_dir("tuned");
         let s = Store::open(Some(&dir)).unwrap();
         let get = |k: &str| -> String {
-            s.conn
+            s.writer_conn()
                 .pragma_query_value(None, k, |r| {
                     r.get::<_, rusqlite::types::Value>(0).map(|v| match v {
                         rusqlite::types::Value::Integer(i) => i.to_string(),
@@ -2224,23 +2838,72 @@ mod tests {
     }
 
     #[test]
+    fn readers_see_every_committed_write() {
+        let dir = temp_dir("readers");
+        let s = std::sync::Arc::new(Store::open(Some(&dir)).unwrap());
+        assert!(
+            s.readers.is_some(),
+            "a database file reads through the pool"
+        );
+        // each thread writes, then reads it back at once through a reader
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        let a = s.register().unwrap();
+                        assert_eq!(s.by_key(&a.key).unwrap().unwrap().id, a.id);
+                        s.set_profile(a.id, None, Some(i)).unwrap();
+                        assert_eq!(s.by_id(a.id).unwrap().unwrap().avatar, i);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(s.account_count().unwrap(), 8 * 40);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_never_wait_for_the_writer() {
+        let dir = temp_dir("nowait");
+        let s = std::sync::Arc::new(Store::open(Some(&dir)).unwrap());
+        let id = s.register().unwrap().id;
+        // the writer is in the middle of a transaction
+        let w = s.writer_conn();
+        w.execute_batch("BEGIN IMMEDIATE; UPDATE accounts SET name = 'HALFWAY'")
+            .unwrap();
+        let r = s.clone();
+        let read = std::thread::spawn(move || r.by_id(id).unwrap().unwrap().name);
+        let name = read.join().unwrap();
+        assert_ne!(name, "HALFWAY", "readers see committed data only");
+        w.execute_batch("ROLLBACK").unwrap();
+        drop(w);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn persists_in_wal_file_and_reopens() {
         let dir = temp_dir("persist");
         let (key, id) = {
-            let mut s = Store::open(Some(&dir)).unwrap();
+            let s = Store::open(Some(&dir)).unwrap();
             assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len());
             let a = s.register().unwrap();
             s.set_profile(a.id, Some("Ryu".into()), None).unwrap();
             (a.key, a.id)
         };
-        let mut s = Store::open(Some(&dir)).unwrap();
+        let s = Store::open(Some(&dir)).unwrap();
         let a = s.by_key(&key).unwrap().unwrap();
         assert_eq!((a.id, a.name.as_str()), (id, "Ryu"));
         assert!(s.by_key(&"0".repeat(64)).unwrap().is_none());
         // ids keep increasing across restarts
         assert!(s.register().unwrap().id > id);
         let mode: String = s
-            .conn
+            .writer_conn()
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
@@ -2271,7 +2934,7 @@ mod tests {
             "next_id": 1002
         });
         std::fs::write(dir.join("state.json"), json.to_string()).unwrap();
-        let mut s = Store::open(Some(&dir)).unwrap();
+        let s = Store::open(Some(&dir)).unwrap();
         let a = s.by_key(&key).unwrap().unwrap();
         assert_eq!(a.name, "OLDTIMER");
         assert_eq!(a.rating, 1350);
@@ -2289,7 +2952,7 @@ mod tests {
 
     #[test]
     fn blocklist_admin_auto_and_sticky_clearing() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let fp = "a".repeat(64);
         assert_eq!(s.truth_seq().unwrap(), 0);
         assert!(s.auto_block(&fp, "auto: regen").unwrap());
@@ -2320,12 +2983,12 @@ mod tests {
 
     #[test]
     fn season_rolls_and_soft_resets() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let a = s.register().unwrap().id;
-        s.conn
+        s.writer_conn()
             .execute("UPDATE accounts SET rating = 1600, wins = 3", [])
             .unwrap();
-        s.set_meta("season_start", (now() - SEASON_SECS - 5) as i64)
+        s.write(move |d| d.set_meta("season_start", (now() - SEASON_SECS - 5) as i64))
             .unwrap();
         s.roll_season().unwrap();
         assert_eq!(s.season().unwrap().number, 2);
@@ -2335,7 +2998,7 @@ mod tests {
 
     #[test]
     fn accounts_are_deleted_by_name_prefix() {
-        let mut s = Store::open(None).unwrap();
+        let s = Store::open(None).unwrap();
         let mut ids = Vec::new();
         for name in [
             "loadtest-a1",

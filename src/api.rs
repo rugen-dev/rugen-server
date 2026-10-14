@@ -270,7 +270,7 @@ const MATCHUP_KEEP: Duration = Duration::from_secs(4 * 3600);
 pub const MAX_CHUNK: u64 = 4 << 20;
 
 pub struct Api {
-    store: Mutex<Store>,
+    store: Store,
     rooms: Mutex<HashMap<String, Room>>,
     queue: Mutex<Vec<QueueEntry>>,
     /// Matches found for queued players, consumed on poll (with the
@@ -430,7 +430,7 @@ impl Api {
         let turn = cfg.turn.clone().map(Turn::new);
         let backups = Backups::new(std::mem::take(&mut cfg.backup), cfg.data.as_deref());
         Arc::new_cyclic(|me| Self {
-            store: Mutex::new(store),
+            store,
             rooms: Mutex::new(HashMap::new()),
             queue: Mutex::new(Vec::new()),
             found: Mutex::new(HashMap::new()),
@@ -458,7 +458,7 @@ impl Api {
             Some(d) => crate::backup::snapshot_file(&d.join("rugen.db"), out),
             None => {
                 let _ = std::fs::remove_file(out);
-                lock(&self.store)
+                self.store
                     .backup_to(out)
                     .map_err(|e| format!("snapshot: {e}"))
             }
@@ -485,23 +485,24 @@ impl Api {
         }
     }
 
-    pub fn store_lock(&self) -> MutexGuard<'_, Store> {
-        lock(&self.store)
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// TURN housekeeping (revocations, ceilings, analytics), every few
     /// seconds from the server's timer.
     pub fn sweep_turn(&self) {
         if let Some(t) = &self.turn {
-            let s = lock(&self.store);
-            t.sweep(&s, &self.relay);
+            t.sweep(&self.store, &self.relay);
         }
     }
 
     /// Expire / evict stored packages (TTL, LRU size cap).
     pub fn sweep_packages(&self) -> Vec<String> {
-        let mut s = lock(&self.store);
-        self.packages.sweep(&mut s)
+        // matchups pick, touch and check packages under this lock: none
+        // of that interleaves with an eviction
+        let _ms = lock(&self.matchups);
+        self.packages.sweep(&self.store)
     }
 
     /// The account owning a key (WebSocket upgrade).
@@ -509,7 +510,7 @@ impl Api {
         if key.len() != 64 {
             return None;
         }
-        let a = lock(&self.store).by_key(key).ok().flatten()?;
+        let a = self.store.by_key(key).ok().flatten()?;
         self.note_seen(a.id);
         Some(a)
     }
@@ -556,7 +557,7 @@ impl Api {
     }
 
     /// Account for the key in `v` (body) or `?key=`.
-    fn auth(&self, store: &mut Store, req: &Request, v: &Value) -> Result<Account, Response> {
+    fn auth(&self, store: &Store, req: &Request, v: &Value) -> Result<Account, Response> {
         let key = request_key(req, v).ok_or_else(|| err(401, "bad key"))?;
         if key.len() != 64 {
             return Err(err(401, "bad key"));
@@ -570,8 +571,8 @@ impl Api {
     }
 
     fn me(&self, req: &Request, v: &Value) -> Result<Account, Response> {
-        let mut s = lock(&self.store);
-        self.auth(&mut s, req, v)
+        let s = &self.store;
+        self.auth(s, req, v)
     }
 
     pub fn handle(&self, req: Request) -> Response {
@@ -623,7 +624,7 @@ impl Api {
                 let mut v = serde_json::to_value(db(self.info())?).unwrap_or(Value::Null);
                 // TURN budget, numbers only (older clients ignore it)
                 if let Some(t) = &self.turn {
-                    v["turn"] = t.status(&lock(&self.store));
+                    v["turn"] = t.status(&self.store);
                 }
                 // relay counters (additive)
                 v["relay"] = json!({
@@ -638,7 +639,7 @@ impl Api {
                 Ok(Response::json(200, &v))
             }
             ("POST", ["register"]) => {
-                let mut s = lock(&self.store);
+                let s = &self.store;
                 if db(s.account_count())? >= 1_000_000 {
                     return Err(err(409, "server full"));
                 }
@@ -649,8 +650,8 @@ impl Api {
                 })
             }
             ("POST", ["profile"]) => {
-                let mut s = lock(&self.store);
-                let a = self.auth(&mut s, &req, &v)?;
+                let s = &self.store;
+                let a = self.auth(s, &req, &v)?;
                 let name = str_field(&v, "name", 32);
                 let avatar = v.get("avatar").and_then(Value::as_u64).map(|a| a as u32);
                 let a = db(s.set_profile(a.id, name, avatar))?.ok_or_else(|| err(404, "gone"))?;
@@ -658,20 +659,20 @@ impl Api {
             }
             ("GET", ["profile", id]) => {
                 let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
-                match db(lock(&self.store).by_id(id))? {
+                match db(self.store.by_id(id))? {
                     Some(a) => ok(&a.info()),
                     None => Err(err(404, "no such player")),
                 }
             }
             ("GET", ["seasons", "current"]) => {
-                let mut s = lock(&self.store);
+                let s = &self.store;
                 db(s.roll_season())?;
                 ok(&db(s.season())?)
             }
             ("GET", ["leaderboard"]) => {
-                let mut s = lock(&self.store);
+                let s = &self.store;
                 db(s.roll_season())?;
-                let me = match self.auth(&mut s, &req, &v) {
+                let me = match self.auth(s, &req, &v) {
                     Ok(a) => db(s.rank_of(a.id))?.map(|pos| (pos, a.info())),
                     Err(_) => None,
                 };
@@ -699,26 +700,26 @@ impl Api {
             ("POST", ["pkg", fp, "upload"]) => self.pkg_upload(&req, fp),
             ("GET", ["pkg", fp, "data"]) => self.pkg_data(&req, &v, fp),
             ("GET", ["char", fp]) => {
-                let r = db(lock(&self.store).char_rating(fp))?;
+                let r = db(self.store.char_rating(fp))?;
                 ok(&r)
             }
             ("POST", ["match", id, "desync"]) => self.desync(&req, &v, id),
             ("GET", ["match", id, "result"]) => {
                 let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
-                let mut s = lock(&self.store);
-                let me = self.auth(&mut s, &req, &v)?.id;
-                ok(&self.result_ack(&s, id, me)?)
+                let s = &self.store;
+                let me = self.auth(s, &req, &v)?.id;
+                ok(&self.result_ack(s, id, me)?)
             }
             ("GET", ["v1", "truth"]) => {
-                let s = lock(&self.store);
-                match db(self.truth.own_feed(&s))? {
+                let s = &self.store;
+                match db(self.truth.own_feed(s))? {
                     Some(b) => ok(&b),
                     None => Err(err(404, "this server does not sign")),
                 }
             }
             ("GET", ["v1", "truth", "official"]) => {
                 let blob = if self.truth.is_official() {
-                    db(self.truth.own_feed(&lock(&self.store)))?
+                    db(self.truth.own_feed(&self.store))?
                 } else {
                     self.truth.official_blob()
                 };
@@ -789,6 +790,12 @@ impl Api {
     }
 
     fn room_view(&self, store: &Store, code: &str, r: &Room, me: u64) -> RoomInfo {
+        // matchups before (never under) the hub lock: push_matchup takes
+        // the hub with matchups held
+        let matchup = r.matchup.and_then(|id| {
+            let ms = lock(&self.matchups);
+            ms.get(&id).map(|m| self.matchup_view(store, m, me))
+        });
         let hub = lock(&self.hub);
         let my_role = r.member(me).map_or(2, |m| m.role);
         let host = r.player(0);
@@ -823,10 +830,6 @@ impl Api {
         let my_ticket = r.running.as_ref().and_then(|run| {
             let slot = run.slots.iter().position(|&a| a == me)?;
             Some(ticket(run, slot, &self.cfg.udp_public))
-        });
-        let matchup = r.matchup.and_then(|id| {
-            let ms = lock(&self.matchups);
-            ms.get(&id).map(|m| self.matchup_view(store, m, me))
         });
         RoomInfo {
             code: code.to_string(),
@@ -864,7 +867,7 @@ impl Api {
 
     /// Open the matchup phase of a new match between host and challenger
     /// (the relay session starts once both fighters are confirmed and synced).
-    fn start_match(&self, store: &mut Store, r: &mut Room, code: &str) -> Result<(), Response> {
+    fn start_match(&self, store: &Store, r: &mut Room, code: &str) -> Result<(), Response> {
         let (Some(host), Some(chal)) = (r.player(0), r.player(1)) else {
             return Ok(());
         };
@@ -899,14 +902,14 @@ impl Api {
     /// others. Each carries the additive `api` of its host; API 4 callers
     /// (who ignore that field) see other rooms with a `[0.6]` name prefix.
     fn list_rooms(&self, req: &Request) -> Res {
-        let s = lock(&self.store);
+        let s = &self.store;
         let mut rooms = lock(&self.rooms);
         self.expire_rooms(&mut rooms);
         let mut list: Vec<(bool, std::cmp::Reverse<Instant>, RoomSummary)> = rooms
             .iter()
             .filter(|(_, r)| r.public)
             .map(|(code, r)| {
-                let host = r.player(0).map(|m| Self::profile(&s, m.account));
+                let host = r.player(0).map(|m| Self::profile(s, m.account));
                 (
                     r.api != req.api,
                     std::cmp::Reverse(r.created),
@@ -932,8 +935,8 @@ impl Api {
     }
 
     fn create_room(&self, req: &Request, v: &Value) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let char_id = clean_id(&str_field(v, "char", 64).unwrap_or_default());
         let password = match str_field(v, "password", 64) {
             Some(p) => Some(password::hash(&p).ok_or_else(|| err(500, "hash failed"))?),
@@ -981,15 +984,15 @@ impl Api {
             api: req.api,
             engine: req.engine.clone(),
         };
-        let view = self.room_view(&s, &code, &room, me.id);
+        let view = self.room_view(s, &code, &room, me.id);
         rooms.insert(code.clone(), room);
         log::info!("room {code} created by {}", me.id);
         ok(&view)
     }
 
     fn join_room(&self, req: &Request, v: &Value, code: &str) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let char_id = clean_id(&str_field(v, "char", 64).unwrap_or_default());
         let spectate = v.get("spectate").and_then(Value::as_bool).unwrap_or(false);
         let code = code.trim().to_ascii_uppercase();
@@ -1036,16 +1039,16 @@ impl Api {
             });
             log::info!("room {code}: {} joined as role {role}", me.id);
             if role == 1 && r.running.is_none() && r.matchup.is_none() {
-                self.start_match(&mut s, r, &code)?;
+                self.start_match(s, r, &code)?;
             }
-            self.broadcast(&s, &code, r);
+            self.broadcast(s, &code, r);
         }
-        ok(&self.room_view(&s, &code, r, me.id))
+        ok(&self.room_view(s, &code, r, me.id))
     }
 
     fn poll_room(&self, req: &Request, v: &Value, code: &str) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let code = code.trim().to_ascii_uppercase();
         let mut rooms = lock(&self.rooms);
         if let Some(m) = rooms
@@ -1059,16 +1062,16 @@ impl Api {
         if r.member(me.id).is_none() {
             return Err(err(401, "not in this room"));
         }
-        ok(&self.room_view(&s, &code, r, me.id))
+        ok(&self.room_view(s, &code, r, me.id))
     }
 
     fn leave_room(&self, req: &Request, v: &Value, code: &str) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let code = code.trim().to_ascii_uppercase();
         let mut rooms = lock(&self.rooms);
         if let Some(r) = rooms.get_mut(&code) {
-            self.fail_matchup_of(&s, r, me.id, "your opponent left");
+            self.fail_matchup_of(s, r, me.id, "your opponent left");
             r.members.retain(|m| m.account != me.id);
             // a player left (or the host closed the room): the match is over
             if r.player(0).is_none() || r.player(1).is_none() {
@@ -1085,15 +1088,15 @@ impl Api {
                     hub.push(a, &ServerMsg::Kicked { code: code.clone() });
                 }
             } else {
-                self.broadcast(&s, &code, r);
+                self.broadcast(s, &code, r);
             }
         }
         ok(&json!({ "left": true }))
     }
 
     fn kick(&self, req: &Request, v: &Value, code: &str) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let target = v
             .get("id")
             .and_then(Value::as_u64)
@@ -1109,7 +1112,7 @@ impl Api {
         if target == me.id {
             return Err(err(400, "use leave"));
         }
-        self.fail_matchup_of(&s, r, target, "a player was removed");
+        self.fail_matchup_of(s, r, target, "a player was removed");
         r.members.retain(|m| m.account != target);
         r.kicked.push(target);
         if r.running
@@ -1121,13 +1124,13 @@ impl Api {
             }
         }
         lock(&self.hub).push(target, &ServerMsg::Kicked { code: code.clone() });
-        self.broadcast(&s, &code, r);
-        ok(&self.room_view(&s, &code, r, me.id))
+        self.broadcast(s, &code, r);
+        ok(&self.room_view(s, &code, r, me.id))
     }
 
     fn rematch(&self, req: &Request, v: &Value, code: &str) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let code = code.trim().to_ascii_uppercase();
         let mut rooms = lock(&self.rooms);
         let r = rooms
@@ -1142,10 +1145,10 @@ impl Api {
         m.last_seen = Instant::now();
         let both = r.members.iter().filter(|m| m.role < 2 && m.ready).count() == 2;
         if both {
-            self.start_match(&mut s, r, &code)?;
-            self.broadcast(&s, &code, r);
+            self.start_match(s, r, &code)?;
+            self.broadcast(s, &code, r);
         }
-        ok(&self.room_view(&s, &code, r, me.id))
+        ok(&self.room_view(s, &code, r, me.id))
     }
 
     // ---- queue (quick match and ranked)
@@ -1239,7 +1242,7 @@ impl Api {
 
     /// Pair queued players (see [`matchmaking::pairs`]) and open relay sessions.
     pub fn pair(&self) -> Result<(), Response> {
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let mut q = lock(&self.queue);
         // drop entries nobody polled for a while (client gone)
         q.retain(|e| e.last_poll.elapsed().as_secs() < 60);
@@ -1273,8 +1276,8 @@ impl Api {
             m.est_ping_ms = Some(est);
             m.high_ping = high;
             let views = [
-                self.matchup_view(&s, &m, a.id),
-                self.matchup_view(&s, &m, b.id),
+                self.matchup_view(s, &m, a.id),
+                self.matchup_view(s, &m, b.id),
             ];
             lock(&self.matchups).insert(match_id, m);
             let [va, vb] = views;
@@ -1286,7 +1289,7 @@ impl Api {
                 code: code.clone(),
                 side,
                 my_char: me.char_id.clone(),
-                opponent: Self::profile(&s, opp.id),
+                opponent: Self::profile(s, opp.id),
                 opponent_char: opp.char_id.clone(),
                 stage: String::new(),
                 ranked: me.ranked,
@@ -1328,8 +1331,8 @@ impl Api {
     // ---- results and replays
 
     fn result(&self, req: &Request, v: &Value) -> Res {
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?.id;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?.id;
         let (Some(match_id), Some(winner)) = (
             v.get("match_id").and_then(Value::as_u64),
             v.get("winner").and_then(Value::as_u64),
@@ -1384,7 +1387,7 @@ impl Api {
             if let Some(slot) =
                 db(s.match_players(match_id))?.and_then(|p| p.iter().position(|&a| a == me))
             {
-                t.finished(&s, match_id, slot as u8, reported);
+                t.finished(s, match_id, slot as u8, reported);
             }
         }
         if out.disputed {
@@ -1399,7 +1402,7 @@ impl Api {
             None => None,
         };
         let signed = match out.delta {
-            Some(_) => self.result_ack(&s, match_id, me)?.signed,
+            Some(_) => self.result_ack(s, match_id, me)?.signed,
             None => None,
         };
         let (ending, fled) = Self::ending_fields(db(s.match_ending(match_id))?);
@@ -1475,7 +1478,7 @@ impl Api {
     /// relay saw the other slot leave first ([`left_first`]): a client's
     /// word alone never moves a rating.
     pub fn sweep_claims(&self) {
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let claims = match s.pending_claims() {
             Ok(c) => c,
             Err(e) => {
@@ -1588,7 +1591,7 @@ impl Api {
                 Err(err(400, "fingerprint: 64 hex digits"))
             }
         };
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let changed = match op {
             "block" => {
                 let fp = fp()?;
@@ -1608,7 +1611,7 @@ impl Api {
             _ => return Err(err(404, "no such admin action")),
         };
         if changed {
-            self.refresh_verdicts(&s);
+            self.refresh_verdicts(s);
         }
         let official = self.truth.official_feed();
         ok(&json!({
@@ -1665,13 +1668,13 @@ impl Api {
     /// Pull the official feed now (community servers), then re-judge.
     pub fn pull_official(&self) -> Result<rugen_proto::TruthFeed, String> {
         let f = self.truth.pull_official()?;
-        let s = lock(&self.store);
-        self.refresh_verdicts(&s);
+        let s = &self.store;
+        self.refresh_verdicts(s);
         Ok(f)
     }
 
     /// Automatic blocklist rules after a flagged lie / desync / analysis.
-    fn auto_block(&self, s: &mut Store, fp: &str, cause: AutoCause) -> Result<(), Response> {
+    fn auto_block(&self, s: &Store, fp: &str, cause: AutoCause) -> Result<(), Response> {
         let rules = &self.truth.cfg.auto;
         let reason = match cause {
             AutoCause::Liar if rules.liars > 0 => {
@@ -1693,7 +1696,7 @@ impl Api {
 
     fn replay(&self, id: &str) -> Res {
         let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
-        let s = lock(&self.store);
+        let s = &self.store;
         let (players, setup_text, winner, created, inputs) =
             db(s.replay(id))?.ok_or_else(|| err(404, "no replay"))?;
         let setup: Value = serde_json::from_str(&setup_text).unwrap_or(Value::Null);
@@ -1707,8 +1710,8 @@ impl Api {
         ok(&Replay {
             match_id: id,
             created,
-            p1: Self::profile(&s, players[0]),
-            p2: Self::profile(&s, players[1]),
+            p1: Self::profile(s, players[0]),
+            p2: Self::profile(s, players[1]),
             p1_char: field("p1_char"),
             p2_char: field("p2_char"),
             stage: field("stage"),
@@ -1818,8 +1821,8 @@ impl Api {
 
     fn matchup_get(&self, req: &Request, v: &Value, id: &str) -> Res {
         let id = Self::matchup_id(id)?;
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let mut ms = lock(&self.matchups);
         Self::expire_matchups(&mut ms);
         let m = ms.get_mut(&id).ok_or_else(|| err(404, "no such matchup"))?;
@@ -1829,13 +1832,13 @@ impl Api {
         if m.side_of(me.id).is_some() {
             m.touched = Instant::now();
         }
-        Ok(Response::json(200, &self.matchup_json(&s, m, me.id)))
+        Ok(Response::json(200, &self.matchup_json(s, m, me.id)))
     }
 
     fn matchup_op(&self, req: &Request, v: &Value, id: &str, op: &str) -> Res {
         let id = Self::matchup_id(id)?;
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let mut rooms = lock(&self.rooms);
         let mut ms = lock(&self.matchups);
         Self::expire_matchups(&mut ms);
@@ -1847,7 +1850,7 @@ impl Api {
             return Err(err(409, &format!("matchup failed: {f}")));
         }
         if m.started.is_some() {
-            return Ok(Response::json(200, &self.matchup_json(&s, m, me.id)));
+            return Ok(Response::json(200, &self.matchup_json(s, m, me.id)));
         }
         m.touched = Instant::now();
         match op {
@@ -1883,10 +1886,10 @@ impl Api {
                         let why =
                             format!("P{}'s fighter profile does not match its files", side + 1);
                         db(s.flag(me.id, Some(id), &why, Some(&d.fingerprint)))?;
-                        self.auto_block(&mut s, &d.fingerprint, AutoCause::Liar)?;
+                        self.auto_block(s, &d.fingerprint, AutoCause::Liar)?;
                         m.fail(why);
-                        self.push_matchup(&s, m);
-                        return Ok(Response::json(200, &self.matchup_json(&s, m, me.id)));
+                        self.push_matchup(s, m);
+                        return Ok(Response::json(200, &self.matchup_json(s, m, me.id)));
                     }
                 }
                 if let Some(f) = fighter {
@@ -1899,7 +1902,7 @@ impl Api {
                 let refs: Vec<&str> = fps.iter().map(String::as_str).collect();
                 db(s.touch_packages(&refs))?;
                 m.reset_progress();
-                m.recompute_verdict(&s, &self.cfg.thresholds, &self.truth);
+                m.recompute_verdict(s, &self.cfg.thresholds, &self.truth);
             }
             "accept" => {
                 let unbalanced = v
@@ -1925,14 +1928,14 @@ impl Api {
             "leave" => m.fail(format!("P{} left", side + 1)),
             _ => return Err(err(404, "no such matchup action")),
         }
-        self.try_start(&mut s, &mut rooms, m)?;
-        self.push_matchup(&s, m);
-        let view = self.matchup_json(&s, m, me.id);
+        self.try_start(s, &mut rooms, m)?;
+        self.push_matchup(s, m);
+        let view = self.matchup_json(s, m, me.id);
         if let Some(code) = m.room.clone()
             && let Some(r) = rooms.get(&code)
         {
             drop(ms);
-            self.broadcast(&s, &code, r);
+            self.broadcast(s, &code, r);
         }
         Ok(Response::json(200, &view))
     }
@@ -1942,7 +1945,7 @@ impl Api {
     /// files, rules and game version.
     fn try_start(
         &self,
-        store: &mut Store,
+        store: &Store,
         rooms: &mut HashMap<String, Room>,
         m: &mut Matchup,
     ) -> Result<bool, Response> {
@@ -2035,8 +2038,8 @@ impl Api {
 
     fn pkg_status(&self, req: &Request, v: &Value, fp: &str) -> Res {
         let fp = Self::fp_arg(fp)?;
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let row = db(s.package(&fp))?;
         let complete = row.is_some() && self.packages.has(&fp);
         ok(&PackageStatus {
@@ -2081,7 +2084,7 @@ impl Api {
                 return Err(err(403, "upload only what you picked for a matchup"));
             }
         }
-        if self.packages.has(&fp) && db(lock(&self.store).package(&fp))?.is_some() {
+        if self.packages.has(&fp) && db(self.store.package(&fp))?.is_some() {
             self.packages.drop_partial(&fp, me.id);
             return self.pkg_status(req, &json!({ "key": req.query.get("key") }), &fp);
         }
@@ -2125,7 +2128,7 @@ impl Api {
             fingerprint: fp.clone(),
             ..Default::default()
         };
-        if let Some(row) = db(lock(&self.store).package(&fp))? {
+        if let Some(row) = db(self.store.package(&fp))? {
             st.complete = true;
             st.size = row.size;
         }
@@ -2134,7 +2137,7 @@ impl Api {
 
     /// Store a verified package, catch lying clients, move matchups on.
     fn after_upload(&self, fp: &str, uploader: u64, verified: Verified) -> Result<(), Response> {
-        let mut s = lock(&self.store);
+        let s = &self.store;
         let mut rooms = lock(&self.rooms);
         let mut ms = lock(&self.matchups);
         let failure = match &verified {
@@ -2147,7 +2150,7 @@ impl Api {
                         .find(|f| f.severity == rugen_proto::Severity::Block)
                 }) {
                     let detail = format!("{}: {}", f.code, f.detail);
-                    self.auto_block(&mut s, fp, AutoCause::Analysis(&detail))?;
+                    self.auto_block(s, fp, AutoCause::Analysis(&detail))?;
                 }
                 log::info!(
                     "package {} stored ({} KB, {})",
@@ -2193,24 +2196,25 @@ impl Api {
                 {
                     let why = format!("P{}'s fighter profile does not match its files", side + 1);
                     db(s.flag(m.players[side], Some(m.id), &why, Some(fp)))?;
-                    self.auto_block(&mut s, fp, AutoCause::Liar)?;
+                    self.auto_block(s, fp, AutoCause::Liar)?;
                     m.fail(why);
                 }
             }
             if m.failed.is_none() {
-                m.recompute_verdict(&s, &self.cfg.thresholds, &self.truth);
-                self.try_start(&mut s, &mut rooms, m)?;
+                m.recompute_verdict(s, &self.cfg.thresholds, &self.truth);
+                self.try_start(s, &mut rooms, m)?;
             }
             touched.push(m.id);
         }
         for id in touched {
             if let Some(m) = ms.get(&id) {
-                self.push_matchup(&s, m);
+                self.push_matchup(s, m);
             }
         }
-        drop(ms);
         drop(rooms);
-        let _ = self.packages.sweep(&mut s);
+        // still under the matchups lock (see `sweep_packages`)
+        let _ = self.packages.sweep(s);
+        drop(ms);
         match verified {
             Verified::Stored(_) => Ok(()),
             Verified::Mismatch { .. } => Err(err(422, "the files do not match their fingerprint")),
@@ -2220,8 +2224,8 @@ impl Api {
 
     fn pkg_data(&self, req: &Request, v: &Value, fp: &str) -> Res {
         let fp = Self::fp_arg(fp)?;
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         {
             let ms = lock(&self.matchups);
             if !ms
@@ -2231,7 +2235,7 @@ impl Api {
                 return Err(err(403, "not part of your matchup"));
             }
         }
-        if !self.stored(&s, &fp) {
+        if !self.stored(s, &fp) {
             return Err(err(404, "not on the server (yet)"));
         }
         // never hand a package to a client that cannot read it
@@ -2242,7 +2246,6 @@ impl Api {
         let offset = q("offset").unwrap_or(0);
         let len = q("len").unwrap_or(MAX_CHUNK).min(MAX_CHUNK);
         db(s.touch_packages(&[&fp]))?;
-        drop(s);
         let bytes = self.packages.read(&fp, offset, len).map_err(|e| {
             log::error!("packages: {e}");
             err(500, "storage error")
@@ -2252,18 +2255,17 @@ impl Api {
 
     fn desync(&self, req: &Request, v: &Value, id: &str) -> Res {
         let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
-        let mut s = lock(&self.store);
-        let me = self.auth(&mut s, req, v)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
         let frame = v.get("frame").and_then(Value::as_u64).unwrap_or(0) as u32;
         if !db(s.report_desync(me.id, id, frame))? {
             return Err(err(404, "not your match"));
         }
         if let Some((setup, ..)) = db(s.match_evidence(id))? {
             for fp in setup_fingerprints(&setup).iter().take(2) {
-                self.auto_block(&mut s, fp, AutoCause::Desync)?;
+                self.auto_block(s, fp, AutoCause::Desync)?;
             }
         }
-        drop(s);
         self.spawn_resim(id);
         ok(&json!({ "recorded": true }))
     }
@@ -2276,11 +2278,11 @@ impl Api {
             return;
         };
         std::thread::spawn(move || {
-            let evidence = lock(&api.store).match_evidence(match_id).ok().flatten();
+            let evidence = api.store.match_evidence(match_id).ok().flatten();
             let Some((setup, _ranked, players, reports)) = evidence else {
                 return;
             };
-            if reports.len() < 2 || !lock(&api.store).is_disputed(match_id).unwrap_or(false) {
+            if reports.len() < 2 || !api.store.is_disputed(match_id).unwrap_or(false) {
                 return;
             }
             let Some((_, longest)) = reports.iter().max_by_key(|(_, r)| r.inputs.len()) else {
@@ -2297,7 +2299,7 @@ impl Api {
                     crate::compat::SIM_ENGINE.unwrap_or("?")
                 );
                 log::info!("match {match_id}: {note}");
-                if let Err(e) = lock(&api.store).resolve_dispute(match_id, None, &note) {
+                if let Err(e) = api.store.resolve_dispute(match_id, None, &note) {
                     log::error!("match {match_id}: {e}");
                 }
                 return;
@@ -2335,7 +2337,7 @@ impl Api {
                     }
                 };
             log::info!("match {match_id}: {note}");
-            if let Err(e) = lock(&api.store).resolve_dispute(match_id, winner, &note) {
+            if let Err(e) = api.store.resolve_dispute(match_id, winner, &note) {
                 log::error!("match {match_id}: {e}");
             }
         });
@@ -2674,7 +2676,7 @@ pub(crate) mod tests {
         assert_eq!(rp["p1_char"], "Alpha");
         assert_eq!(rp["files_available"], true);
         assert_eq!(rp["fingerprints"][0], fp.as_str());
-        let row = lock(&api.store).package(fp).unwrap().unwrap();
+        let row = api.store.package(fp).unwrap().unwrap();
         assert!(
             row.keep_until > crate::store::now() + 86400,
             "kept for the replay"
@@ -2790,7 +2792,7 @@ pub(crate) mod tests {
         let v = json_of(api.handle(req("GET", &format!("/matchup/{id}?key={ka}"), Value::Null)));
         assert_eq!(v["phase"], "failed");
         assert!(v["error"].as_str().unwrap().contains("P2"), "{v}");
-        assert_eq!(lock(&api.store).flags_of(bid).unwrap().len(), 1);
+        assert_eq!(api.store.flags_of(bid).unwrap().len(), 1);
         // once known, the same lie is caught at pick time
         json_of(api.handle(req("POST", "/queue", json!({"key": ka, "ranked": false}))));
         let f = json_of(api.handle(req("POST", "/queue", json!({"key": kb, "ranked": false}))));
@@ -2809,7 +2811,7 @@ pub(crate) mod tests {
         let v = json_of(api.handle(req("GET", &format!("/matchup/{id}?key={kb}"), Value::Null)));
         assert_eq!(v["phase"], "failed");
         assert!(!api.packages.has(&fake.fingerprint));
-        assert_eq!(lock(&api.store).flags_of(aid).unwrap().len(), 1);
+        assert_eq!(api.store.flags_of(aid).unwrap().len(), 1);
         // and nobody may upload what they did not pick
         let r = upload(&api, &kb, &kit.a.0, &kit.a.1, 1 << 20);
         assert_eq!(r.status, 403);
@@ -2884,7 +2886,7 @@ pub(crate) mod tests {
             max_total: 0,
             ..Default::default()
         });
-        let mut s = lock(&api.store);
+        let s = &api.store;
         let t = crate::store::now();
         for (i, (d, pkg)) in [&kit.a, &kit.b, &kit.stage].into_iter().enumerate() {
             std::fs::write(api.packages.path(&d.fingerprint), pkg).unwrap();
@@ -2919,7 +2921,7 @@ pub(crate) mod tests {
         };
         // TTL pass with a roomy cap
         let pkgs = Packages::at(api.packages.dir(), pk.clone());
-        let gone = pkgs.sweep(&mut s);
+        let gone = pkgs.sweep(s);
         assert_eq!(gone, vec![kit.a.0.fingerprint.clone()]);
         assert!(!pkgs.has(&kit.a.0.fingerprint) && pkgs.has(&kit.b.0.fingerprint));
         assert!(!pkgs.path(&"cd".repeat(32)).exists(), "orphan removed");
@@ -2927,7 +2929,7 @@ pub(crate) mod tests {
         // size cap 0: LRU eviction, replay-kept last
         pk.max_total = kit.stage.1.len() as u64;
         let pkgs = Packages::at(api.packages.dir(), pk);
-        let gone = pkgs.sweep(&mut s);
+        let gone = pkgs.sweep(s);
         assert_eq!(gone, vec![kit.b.0.fingerprint.clone()]);
         assert!(pkgs.has(&kit.stage.0.fingerprint));
     }
@@ -3194,7 +3196,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(r.fingerprint.as_deref(), Some(fp.as_str()));
-            lock(&api.store)
+            api.store
                 .put_package(&crate::store::PackageRow {
                     fingerprint: fp.clone(),
                     kind: kind.as_str().into(),
@@ -3250,7 +3252,8 @@ pub(crate) mod tests {
         // played on the version this server simulates
         let setup = json!({"p1_fp": fps[0], "p2_fp": fps[0], "stage_fp": fps[1],
             "rules": Rules::default(), "engine": crate::compat::SIM_ENGINE});
-        let mid = lock(&api.store)
+        let mid = api
+            .store
             .new_match([aid, bid], true, &setup.to_string())
             .unwrap();
         let hex = to_hex(&inputs);
@@ -3269,14 +3272,14 @@ pub(crate) mod tests {
         )));
         assert_eq!(r["disputed"], true);
         let t = Instant::now();
-        while lock(&api.store).is_disputed(mid).unwrap() && t.elapsed() < Duration::from_secs(120) {
+        while api.store.is_disputed(mid).unwrap() && t.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(
-            !lock(&api.store).is_disputed(mid).unwrap(),
+            !api.store.is_disputed(mid).unwrap(),
             "settled by re-simulation"
         );
-        let a = lock(&api.store).by_id(aid).unwrap().unwrap();
+        let a = api.store.by_id(aid).unwrap().unwrap();
         assert_eq!(a.wins, 1);
         assert!(a.rating > 1200);
     }
@@ -3305,7 +3308,8 @@ pub(crate) mod tests {
             let (bid, kb) = register(&api);
             let setup = json!({"p1_fp": fp('a'), "p2_fp": fp('b'), "stage_fp": fp('c'),
                 "rules": Rules::default(), "engine": engine});
-            let mid = lock(&api.store)
+            let mid = api
+                .store
                 .new_match([aid, bid], true, &setup.to_string())
                 .unwrap();
             for (key, winner, checksum) in [(&ka, aid, 1u64), (&kb, bid, 2u64)] {
@@ -3318,7 +3322,7 @@ pub(crate) mod tests {
             }
             let t = Instant::now();
             let note = loop {
-                if let Some(n) = lock(&api.store).resim_note(mid).unwrap() {
+                if let Some(n) = api.store.resim_note(mid).unwrap() {
                     break n;
                 }
                 assert!(
@@ -3328,7 +3332,7 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             };
             assert!(note.starts_with("unverified (version)"), "{note}");
-            let s = lock(&api.store);
+            let s = &api.store;
             assert!(s.is_disputed(mid).unwrap(), "stays an ordinary dispute");
             for id in [aid, bid] {
                 let a = s.by_id(id).unwrap().unwrap();
@@ -3704,18 +3708,15 @@ pub(crate) mod tests {
         pick(&api, id, &kb, &cheat.0, None);
         // the cheater's package reaches the server: its own analysis blocks it
         let _ = upload(&api, &kb, &cheat.0, &cheat.1, 1 << 20);
-        let b = lock(&api.store)
-            .blocked(&cheat.0.fingerprint)
-            .unwrap()
-            .unwrap();
+        let b = api.store.blocked(&cheat.0.fingerprint).unwrap().unwrap();
         assert_eq!(b.source, "auto");
         assert!(b.reason.starts_with("auto: regen"), "{}", b.reason);
         // three different players lying about the same fighter
-        let mut s = lock(&api.store);
+        let s = &api.store;
         for acc in [11, 12, 13] {
             s.flag(acc, None, "lie", Some(&fair.0.fingerprint)).unwrap();
             assert!(
-                api.auto_block(&mut s, &fair.0.fingerprint, AutoCause::Liar)
+                api.auto_block(s, &fair.0.fingerprint, AutoCause::Liar)
                     .is_ok()
             );
         }
@@ -3726,7 +3727,6 @@ pub(crate) mod tests {
                 .reason
                 .contains("3 players")
         );
-        drop(s);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3793,7 +3793,7 @@ pub(crate) mod tests {
         )));
         assert_eq!(ack["accepted"], true);
         assert!(ack["delta"].is_null(), "{ack}");
-        lock(&api.store).age_reports(id, 60).unwrap();
+        api.store.age_reports(id, 60).unwrap();
         api.sweep_claims();
         assert!(result(&ka)["delta"].is_null(), "b is still connected");
         // b's BYE reaches the relay, a stays connected: settled for a
@@ -3861,7 +3861,7 @@ pub(crate) mod tests {
         )));
         // the relay agrees, but the claim is younger than the grace period
         api.sweep_claims();
-        assert_eq!(lock(&api.store).pending_claims().unwrap().len(), 1);
+        assert_eq!(api.store.pending_claims().unwrap().len(), 1);
         // the other report says the claimant lost: a dispute, never a win
         let r = json_of(api.handle(req(
             "POST",
@@ -3870,7 +3870,7 @@ pub(crate) mod tests {
         )));
         assert_eq!(r["accepted"], true);
         assert_eq!(r["disputed"], true);
-        assert!(lock(&api.store).pending_claims().unwrap().is_empty());
+        assert!(api.store.pending_claims().unwrap().is_empty());
     }
 
     #[test]
@@ -4380,7 +4380,7 @@ pub(crate) mod tests {
             )));
             let old_match = st["found"]["match_id"].as_u64().unwrap();
             assert_ne!(old_match, new_match);
-            let id = |k: &str| lock(&api.store).by_key(k).unwrap().unwrap().id;
+            let id = |k: &str| api.store.by_key(k).unwrap().unwrap().id;
             let ms = lock(&api.matchups);
             for (m, keys) in [(old_match, [&old_a, &old_b]), (new_match, [&new_a, &new_b])] {
                 let mut want = [id(keys[0]), id(keys[1])];
@@ -4567,7 +4567,7 @@ pub(crate) mod tests {
         let (a, ka) = register(&api);
         let (b, _) = register(&api);
         {
-            let mut s = api.store_lock();
+            let s = api.store();
             let m = s.new_match([a, b], true, "{}").unwrap();
             let w = ReportData {
                 winner: a,

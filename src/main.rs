@@ -283,7 +283,7 @@ fn gen_key() {
 
 /// `--block` / `--unblock` / `--blocklist`: edit the blocklist and exit.
 /// True when one of them ran.
-fn blocklist_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+fn blocklist_cli(store: &store::Store) -> Result<bool, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| {
         args.iter()
@@ -325,7 +325,7 @@ fn blocklist_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::E
 
 /// `--delete-accounts <prefix> [--yes]`: remove accounts by name prefix
 /// (load-test leftovers) and exit. True when it ran.
-fn delete_accounts_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+fn delete_accounts_cli(store: &store::Store) -> Result<bool, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(i) = args.iter().position(|a| a == "--delete-accounts") else {
         return Ok(false);
@@ -352,7 +352,7 @@ fn delete_accounts_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::er
 
 /// `--reset-password <username>`: a temporary password for a named account
 /// (every device logged out), printed once. True when it ran.
-fn reset_password_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::error::Error>> {
+fn reset_password_cli(store: &store::Store) -> Result<bool, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(i) = args.iter().position(|a| a == "--reset-password") else {
         return Ok(false);
@@ -366,8 +366,7 @@ fn reset_password_cli(store: &mut store::Store) -> Result<bool, Box<dyn std::err
         .ok_or_else(|| format!("--reset-password: no account named {username}"))?;
     let temp = password::temporary();
     let phc = password::hash_account(&temp).ok_or("--reset-password: hashing failed")?;
-    store.set_password(a.id, &phc)?;
-    store.revoke_all(a.id)?;
+    store.replace_password(a.id, &phc, false)?;
     println!(
         "password of {} (account {}) reset; every device was logged out\n\
          temporary password: {temp}\n\
@@ -526,7 +525,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     if restore_cli(&s)? {
         return Ok(());
     }
-    let mut store = store::Store::open(Some(&s.data))
+    let store = store::Store::open(Some(&s.data))
         .map_err(|e| format!("database in {}: {e}", s.data.display()))?;
     if let Some(i) = std::env::args().position(|a| a == "--backup") {
         let out = std::env::args()
@@ -539,10 +538,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     if backup_now_cli(&s)? {
         return Ok(());
     }
-    if blocklist_cli(&mut store)?
-        || delete_accounts_cli(&mut store)?
-        || reset_password_cli(&mut store)?
-    {
+    if blocklist_cli(&store)? || delete_accounts_cli(&store)? || reset_password_cli(&store)? {
         return Ok(());
     }
     let (key, key_from) = truth::load_key(&s.data)?;
@@ -655,7 +651,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     }
     api.start_backup_schedule();
     match &api.turn {
-        Some(t) => t.log_startup(&api.store_lock()),
+        Some(t) => t.log_startup(api.store()),
         None => log::info!("turn: off (set RUGEN_CF_TURN_KEY_ID + RUGEN_CF_TURN_TOKEN)"),
     }
     let workers = worker_threads();
