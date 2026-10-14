@@ -630,6 +630,10 @@ impl Pool {
         impl Drop for Back<'_> {
             fn drop(&mut self) {
                 if let Some(c) = self.conn.take() {
+                    if !c.is_autocommit() {
+                        // a read that panicked left its transaction open
+                        let _ = c.execute_batch("ROLLBACK");
+                    }
                     lock(&self.pool.idle).push(c);
                     self.pool.ready.notify_one();
                 }
@@ -3036,6 +3040,30 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(s.account_count().unwrap(), 8 * 40);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panicking_read_hands_its_connection_back_clean() {
+        let dir = temp_dir("panic");
+        let s = Arc::new(Store::open(Some(&dir)).unwrap());
+        let id = s.register().unwrap().id;
+        for _ in 0..READERS + 1 {
+            let r = s.clone();
+            let panicked = std::thread::spawn(move || {
+                let _ = r.read(|d| -> DbResult<()> {
+                    d.by_id(id)?;
+                    panic!("boom")
+                });
+            })
+            .join();
+            assert!(panicked.is_err());
+        }
+        // every reader is back, outside any transaction
+        for _ in 0..READERS * 2 {
+            assert!(s.by_id(id).unwrap().is_some());
+        }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
