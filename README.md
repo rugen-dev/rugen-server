@@ -28,11 +28,11 @@ Measured on the production host with the built-in self-benchmark. The
 container was capped at **1 CPU and 768 MB**, and the load generator ran
 inside the same container, so these numbers are a floor.
 
-| Players online | p99 latency | CPU | Memory | Errors |
-|---|---|---|---|---|
-| 500 | 1.8 ms | 37 % | 228 MB | 0 |
-| 1,000 | 2.5 ms | 66 % | 408 MB | 0 |
-| 1,250 | 4.8 ms | 79 % | 530 MB | 0 |
+| Players online | CPU | Memory | Errors |
+|---|---|---|---|
+| 500 | 37 % | 228 MB | 0 |
+| 1,000 | 66 % | 408 MB | 0 |
+| 1,250 | 79 % | 530 MB | 0 |
 
 Every simulated player keeps a presence WebSocket, polls its room or queue,
 plays matches and reports results; part of them relay their match traffic

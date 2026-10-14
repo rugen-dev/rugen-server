@@ -24,7 +24,9 @@ configuration ran 2–3 times, interleaved.
 
 `play.rugen.dev`, Docker capped at `cpus: 1.0`, `mem_limit: 768m`,
 `pids_limit: 256`; `POST /admin/bench` with steps 250 → 1500, 30 s hold.
-The load generator shares the container, so this is a floor.
+The load generator shares the container, so this is a floor. The p50 / p99
+columns are the server's own processing time over localhost: real players
+add their network round trip (and Cloudflare's) on top.
 
 | clients | req/s | p50 ms | p99 ms | errors | CPU % | RSS MB | threads | relay pkt/s |
 |---|---|---|---|---|---|---|---|---|
