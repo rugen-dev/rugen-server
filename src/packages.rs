@@ -144,6 +144,9 @@ pub enum Verified {
 pub struct Packages {
     dir: PathBuf,
     pub cfg: PkgConfig,
+    /// `RUGEN_PKG_S3`: verified packages are also served from a bucket
+    /// ([`crate::pkg_r2`]).
+    pub r2: Option<crate::pkg_r2::R2>,
 }
 
 impl Packages {
@@ -158,7 +161,7 @@ impl Packages {
         std::fs::create_dir_all(dir.join("partial"))?;
         // files of an interrupted verification
         let _ = std::fs::remove_dir_all(dir.join("verify"));
-        Ok(Self { dir, cfg })
+        Ok(Self { dir, cfg, r2: None })
     }
 
     /// Another view of an existing packages directory (tests).
@@ -167,6 +170,7 @@ impl Packages {
         Self {
             dir: dir.to_path_buf(),
             cfg,
+            r2: None,
         }
     }
 
@@ -299,9 +303,13 @@ impl Packages {
         match self.verify_file(&checking, fp, account) {
             Ok(row) => {
                 rugen_formats::vfs::forget(&checking);
-                if let Err(e) = std::fs::rename(&checking, self.path_for(fp, kind)) {
+                let dest = self.path_for(fp, kind);
+                if let Err(e) = std::fs::rename(&checking, &dest) {
                     let _ = std::fs::remove_file(&checking);
                     return Verified::Invalid(format!("store: {e}"));
+                }
+                if let Some(r2) = &self.r2 {
+                    r2.stored(fp, &dest);
                 }
                 Verified::Stored(row)
             }
@@ -492,6 +500,9 @@ impl Packages {
             rugen_formats::vfs::forget(&path);
             let _ = std::fs::remove_file(path);
             let _ = store.delete_package(fp);
+        }
+        if let Some(r2) = &self.r2 {
+            r2.forget(&removed);
         }
         // orphans (files without rows) and partial uploads older than the TTL
         let known: std::collections::HashSet<String> = store

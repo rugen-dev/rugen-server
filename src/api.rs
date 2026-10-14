@@ -52,6 +52,9 @@
 //!                               (403) with consent other than 1, and without it from
 //!                               rugen 0.6.4+ (0.6.0-0.6.3 never send it: accepted)
 //! GET  /pkg/{fp}/data?key=&offset=&len=       raw bytes, resumable
+//! GET  /pkg/{fp}/url?key=       PackageUrl: a presigned bucket URL (RUGEN_PKG_S3, valid
+//!                               15 min) with the file's sha256 and size, or url "" when
+//!                               the package is only here (download /data); rugen 0.6.4+
 //! GET  /char/{fp}               community rating of a character fingerprint
 //! POST /match/{id}/desync       {key, frame}    a client saw a desync
 //! GET  /match/{id}/result?key=  ResultAck (signed once settled)
@@ -91,6 +94,8 @@
 //! MatchInfo (`found` of GET/POST /queue and the `found` push)
 //!                                high_ping: bool
 //! GET /health                    pkg_days (days packages are kept after upload)
+//!                                packages_r2: {configured, objects, bytes, max_bytes, full,
+//!                                  pending, last_error} (also in /admin/stats)
 //!                                relay: {sessions, forwarded, dropped, queue_drops}
 //!                                backup: {configured, status, provider, retention_days,
 //!                                  last_success, last_error, last_size_bytes, next_at, running}
@@ -284,6 +289,8 @@ pub struct ApiConfig {
     pub backup: BackupSetting,
     /// `RUGEN_BENCH=1`: `POST /admin/bench` may run self-benchmarks.
     pub bench: bool,
+    /// `RUGEN_PKG_S3*`: packages served from a bucket ([`crate::pkg_r2`]).
+    pub pkg_r2: crate::pkg_r2::R2Setting,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -511,12 +518,28 @@ impl Api {
             &cfg.name,
             cfg.data.as_deref(),
         );
-        let packages = Packages::open(cfg.data.as_deref(), cfg.pkg.clone())
+        let mut packages = Packages::open(cfg.data.as_deref(), cfg.pkg.clone())
             .or_else(|e| {
                 log::error!("packages directory: {e}; using a temporary one");
                 Packages::open(None, cfg.pkg.clone())
             })
             .expect("a temporary packages directory");
+        match &cfg.pkg_r2 {
+            crate::pkg_r2::R2Setting::On { target, max_bytes } => {
+                log::info!(
+                    "packages: also served from a bucket ({} under chars/, up to {} MB)",
+                    target.host,
+                    max_bytes >> 20
+                );
+                packages.r2 = Some(crate::pkg_r2::R2::new(
+                    target.clone(),
+                    *max_bytes,
+                    cfg.pkg.max_age_secs,
+                ));
+            }
+            crate::pkg_r2::R2Setting::Invalid(e) => log::error!("{e}; packages served directly"),
+            crate::pkg_r2::R2Setting::Off => {}
+        }
         let turn = cfg.turn.clone().map(Turn::new);
         let backups = Backups::new(std::mem::take(&mut cfg.backup), cfg.data.as_deref());
         let resim = cfg.resim.is_some();
@@ -614,7 +637,18 @@ impl Api {
         // matchups pick, touch and check packages under this lock: none
         // of that interleaves with an eviction
         let _ms = lock(&self.matchups);
+        if let Some(r2) = &self.packages.r2 {
+            r2.reconcile();
+        }
         self.packages.sweep(&self.store)
+    }
+
+    /// `packages_r2` of `/health` and `/admin/stats`.
+    fn r2_health(&self) -> Value {
+        match &self.packages.r2 {
+            Some(r) => r.health(),
+            None => crate::pkg_r2::health_off(&self.cfg.pkg_r2),
+        }
     }
 
     /// The account owning a key (WebSocket upgrade).
@@ -795,6 +829,7 @@ impl Api {
             "write_queue": self.store.write_queue(),
             "resim_queue": self.resim.as_ref().map_or(0, |w| w.queued()),
             "bench": self.bench.status().map(|r| r.state),
+            "packages_r2": self.r2_health(),
         }))
     }
 
@@ -856,6 +891,8 @@ impl Api {
                 });
                 // backup state: no endpoint, bucket or credentials
                 v["backup"] = self.backups.health();
+                // packages bucket: counts and the last error only
+                v["packages_r2"] = self.r2_health();
                 *lock(&self.health) = Some((Instant::now(), v.clone()));
                 Ok(Response::json(200, &v))
             }
@@ -913,6 +950,7 @@ impl Api {
             ("GET", ["pkg", fp]) => self.pkg_status(&req, &v, fp),
             ("POST", ["pkg", fp, "upload"]) => self.pkg_upload(&req, fp),
             ("GET", ["pkg", fp, "data"]) => self.pkg_data(&req, &v, fp),
+            ("GET", ["pkg", fp, "url"]) => self.pkg_url(&req, &v, fp),
             ("GET", ["char", fp]) => {
                 let r = db(self.store.char_rating(fp))?;
                 ok(&r)
@@ -3192,23 +3230,59 @@ impl Api {
         }
     }
 
+    /// Who may download package `fp`: players and spectators of a matchup
+    /// declaring it, viewers of a live match (who opened its stream), and
+    /// anyone for the files of a shared replay.
+    fn may_download(&self, s: &Store, fp: &str, me: u64) -> Result<(), Response> {
+        let ms = lock(&self.matchups);
+        if !ms
+            .values()
+            .any(|m| m.involves(me) && m.declared().contains(&fp))
+            && !self.live.watches_content(fp, me)
+            && !s.shared_has(fp).unwrap_or(false)
+        {
+            return Err(err(403, "not part of your matchup"));
+        }
+        Ok(())
+    }
+
+    /// `GET /pkg/{fp}/url`: a presigned bucket URL for the package
+    /// ([`crate::pkg_r2`]), or `url: ""` (download it from `/data`).
+    fn pkg_url(&self, req: &Request, v: &Value, fp: &str) -> Res {
+        let fp = Self::fp_arg(fp)?;
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
+        self.may_download(s, &fp, me.id)?;
+        if !self.stored(s, &fp) {
+            return Err(err(404, "not on the server (yet)"));
+        }
+        if self.packages.is_legacy(&fp) != crate::compat::is_legacy(req.api) {
+            return Err(err(409, &crate::compat::package_refusal(req.api)));
+        }
+        let path = self.packages.path(&fp);
+        let found = self.packages.r2.as_ref().and_then(|r| r.url(&fp, &path));
+        db(s.touch_packages(&[&fp]))?;
+        let out = match found {
+            Some((url, sha256, size)) => rugen_proto::PackageUrl {
+                fingerprint: fp,
+                url,
+                sha256,
+                size,
+                expires_secs: crate::pkg_r2::URL_SECS,
+            },
+            None => rugen_proto::PackageUrl {
+                fingerprint: fp,
+                ..Default::default()
+            },
+        };
+        ok(&out)
+    }
+
     fn pkg_data(&self, req: &Request, v: &Value, fp: &str) -> Res {
         let fp = Self::fp_arg(fp)?;
         let s = &self.store;
         let me = self.auth(s, req, v)?;
-        {
-            let ms = lock(&self.matchups);
-            // players and spectators of a matchup, and viewers of a live
-            // match (who opened its stream)
-            if !ms
-                .values()
-                .any(|m| m.involves(me.id) && m.declared().contains(&fp.as_str()))
-                && !self.live.watches_content(&fp, me.id)
-                && !s.shared_has(&fp).unwrap_or(false)
-            {
-                return Err(err(403, "not part of your matchup"));
-            }
-        }
+        self.may_download(s, &fp, me.id)?;
         if !self.stored(s, &fp) {
             return Err(err(404, "not on the server (yet)"));
         }

@@ -25,6 +25,8 @@ pub struct FakeS3 {
     pub objects: Arc<Mutex<BTreeMap<String, Stored>>>,
     /// Requests that failed the signature checks.
     pub rejected: Arc<Mutex<u32>>,
+    /// Presigned GETs served.
+    pub presigned: Arc<Mutex<u32>>,
 }
 
 const PAGE: usize = 3;
@@ -35,6 +37,7 @@ impl FakeS3 {
         let port = listener.local_addr().unwrap().port();
         let objects = Arc::new(Mutex::new(BTreeMap::new()));
         let rejected = Arc::new(Mutex::new(0));
+        let presigned = Arc::new(Mutex::new(0));
         let ctx = Arc::new((
             bucket.to_string(),
             access_key.to_string(),
@@ -42,6 +45,7 @@ impl FakeS3 {
             region.to_string(),
             objects.clone(),
             rejected.clone(),
+            presigned.clone(),
         ));
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -55,6 +59,7 @@ impl FakeS3 {
             port,
             objects,
             rejected,
+            presigned,
         }
     }
 
@@ -79,6 +84,7 @@ type Ctx = (
     String,
     String,
     Arc<Mutex<BTreeMap<String, Stored>>>,
+    Arc<Mutex<u32>>,
     Arc<Mutex<u32>>,
 );
 
@@ -117,7 +123,7 @@ fn error(s: &mut TcpStream, status: u16, code: &str) -> std::io::Result<()> {
 }
 
 fn serve(stream: TcpStream, ctx: &Ctx) -> std::io::Result<()> {
-    let (bucket, ak, secret, region, objects, rejected) = ctx;
+    let (bucket, ak, secret, region, objects, rejected, presigned) = ctx;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut out = stream;
     loop {
@@ -161,6 +167,61 @@ fn serve(stream: TcpStream, ctx: &Ctx) -> std::io::Result<()> {
                 (decode(k), decode(v))
             })
             .collect();
+        // a presigned GET (SigV4 query signing)
+        if let Some(sig) = query
+            .iter()
+            .find(|(k, _)| k == "X-Amz-Signature")
+            .map(|(_, v)| v.clone())
+        {
+            let q = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            let (date, expires) = (q("X-Amz-Date").unwrap_or_default(), q("X-Amz-Expires"));
+            let expires: u64 = expires.and_then(|e| e.parse().ok()).unwrap_or(0);
+            let want = (date.len() == 16).then(|| {
+                crate::s3::presign_query(
+                    ak,
+                    secret,
+                    region,
+                    &header("host").unwrap_or_default(),
+                    raw_path,
+                    &date,
+                    expires,
+                )
+            });
+            let fresh = crate::s3::parse_amz_date(&date)
+                .is_some_and(|t| t + expires >= crate::store::now());
+            let good = want
+                .as_ref()
+                .and_then(|w| w.last())
+                .is_some_and(|(_, s)| *s == sig);
+            if method != "GET" || !good || !fresh {
+                *rejected.lock().unwrap() += 1;
+                error(
+                    &mut out,
+                    403,
+                    if fresh {
+                        "SignatureDoesNotMatch"
+                    } else {
+                        "AccessDenied"
+                    },
+                )?;
+                continue;
+            }
+            let key = decode(raw_path)
+                .strip_prefix('/')
+                .and_then(|p| p.strip_prefix(bucket.as_str()))
+                .and_then(|p| p.strip_prefix('/'))
+                .unwrap_or("")
+                .to_string();
+            let body = objects.lock().unwrap().get(&key).map(|o| o.body.clone());
+            match body {
+                Some(b) => {
+                    *presigned.lock().unwrap() += 1;
+                    respond(&mut out, 200, "application/octet-stream", &b)?
+                }
+                None => error(&mut out, 404, "NoSuchKey")?,
+            }
+            continue;
+        }
         // signature checks
         let payload = header("x-amz-content-sha256").unwrap_or_default();
         let date = header("x-amz-date").unwrap_or_default();

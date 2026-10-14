@@ -295,6 +295,35 @@ what you are willing to keep, remove content on request (delete
 from the data volume; the server drops its record on the next sweep), and
 do not run a public server if you cannot answer takedown requests.
 
+### Serving packages from Cloudflare R2 (optional)
+
+A fighter is 5-70 MB; with `RUGEN_PKG_S3` set, downloads come straight from
+a bucket instead of through this server. Same one-line URL as
+`RUGEN_BACKUP_S3` (it may be the same bucket):
+
+```sh
+RUGEN_PKG_S3=s3://ACCESS_KEY:SECRET_KEY@<account>.r2.cloudflarestorage.com/rugen
+RUGEN_PKG_S3_MAX_GB=8        # free-tier guard (default 8)
+```
+
+- Every verified package is also copied, once, to
+  `<prefix>/chars/<sha256>.rgc` (stages `.rgs`; `chars/` is reserved for this).
+- A rugen 0.6.4+ client asks `GET /pkg/{fp}/url` and gets a presigned URL
+  valid 15 minutes, then checks the file's size and sha256 before it
+  installs it (and recomputes the fingerprint as always). Older clients,
+  a package not copied yet, a bucket error or a failed check all use the
+  direct download from this server.
+- Objects follow their packages: deleted with them and, at the next sweep,
+  anything older than `RUGEN_PKG_DAYS`. Add an R2 **lifecycle rule** as a
+  safety net: prefix `chars/`, delete objects 3 days after upload (match
+  `RUGEN_PKG_DAYS`).
+- Above `RUGEN_PKG_S3_MAX_GB` stored under `chars/`, new packages are not
+  copied (served directly) until expiries make room. `/health` and
+  `/admin/stats` show `packages_r2`: `configured`, `objects`, `bytes`,
+  `max_bytes`, `full`, `pending`, `last_error` (never the endpoint, bucket or
+  keys).
+- R2 token: Object Read & Write on that bucket only.
+
 ### Re-simulating disputed matches
 
 Built with `--features resim` (`cargo build --release
@@ -485,6 +514,8 @@ again (it is at least the current Unix time).
 | `RUGEN_PKG_TTL`    | `RUGEN_PKG_DAYS`   | a package expires this long after its last use (`90m`, `2d`, seconds), never later than `RUGEN_PKG_DAYS` |
 | `RUGEN_PKG_MAX_TOTAL` | `5GB`           | all packages together; least recently used evicted above it |
 | `RUGEN_PKG_MAX`    | `150MB`            | largest single package accepted |
+| `RUGEN_PKG_S3`     | –                  | bucket that also serves packages (Cloudflare R2), `RUGEN_BACKUP_S3` URL format; objects under `chars/` |
+| `RUGEN_PKG_S3_MAX_GB` | `8`             | stop copying new packages to that bucket above this many GB |
 | `RUGEN_PKG_RATE_ACCOUNT` | `1GB`        | upload bytes per account per hour |
 | `RUGEN_PKG_RATE_IP` | `2GB`             | upload bytes per client IP per hour |
 | `RUGEN_PKG_REPLAY_TTL` | `720`          | hours the packages of a stored ranked replay are evicted last (still deleted after `RUGEN_PKG_DAYS`) |

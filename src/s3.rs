@@ -273,6 +273,29 @@ impl S3 {
         check("GET", req.call().map_err(|e| net("GET", e))?)
     }
 
+    /// A URL anyone can `GET` object `key` with for `expires` seconds
+    /// (SigV4 query presigning). It carries a signature, never the secret.
+    pub fn presign_get(&self, key: &str, expires: u64) -> String {
+        let (host, path) = self.locate(key);
+        let q = presign_query(
+            &self.target.access_key,
+            &self.target.secret_key,
+            &self.target.region,
+            &host,
+            &path,
+            &amz_date(crate::store::now()),
+            expires,
+        );
+        // the signature goes last, in the signed order
+        let (sig, rest) = q.split_last().expect("signature");
+        format!(
+            "{}&{}={}",
+            self.url(&host, &path, rest),
+            sig.0,
+            uri_encode(&sig.1, true)
+        )
+    }
+
     pub fn delete(&self, key: &str) -> S3Result<()> {
         let (host, path) = self.locate(key);
         let mut req = self.agent.delete(self.url(&host, &path, &[]));
@@ -446,20 +469,65 @@ pub fn authorization(
         "{method}\n{path}\n{}\n{canonical_headers}\n{signed}\n{payload_sha}",
         canonical_query(query)
     );
+    let scope = scope(amz_date, region);
+    let sig = signature(secret_key, region, amz_date, &creq);
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
+    )
+}
+
+/// `day/region/s3/aws4_request`.
+fn scope(amz_date: &str, region: &str) -> String {
+    format!("{}/{region}/s3/aws4_request", &amz_date[..8])
+}
+
+/// SigV4 signature (hex) of canonical request `creq`.
+fn signature(secret_key: &str, region: &str, amz_date: &str, creq: &str) -> String {
     let day = &amz_date[..8];
-    let scope = format!("{day}/{region}/s3/aws4_request");
     let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        "AWS4-HMAC-SHA256\n{amz_date}\n{}\n{}",
+        scope(amz_date, region),
         rugen_proto::to_hex(&Sha256::digest(creq.as_bytes()))
     );
     let k = hmac(format!("AWS4{secret_key}").as_bytes(), day.as_bytes());
     let k = hmac(&k, region.as_bytes());
     let k = hmac(&k, b"s3");
     let k = hmac(&k, b"aws4_request");
-    let sig = rugen_proto::to_hex(&hmac(&k, to_sign.as_bytes()));
-    format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
-    )
+    rugen_proto::to_hex(&hmac(&k, to_sign.as_bytes()))
+}
+
+/// Query parameters of a presigned `GET` of `path` on `host` (SigV4
+/// query signing: only `host` signed, `UNSIGNED-PAYLOAD`), valid `expires`
+/// seconds from `amz_date`, `X-Amz-Signature` last.
+#[allow(clippy::too_many_arguments)]
+pub fn presign_query(
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    host: &str,
+    path: &str,
+    amz_date: &str,
+    expires: u64,
+) -> Vec<(String, String)> {
+    let mut q: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+        (
+            "X-Amz-Credential".into(),
+            format!("{access_key}/{}", scope(amz_date, region)),
+        ),
+        ("X-Amz-Date".into(), amz_date.into()),
+        ("X-Amz-Expires".into(), expires.to_string()),
+        ("X-Amz-SignedHeaders".into(), "host".into()),
+    ];
+    let creq = format!(
+        "GET\n{path}\n{}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
+        canonical_query(&q)
+    );
+    q.push((
+        "X-Amz-Signature".into(),
+        signature(secret_key, region, amz_date, &creq),
+    ));
+    q
 }
 
 // ---- time

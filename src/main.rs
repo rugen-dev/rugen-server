@@ -22,6 +22,9 @@
 //! RUGEN_PKG_TTL                 package expiry after last use      RUGEN_PKG_DAYS
 //! RUGEN_PKG_MAX_TOTAL           all packages (LRU eviction)        5GB
 //! RUGEN_PKG_MAX                 one package                        150MB
+//! RUGEN_PKG_S3                  bucket that serves packages (R2),  (off)
+//!                               same URL format as RUGEN_BACKUP_S3; objects under chars/
+//! RUGEN_PKG_S3_MAX_GB           stop uploading to it above         8
 //! RUGEN_PKG_RATE_ACCOUNT        uploads per account per hour       1GB
 //! RUGEN_PKG_RATE_IP             uploads per client IP per hour     2GB
 //! RUGEN_PKG_REPLAY_TTL          hours packages of ranked replays are  720
@@ -115,6 +118,7 @@ mod matchmaking;
 mod matchup;
 mod packages;
 mod password;
+mod pkg_r2;
 mod relay;
 mod resim;
 mod s3;
@@ -639,6 +643,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         high_ping_ms: env_f("RUGEN_HIGH_PING_MS").map_or(0, |v| v.max(1.0) as u32),
         bench: std::env::var("RUGEN_BENCH").is_ok_and(|v| v.trim() == "1"),
         backup: backup::BackupSetting::from_env(),
+        pkg_r2: pkg_r2::R2Setting::from_env(),
     };
     if let backup::BackupSetting::Invalid(e) = &cfg.backup {
         log::error!(

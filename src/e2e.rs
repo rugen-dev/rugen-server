@@ -66,6 +66,15 @@ fn server(data: &Path) -> Server {
 /// `turn`: Cloudflare TURN config (a mock); the UDP relay is still bound
 /// but not advertised then (like a tunnel-only server: WebSocket relay).
 fn server_with(data: &Path, turn: Option<crate::turn::TurnConfig>) -> Server {
+    server_full(data, turn, Default::default())
+}
+
+/// [`server_with`] serving packages from a bucket (`RUGEN_PKG_S3`).
+fn server_full(
+    data: &Path,
+    turn: Option<crate::turn::TurnConfig>,
+    pkg_r2: crate::pkg_r2::R2Setting,
+) -> Server {
     let tunnel = turn.is_some();
     let relay = Arc::new(Relay::default());
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
@@ -80,6 +89,7 @@ fn server_with(data: &Path, turn: Option<crate::turn::TurnConfig>) -> Server {
             udp_public: (!tunnel).then(|| udp.to_string()),
             data: Some(data.to_path_buf()),
             turn,
+            pkg_r2,
             ..Default::default()
         },
         relay,
@@ -960,6 +970,113 @@ fn no_consent_plays_with_shared_files_and_never_uploads() {
         v.error.contains("P2 does not have") && v.error.contains("no online consent"),
         "{}",
         v.error
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// With `RUGEN_PKG_S3`, a verified package goes to the bucket and the
+/// opponent downloads it through a presigned URL (sha256 checked); a broken
+/// object falls back to the direct download.
+#[test]
+fn packages_download_from_the_bucket_through_presigned_urls() {
+    let Some(reference) = reference() else {
+        eprintln!("reference tree missing; skipping");
+        return;
+    };
+    let tmp = crate::testkit::tmp("e2e-r2");
+    let fake = crate::s3_fake::FakeS3::start("rugen", "AK", "SK", "auto");
+    let setting = crate::pkg_r2::R2Setting::parse(
+        Some(&format!(
+            "s3+http://AK:SK@127.0.0.1:{}/rugen?region=auto",
+            fake.port
+        )),
+        None,
+    );
+    let srv = server_full(&tmp.join("server"), None, setting);
+    let lib_a = machine(&tmp.join("a"), &reference);
+    copy_dir(&reference.join("chars/kfm"), &tmp.join("a/chars/kfm"));
+    let kfm = decl(&lib_a, "kfm", false);
+    let mut a = player(&srv.url);
+    let mut b = player(&srv.url);
+    a.register().unwrap();
+    b.register().unwrap();
+    let room = a
+        .create_room("", &rugen_net::online::RoomOptions::default())
+        .unwrap();
+    let id = b
+        .join_room(&room.code, "", "", false)
+        .unwrap()
+        .matchup
+        .unwrap()
+        .id;
+    a.pick(id, Some(&kfm), None).unwrap();
+    let (dir, m) = lib_a.find_fingerprint(&kfm.fingerprint).unwrap();
+    let pkg = lib_a.package(&dir, &m).unwrap();
+    assert!(
+        a.upload_package(&kfm.fingerprint, &pkg, &Transfer::new())
+            .unwrap()
+            .complete
+    );
+    // the copy to the bucket runs in the background
+    let t = Instant::now();
+    while fake.keys().is_empty() {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "never uploaded: {}",
+            srv.api
+                .packages
+                .r2
+                .as_ref()
+                .map(|r| r.health())
+                .unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sha = crate::s3::sha256_file(&pkg).unwrap().0;
+    assert_eq!(fake.keys(), vec![format!("chars/{sha}.rgc")]);
+    let u = b
+        .package_url(&kfm.fingerprint)
+        .unwrap()
+        .expect("a presigned url");
+    assert_eq!((u.sha256.as_str(), u.expires_secs), (sha.as_str(), 900));
+    // B downloads it from the bucket, installs it (fingerprint checked)
+    let lib_b = machine(&tmp.join("b"), &reference);
+    let part = tmp.join("b/kfm.part");
+    let size = std::fs::metadata(&pkg).unwrap().len();
+    b.download_package(&kfm.fingerprint, size, &part, &Transfer::new())
+        .unwrap();
+    assert_eq!(*fake.presigned.lock().unwrap(), 1, "from the bucket");
+    lib_b
+        .install_package(&part, &kfm.fingerprint, 1 << 30)
+        .unwrap();
+    assert!(lib_b.find_fingerprint(&kfm.fingerprint).is_some());
+    // a corrupted object: the sha256 check fails, the server serves it
+    fake.put(
+        &format!("chars/{sha}.rgc"),
+        &vec![7u8; size as usize],
+        crate::store::now(),
+    );
+    let lib_c = machine(&tmp.join("c"), &reference);
+    let part = tmp.join("c/kfm.part");
+    b.download_package(&kfm.fingerprint, size, &part, &Transfer::new())
+        .unwrap();
+    assert_eq!(*fake.presigned.lock().unwrap(), 2);
+    lib_c
+        .install_package(&part, &kfm.fingerprint, 1 << 30)
+        .unwrap();
+    // /health shows the bucket, never its address or keys
+    let h: serde_json::Value = ureq::get(format!("{}/health", srv.url))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_json()
+        .unwrap();
+    assert_eq!(h["packages_r2"]["configured"], true);
+    assert_eq!(h["packages_r2"]["objects"], 1);
+    let text = h["packages_r2"].to_string();
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("SK"),
+        "{text}"
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
