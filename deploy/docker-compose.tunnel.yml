@@ -72,9 +72,9 @@ services:
       - ALL
     # good neighbour on a shared host: hard caps, lowest priority under
     # contention, first to go if the host runs out of memory, bounded logs
-    cpus: ${RUGEN_CPUS:-1.0}
-    mem_limit: ${RUGEN_MEM:-768m}
-    memswap_limit: ${RUGEN_MEM:-768m}
+    cpus: ${RUGEN_CPUS:-2.0}
+    mem_limit: ${RUGEN_MEM:-1536m}
+    memswap_limit: ${RUGEN_MEM:-1536m}
     cpu_shares: 256
     blkio_config:
       weight: 100

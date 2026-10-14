@@ -44,6 +44,28 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # the only writable path besides /data: the self-benchmark's scratch
+    tmpfs:
+      - /tmp:size=128m
+    # good neighbour on a shared host: hard caps, lowest priority under
+    # contention, first to go if the host runs out of memory, bounded logs.
+    # 2 CPU / 1.5 GB holds a few thousand players (docs/performance.md)
+    cpus: ${RUGEN_CPUS:-2.0}
+    mem_limit: ${RUGEN_MEM:-1536m}
+    memswap_limit: ${RUGEN_MEM:-1536m}
+    cpu_shares: 256
+    pids_limit: 256
+    # Docker starts containers with 1024 open files: about 500 players
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    oom_score_adj: 500
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 networks:
   # fixed name so optional add-ons (deploy/cloudflared) can join it

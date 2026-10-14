@@ -1,82 +1,96 @@
 # rugen-server
 
 The self-hostable online hub for [rugen](https://github.com/rugen-dev/rugen-engine),
-the M.U.G.E.N engine rewritten in Rust. One small binary (≈5 MB image,
-SQLite inside):
+the M.U.G.E.N engine rewritten in Rust: accounts, rooms, quick match, ranked
+and the match relay. One small binary with SQLite inside.
 
-- named accounts (username + password, Argon2id, several devices, operator
-  password resets) next to the anonymous accounts of older clients
-- a lobby with public and private rooms (optional Argon2id room
-  passwords), spectators, rematch
-- quick match and ranked (Elo K=32, 90-day seasons, leaderboard)
-- the **match relay**: every datagram goes player → server → player over UDP
-  (WebSocket fallback), so players never learn each other's IP address
-- optional **Cloudflare Realtime TURN**: real UDP for matches even behind a
-  tunnel-only deployment, under a hard monthly byte budget that keeps it
-  inside Cloudflare's free tier (see `deploy/README.md`, section 2b)
-- **bring your own character**: instant FAIR / UNBALANCED / BLOCKED
-  matchup verdicts, verified temporary packages so both players fight with
-  byte-identical files
-- ranked result verification, stored replays, optional re-simulation of
-  disputed matches (`--features resim`)
-- matches that end early: a player who flees forfeits at once (a normal
-  loss); a win claimed because the other player fled or disconnected is
-  settled only on the server's own relay view (that slot said BYE or went
-  silent first), after a 15 s grace for the other report
-- **official vs community servers**: the official server (`play.rugen.dev`,
-  holder of the official Ed25519 key) is the global ranking and publishes a
-  signed truth feed (cheat blocklist + character ratings) that every
-  community server pulls and enforces; verdicts and results are signed
+**Docs: [rugen.dev/server](https://rugen.dev/server/overview/)** · official
+server: `play.rugen.dev`
 
-Docs: <https://rugen.dev> ·
-deployment guide: [`deploy/README.md`](deploy/README.md)
+## Features
 
-## Run
+- **Accounts**: optional username and password (Argon2id), several devices.
+- **Lobby**: public and private rooms, spectators, rematch.
+- **Quick match and ranked**: Elo, seasons, leaderboard.
+- **Match relay**: UDP with a WebSocket fallback; players never see each
+  other's IP. Optional Cloudflare TURN inside the free tier.
+- **Bring your own character**: matchup verdicts and verified temporary
+  packages, so both players fight with identical files.
+- **Fair ranked**: result checks, stored replays, re-simulation of disputed
+  matches.
+- **Official and community servers**: the official server signs a truth feed
+  (cheat blocklist, character ratings) that community servers enforce.
+- **Backups**: daily, to any S3-compatible bucket.
+
+## Capacity
+
+Measured on the production host with the built-in self-benchmark. The
+container was capped at **1 CPU and 768 MB**, and the load generator ran
+inside the same container, so these numbers are a floor.
+
+| Players online | p99 latency | CPU | Memory | Errors |
+|---|---|---|---|---|
+| 500 | 1.8 ms | 37 % | 228 MB | 0 |
+| 1,000 | 2.5 ms | 66 % | 408 MB | 0 |
+| 1,250 | 4.8 ms | 79 % | 530 MB | 0 |
+
+Every simulated player keeps a presence WebSocket, polls its room or queue,
+plays matches and reports results; part of them relay their match traffic
+through the server (about 10,000 packets/s at 1,250 players).
+
+- **1 CPU / 768 MB**: about 2,000 players online at once; memory runs out
+  first.
+- **2 CPU / 1.5 GB**: the compose defaults; roughly twice that.
+
+Method, raw numbers and how to benchmark your own host:
+[`docs/performance.md`](docs/performance.md).
+
+## Deploy
+
+Both compose files cap the container at 2 CPU / 1.5 GB by default
+(`RUGEN_CPUS`, `RUGEN_MEM`), with low priority under contention. They run
+as plain `docker compose` or as a Dokploy "Compose" app.
+
+**Public server**: [`deploy/docker-compose.yml`](deploy/docker-compose.yml)
+publishes 8080/tcp (HTTP and WebSocket; put HTTPS in front) and 7001/udp
+(the relay's fast path).
 
 ```sh
-docker compose -f deploy/docker-compose.yml up -d
+git clone https://github.com/rugen-dev/rugen-server
+cd rugen-server/deploy
+cp .env.example .env    # optional: name, MOTD, public URL
+docker compose up -d
 ```
 
-or from source:
+**Behind a Cloudflare Tunnel**:
+[`deploy/docker-compose.tunnel.yml`](deploy/docker-compose.tunnel.yml) opens
+no ports at all; the tunnel is the only way in and matches relay over the
+WebSocket. It builds the image from this repository on the host, so no
+registry is needed. This is how `play.rugen.dev` runs.
 
 ```sh
-cargo build --release
+docker compose -f deploy/docker-compose.tunnel.yml up -d
+```
+
+Players connect from the game's ONLINE menu by entering the server address.
+Configuration, official server keys, TURN, backups and operations:
+[rugen.dev/server](https://rugen.dev/server/overview/) and
+[`deploy/README.md`](deploy/README.md).
+
+## Build from source
+
+```sh
+cargo build --release --features resim
 RUGEN_DATA=/var/lib/rugen RUGEN_NAME="my server" ./target/release/rugen-server
 ```
 
-HTTP + WebSocket on 8080 (put HTTPS in front), UDP relay on 7001. Players
-connect from the game's ONLINE menu by entering the server address.
-
-## Develop
-
-The protocol, fairness rules and simulation are shared with the game and
-come from [rugen-engine](https://github.com/rugen-dev/rugen-engine) as git
-dependencies. To work against a local engine checkout, add an untracked
-`.cargo/config.toml`:
-
-```toml
-[patch."https://github.com/rugen-dev/rugen-engine"]
-rugen-proto   = { path = "../rugen-engine/crates/proto" }
-rugen-fair    = { path = "../rugen-engine/crates/fair" }
-rugen-formats = { path = "../rugen-engine/crates/formats" }
-rugen-cns     = { path = "../rugen-engine/crates/cns" }
-rugen-sim     = { path = "../rugen-engine/crates/sim" }
-rugen-net     = { path = "../rugen-engine/crates/net" }
-rugen-content = { path = "../rugen-engine/crates/content" }
-```
-
-The end-to-end tests use the engine checkout's `reference/` tree (KFM) and
-skip when it is missing; point `RUGEN_ENGINE_DIR` at it if it is not a
-sibling `../rugen-engine`.
+The protocol, fairness rules and simulation come from
+[rugen-engine](https://github.com/rugen-dev/rugen-engine) as git dependencies.
+To build against a local engine checkout, add an untracked
+`.cargo/config.toml` with a `[patch."https://github.com/rugen-dev/rugen-engine"]`
+section pointing at its `crates/`.
 
 Commits follow Conventional Commits: `type(scope): subject`.
-
-## Performance
-
-One CPU / 768 MB (the deploy limits) holds about 1250 concurrent clients
-of the default mix at p99 under 500 ms, CPU-bound; method, numbers and the
-built-in self-benchmark (`RUGEN_BENCH=1`, `POST /admin/bench`,
-`GET /admin/stats`) are in [`docs/performance.md`](docs/performance.md).
 
 ## License
 

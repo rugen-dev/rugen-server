@@ -20,7 +20,24 @@ data directory; the load generator on other cores. Steps of N clients
 with other builds: p99 near the knee varies x3–x10 between runs, so every
 configuration ran 2–3 times, interleaved.
 
-## Results (one CPU, static musl build like the release image)
+## Production host (self-benchmark, 1 CPU / 768 MB)
+
+`play.rugen.dev`, Docker capped at `cpus: 1.0`, `mem_limit: 768m`,
+`pids_limit: 256`; `POST /admin/bench` with steps 250 → 1500, 30 s hold.
+The load generator shares the container, so this is a floor.
+
+| clients | req/s | p50 ms | p99 ms | errors | CPU % | RSS MB | threads | relay pkt/s |
+|---|---|---|---|---|---|---|---|---|
+| 250 | 116 | 0.5 | 1.9 | 0 | 22 | 137 | 18 | 1,976 |
+| 500 | 233 | 0.6 | 1.8 | 0 | 37 | 228 | 19 | 4,037 |
+| 750 | 328 | 0.6 | 2.1 | 0 | 52 | 314 | 20 | 6,662 |
+| 1000 | 431 | 0.7 | 2.5 | 0 | 66 | 408 | 20 | 8,892 |
+| 1250 | 541 | 0.8 | 4.8 | 0 | 79 | 530 | 30 | 10,140 |
+
+The run stopped before 1500 on the memory guard (projected 636 MB of the
+614 MB allowed), not on latency or errors.
+
+## Laptop results (one CPU, static musl build like the release image)
 
 | | clients held | req/s | p99 ms | CPU % | RSS MB | threads | broke at |
 |---|---|---|---|---|---|---|---|
