@@ -373,6 +373,26 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     let n = 280 * 4;
     assert_eq!(la_log[..n], lb_log[..n], "input streams diverged");
 
+    // the server's input log: the same confirmed inputs, from frame 0, with
+    // the header (both players fed it on the relay). A private room's
+    // match: members only
+    let mut outsider = OnlineClient::new(&srv.url, None);
+    outsider.register().unwrap();
+    assert!(outsider.live_chunk(id, 0).is_err());
+    let viewer = a.clone();
+    // both players left the relay session: the match is over, its log stays
+    assert!(viewer.live_matches().unwrap().is_empty());
+    let c = viewer.live_chunk(id, 0).unwrap();
+    assert!(c.ended);
+    let h = c.header.as_ref().unwrap();
+    assert_eq!(h.fighters[0].fingerprint, kfm.fingerprint);
+    assert_eq!(h.seed, rugen_sim::headless::online_seed(id));
+    assert!(c.total >= 250, "the server holds {} frames", c.total);
+    let got = rugen_proto::stream::inputs_to_bytes(&c.inputs);
+    assert_eq!(got[..250 * 4], la_log[..250 * 4], "the log is the match");
+    let later = viewer.live_chunk(id, 100).unwrap();
+    assert!(later.header.is_none() && later.from == 100);
+
     // results (unranked room): accepted, community ratings of both fingerprints move
     let ev = |log: &Vec<u8>| rugen_net::online::Evidence {
         frames: 0,
