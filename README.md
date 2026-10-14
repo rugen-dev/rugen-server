@@ -20,6 +20,9 @@ server: `play.rugen.dev`
   packages, so both players fight with identical files.
 - **Fair ranked**: result checks, stored replays, re-simulation of disputed
   matches.
+- **Live watching and shared replays**: the server keeps every match's
+  input log, so anyone can watch it, even mid-match, and players share a
+  finished match by short code (kept 30 days).
 - **Official and community servers**: the official server signs a truth feed
   (cheat blocklist, character ratings) that community servers enforce.
 - **Backups**: daily, to any S3-compatible bucket.
