@@ -91,6 +91,11 @@
 // one audited exception: setpriority in crate::workers
 #![deny(unsafe_code)]
 
+/// mimalloc instead of the system allocator: the release image is static
+/// musl, whose allocator serialises threads (see docs/performance.md).
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod api;
 mod backup;
 mod compat;

@@ -33,6 +33,8 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # RGPK packages and rugen-fp-1 fingerprints of API 4 (rugen 0.5) clients
 zstd = { version = "0.13", default-features = false }
 sha2 = "0.11"
+# global allocator: musl's is slow under many threads (the image is musl)
+mimalloc = { version = "0.1", default-features = false }
 
 # setpriority: the re-simulation thread runs at a lower priority
 [target.'cfg(target_os = "linux")'.dependencies]
