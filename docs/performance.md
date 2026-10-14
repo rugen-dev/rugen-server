@@ -61,8 +61,19 @@ re-simulation) and loads it with the clients above, using a synthetic
 fighter so matches and relay traffic happen. The load generator shares
 the container's CPU quota and memory: the numbers are a lower bound.
 Limits: one run at a time, 5000 clients per step, 5 minutes per run,
-abort when p99 > 2 s or errors > 5 %; the temp directory is removed
-however the run ends. A read-only container needs a writable
+abort when p99 > 2 s or errors > 5 %, and never past 80 % of the
+container's memory limit (a step that would need more is not started:
+an OOM kill would take the real server down); the temp directory is
+removed however the run ends. The bench instance has no rate limits (its
+clients all come from this process); the real server's are unchanged.
+Each row has the errors by kind (`e_net` / `e_5xx` / `e_429` / `e_4xx`),
+a few `error_samples` and `relay_fail`.
+
+Open files: Docker 25+ starts containers with a soft limit of 1024 open
+files, about 500 players' sockets (the first production bench aborted at
+500 clients on it: connections and `/proc` reads failed). The server
+raises its soft limit to the hard one at startup (logged as `open files:
+limit …`); `/admin/stats` shows `open_files` / `max_open_files`. A read-only container needs a writable
 `RUGEN_BENCH_DIR` (e.g. `tmpfs: /tmp` in compose). Run it off-peak: it
 competes with real players for the same CPU.
 

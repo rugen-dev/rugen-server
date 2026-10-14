@@ -76,6 +76,18 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// No limit at all (self-benchmark instance only).
+    pub fn unlimited() -> Self {
+        Self {
+            account: u32::MAX,
+            ip: u32::MAX,
+            anon: u32::MAX,
+            register: u32::MAX,
+            relay: u32::MAX,
+            admin: u32::MAX,
+        }
+    }
+
     pub fn from_env() -> Self {
         let d = Self::default();
         let n = |k: &str, v: u32| {
@@ -257,6 +269,7 @@ fn request_key(query: &HashMap<String, String>, body: &[u8]) -> Option<String> {
     serde_json::from_slice::<KeyOnly>(body).ok()?.key
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn router(api: Arc<Api>) -> Router {
     router_with(api, Limits::from_env())
 }
@@ -281,6 +294,17 @@ pub async fn serve(
     api: Arc<Api>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_with(listener, api, Limits::from_env(), shutdown).await
+}
+
+/// [`serve`] with explicit rate limits (the self-benchmark instance runs
+/// without any: all its clients come from one process).
+pub async fn serve_with(
+    listener: tokio::net::TcpListener,
+    api: Arc<Api>,
+    limits: Limits,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     // relayed match frames are tiny and latency bound: no Nagle delay
     let listener = listener.tap_io(|tcp| {
         if let Err(e) = tcp.set_nodelay(true) {
@@ -289,7 +313,7 @@ pub async fn serve(
     });
     axum::serve(
         listener,
-        router(api).into_make_service_with_connect_info::<SocketAddr>(),
+        router_with(api, limits).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await

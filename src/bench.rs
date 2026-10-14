@@ -42,6 +42,17 @@ pub const MAX_RUN: Duration = Duration::from_secs(300);
 pub const ABORT_P99_MS: f64 = 2000.0;
 /// ... or this share of failed calls.
 pub const ABORT_ERR: f64 = 0.05;
+/// Descriptors a bench client needs at most (both ends of two TCP
+/// connections, one UDP socket).
+const FDS_PER_CLIENT: u64 = 5;
+/// Descriptors kept free for the real server and the process.
+const FD_MARGIN: u64 = 512;
+/// A run aborts when the process uses this share of its memory limit (an
+/// OOM kill would take the real server down) ...
+const MAX_MEM_SHARE: f64 = 0.8;
+/// ... and does not start a step that would get there at this much
+/// memory per client (measured: ~0.35 MB).
+const MB_PER_CLIENT: f64 = 0.45;
 /// Settling time after a step's ramp before measuring.
 const SETTLE: Duration = Duration::from_secs(2);
 /// Setup allowance counted into the time limit.
@@ -125,11 +136,20 @@ pub struct Row {
     pub p99_ms: f64,
     pub errors: u64,
     pub err_pct: f64,
+    /// Errors by kind: connect / timeout / reset, 5xx, 429, other 4xx.
+    pub e_net: u64,
+    pub e_5xx: u64,
+    pub e_429: u64,
+    pub e_4xx: u64,
+    /// A few distinct failures (`route: status message`).
+    pub error_samples: Vec<String>,
     /// Whole process (server + bench instance + load generator).
     pub cpu_pct: f64,
     pub rss_mb: f64,
     pub threads: u64,
     pub relay_pkt_s: f64,
+    /// Relayed matches that could not start (UDP bind / handshake).
+    pub relay_fail: u64,
     pub matches: u64,
 }
 
@@ -410,9 +430,16 @@ async fn serve_and_load(
         .map_err(|e| format!("bench http: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(crate::http::serve(listener, api.clone(), async move {
-        let _ = stop_rx.await;
-    }));
+    // no rate limits: every bench client comes from this process (the
+    // real server's limits are untouched)
+    let server = tokio::spawn(crate::http::serve_with(
+        listener,
+        api.clone(),
+        crate::http::Limits::unlimited(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
     let engine = crate::compat::SIM_ENGINE.unwrap_or("0.6.2");
     let mut load = Load::new(addr, Mix::new(engine, fighter, stage));
     let out = steps(plan, &mut load, deadline, last, id).await;
@@ -432,8 +459,33 @@ async fn steps(
 ) -> Option<String> {
     for &target in &plan.steps {
         let aborted = |why: String| Some(format!("{target} clients: {why}"));
+        // each client holds ~4 descriptors (its HTTP and WebSocket
+        // connections, both ends) plus a UDP socket while relaying
+        if let (Some((soft, _)), Some(open)) = (crate::sys::fd_limit(), crate::sys::open_fds()) {
+            let more = target.saturating_sub(load.clients() as u64) * FDS_PER_CLIENT;
+            if open + more + FD_MARGIN > soft {
+                let can = (load.clients() as u64)
+                    + soft.saturating_sub(open + FD_MARGIN) / FDS_PER_CLIENT;
+                return aborted(format!(
+                    "the open-file limit ({soft}) allows about {can} bench clients: raise it \
+                     (compose `ulimits: nofile`) or ask for fewer"
+                ));
+            }
+        }
         if Instant::now() + plan.ramp + SETTLE + plan.hold > deadline {
             return aborted("the 5 minute limit".into());
+        }
+        let mem_cap = crate::sys::memory_limit_mb().map(|m| m * MAX_MEM_SHARE);
+        if let Some(cap) = mem_cap {
+            let rss = proc_sample(None).rss_mb;
+            let more = target.saturating_sub(load.clients() as u64) as f64 * MB_PER_CLIENT;
+            if rss + more > cap {
+                return aborted(format!(
+                    "would need about {:.0} MB of the {:.0} MB allowed (80 % of the memory limit)",
+                    rss + more,
+                    cap
+                ));
+            }
         }
         load.grow(target as usize, plan.ramp).await;
         tokio::time::sleep(SETTLE).await;
@@ -449,10 +501,17 @@ async fn steps(
             threads = threads.max(p.threads);
             rss = rss.max(p.rss_mb);
             let (p99, err, calls) = load.peek();
-            if calls >= 20 && p99 > ABORT_P99_MS {
+            if calls >= 100 && p99 > ABORT_P99_MS {
                 why = Some(format!("p99 {p99:.0} ms above {ABORT_P99_MS:.0} ms"));
-            } else if calls >= 20 && err > ABORT_ERR {
+            } else if calls >= 100 && err > ABORT_ERR {
                 why = Some(format!("{:.1} % of the calls failed", err * 100.0));
+            } else if let Some(cap) = mem_cap
+                && p.rss_mb > cap
+            {
+                why = Some(format!(
+                    "memory {:.0} MB above {cap:.0} MB (80 % of the limit)",
+                    p.rss_mb
+                ));
             } else if Instant::now() > deadline {
                 why = Some("the 5 minute limit".into());
             }
@@ -474,10 +533,16 @@ async fn steps(
             p99_ms: s.pct(0.99),
             errors: s.errors(),
             err_pct: s.err_rate() * 100.0,
+            e_net: s.e_net,
+            e_5xx: s.e_5xx,
+            e_429: s.e_429,
+            e_4xx: s.e_4xx,
+            error_samples: s.err_samples.clone(),
             cpu_pct: (p1.cpu_secs - p0.cpu_secs) / secs * 100.0,
             rss_mb: rss.max(p1.rss_mb),
             threads: threads.max(p1.threads),
             relay_pkt_s: s.udp_sent as f64 / secs,
+            relay_fail: s.relay_fail,
             matches: s.matches,
         };
         log::info!(

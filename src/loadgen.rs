@@ -96,7 +96,13 @@ struct Stats {
     disputes: AtomicU64,
     matchup_fail: AtomicU64,
     ws_fail: AtomicU64,
+    relay_fail: AtomicU64,
+    /// A few distinct failures (`route: status message`), for diagnosis.
+    err_samples: Mutex<Vec<String>>,
 }
+
+/// Distinct failure messages kept per window.
+const ERR_SAMPLES: usize = 8;
 
 /// One measurement window.
 #[derive(Default)]
@@ -119,6 +125,10 @@ pub struct Sample {
     pub disputes: u64,
     pub matchup_fail: u64,
     pub ws_fail: u64,
+    /// Relayed matches that could not start (UDP bind / handshake).
+    pub relay_fail: u64,
+    /// A few distinct failures (`route: status message`).
+    pub err_samples: Vec<String>,
 }
 
 impl Sample {
@@ -175,30 +185,65 @@ pub struct ProcSample {
     pub alive: bool,
 }
 
-/// `pid` `None` = this process.
+/// `pid` `None` = this process: CPU time from `getrusage` (no `/proc`
+/// needed), memory and threads from `/proc/self` with fallbacks
+/// (`statm`, the `task` directory).
 pub fn proc_sample(pid: Option<u32>) -> ProcSample {
     let dir = pid.map_or_else(|| "/proc/self".to_string(), |p| format!("/proc/{p}"));
-    let Ok(stat) = std::fs::read_to_string(format!("{dir}/stat")) else {
-        return ProcSample::default();
-    };
-    let after = stat.rsplit_once(')').map(|x| x.1).unwrap_or("");
-    let f: Vec<&str> = after.split_whitespace().collect();
-    let t = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    let stat = std::fs::read_to_string(format!("{dir}/stat")).ok();
     let status = std::fs::read_to_string(format!("{dir}/status")).unwrap_or_default();
     let field = |k: &str| {
         status
             .lines()
             .find_map(|l| l.strip_prefix(k))
             .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
-            .unwrap_or(0.0)
     };
-    ProcSample {
+    let stat_cpu = stat.as_deref().map(|stat| {
+        let after = stat.rsplit_once(')').map(|x| x.1).unwrap_or("");
+        let f: Vec<&str> = after.split_whitespace().collect();
+        let t = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
         // utime + stime, clock ticks (100 Hz on Linux)
-        cpu_secs: (t(11) + t(12)) / 100.0,
-        rss_mb: field("VmRSS:") / 1024.0,
-        threads: field("Threads:") as u64,
-        alive: true,
+        (t(11) + t(12)) / 100.0
+    });
+    let cpu_secs = match pid {
+        None => self_cpu_secs().or(stat_cpu),
+        Some(_) => stat_cpu,
+    };
+    let rss_mb = field("VmRSS:").map(|kb| kb / 1024.0).or_else(|| {
+        // resident pages, 4 KiB on the platforms we run on
+        let statm = std::fs::read_to_string(format!("{dir}/statm")).ok()?;
+        let pages: f64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096.0 / (1024.0 * 1024.0))
+    });
+    let threads = field("Threads:").map(|t| t as u64).or_else(|| {
+        std::fs::read_dir(format!("{dir}/task"))
+            .ok()
+            .map(|d| d.count() as u64)
+    });
+    ProcSample {
+        cpu_secs: cpu_secs.unwrap_or(0.0),
+        rss_mb: rss_mb.unwrap_or(0.0),
+        threads: threads.unwrap_or(0),
+        alive: stat.is_some() || cpu_secs.is_some(),
     }
+}
+
+/// CPU seconds (user + system) of this process, from `getrusage`.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn self_cpu_secs() -> Option<f64> {
+    // SAFETY: getrusage fills the zeroed struct it is given, nothing else
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return None;
+    }
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Some(secs(ru.ru_utime) + secs(ru.ru_stime))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn self_cpu_secs() -> Option<f64> {
+    None
 }
 
 struct Ctx {
@@ -289,6 +334,10 @@ impl Load {
             disputes: s.disputes.swap(0, Relaxed),
             matchup_fail: s.matchup_fail.swap(0, Relaxed),
             ws_fail: s.ws_fail.swap(0, Relaxed),
+            relay_fail: s.relay_fail.swap(0, Relaxed),
+            err_samples: std::mem::take(
+                &mut *s.err_samples.lock().unwrap_or_else(|p| p.into_inner()),
+            ),
         };
         out.lat.sort_unstable();
         out.relay_lat.sort_unstable();
@@ -476,8 +525,19 @@ impl Client {
         };
         let us = t.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
         s.lat.lock().unwrap_or_else(|p| p.into_inner()).push(us);
+        let route = route_name(method, path);
+        if let Err(e) = &out {
+            let mut v = s.err_samples.lock().unwrap_or_else(|p| p.into_inner());
+            // `METHOD /path?...: reason` → `METHOD /route: reason`
+            let why = e.split_once(": ").map_or(e.as_str(), |x| x.1);
+            let line = format!("{route}: {why}");
+            let line: String = line.chars().take(160).collect();
+            if v.len() < ERR_SAMPLES && !v.contains(&line) {
+                v.push(line);
+            }
+        }
         let mut m = s.by_route.lock().unwrap_or_else(|p| p.into_inner());
-        let e = m.entry(route_name(method, path)).or_default();
+        let e = m.entry(route).or_default();
         e.0 += 1;
         e.1 += u64::from(us);
         e.2 = e.2.max(u64::from(us));
@@ -660,7 +720,7 @@ impl Client {
     async fn play(&mut self, id: u64, side: u8, opp: u64, ranked: bool, t: SessionTicket) {
         self.ctx.stats.matches.fetch_add(1, Relaxed);
         let secs = 20 + (id % 21);
-        if share_of(id, 1, self.ctx.mix.relay_share) && t.udp.is_some() {
+        if share_of(id, 1, self.ctx.mix.relay_share) {
             self.ctx.relaying.fetch_add(1, Relaxed);
             relay(&self.ctx, self.n, &t, Duration::from_secs(secs)).await;
             self.ctx.relaying.fetch_sub(1, Relaxed);
@@ -754,6 +814,7 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
     let Some(token) =
         rugen_proto::from_hex(&t.token).and_then(|v| <[u8; TOKEN_LEN]>::try_from(v).ok())
     else {
+        ctx.stats.relay_fail.fetch_add(1, Relaxed);
         return;
     };
     let Some(server) = t
@@ -761,6 +822,7 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
         .as_deref()
         .and_then(|u| std::net::ToSocketAddrs::to_socket_addrs(u).ok()?.next())
     else {
+        ctx.stats.relay_fail.fetch_add(1, Relaxed);
         return;
     };
     let local = format!(
@@ -769,8 +831,13 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
         (n >> 8) & 255,
         (n & 255).max(1)
     );
-    let Ok(sock) = tokio::net::UdpSocket::bind(&local).await else {
-        return;
+    let sock = match tokio::net::UdpSocket::bind(&local).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("relay: bind {local}: {e}");
+            ctx.stats.relay_fail.fetch_add(1, Relaxed);
+            return;
+        }
     };
     let peer = 1 - t.slot;
     let frame = |kind: u8, to: u8, p: &[u8]| {
@@ -798,7 +865,11 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
     let mut mask = 0u8;
     let mut last_hello = t0 - Duration::from_secs(1);
     while mask & 0b11 != 0b11 {
-        if t0.elapsed() > Duration::from_secs(15) || ctx.stop.load(Relaxed) {
+        if ctx.stop.load(Relaxed) {
+            return;
+        }
+        if t0.elapsed() > Duration::from_secs(15) {
+            ctx.stats.relay_fail.fetch_add(1, Relaxed);
             return;
         }
         if last_hello.elapsed() >= Duration::from_millis(500) {
