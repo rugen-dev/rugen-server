@@ -10,7 +10,8 @@ server: `play.rugen.dev`
 ## Features
 
 - **Accounts**: optional username and password (Argon2id), several devices.
-- **Lobby**: public and private rooms, spectators, rematch.
+- **Lobby**: public and private rooms, spectators, rematch, tournament
+  brackets of 8 or 16 players (seeded by rating, matches called by the server).
 - **Quick match and ranked**: Elo, 90-day seasons (final standings and tier
   badges kept), leaderboards.
 - **Match relay**: UDP with a WebSocket fallback; players never see each
