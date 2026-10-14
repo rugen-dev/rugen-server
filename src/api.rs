@@ -23,6 +23,10 @@
 //! DELETE /queue (or POST /queue/leave) {key}
 //! POST /result                  {key, match_id, winner, frames?, checksum?, inputs? | inputs_rle?, checksums?, turn?}
 //! GET  /replay/{match_id}       stored ranked replay
+//! GET  /v1/live?key=            public live matches (LiveMatch[])
+//! GET  /v1/live/{id}?key=&from= a live match's input stream from frame N, binary
+//!                               (rugen_proto::stream chunk, the header when N = 0);
+//!                               private rooms: members only
 //! GET  /leaderboard?key=&season=  the live board, or a finished season's final
 //!                               standings (`finished`, `past` = seasons kept)
 //!      &fighter=FP | &fighters=1  a per-fighter board (players by their rating
@@ -88,7 +92,8 @@
 //! Season (GET /seasons/current, leaderboard.season)
 //!                                started_at, secs_left
 //! RoomInfo                       tournament: {size, state, entrants, rounds, live, champion}
-//! RoomSummary                    tournament: {size, entrants, state}
+//! RoomSummary                    tournament: {size, entrants, state}, live_match
+//! SessionTicket                  live: true (players send confirmed inputs on the relay)
 //! POST /result                   rounds: [p1, p2] (rounds won; the bracket's score)
 //! Leaderboard                    past: [season], finished: bool, fighter, fighters
 //!                                  (per-fighter boards)
@@ -311,6 +316,8 @@ pub struct Api {
     found: Mutex<HashMap<u64, (MatchInfo, bool)>>,
     pub hub: Mutex<Hub>,
     pub relay: Arc<Relay>,
+    /// Input logs of live matches, for viewers ([`crate::live`]).
+    pub live: Arc<crate::live::Live>,
     matchups: Mutex<HashMap<u64, Matchup>>,
     pub packages: Packages,
     /// Upload bytes per account in the current hour.
@@ -460,6 +467,8 @@ fn ticket(r: &Running, slot: usize, udp: &Option<String>) -> SessionTicket {
         spectators: r.slots.len().saturating_sub(2) as u8,
         udp: udp.clone(),
         transports,
+        // the server keeps the input log: the players feed it
+        live: slot < 2,
     }
 }
 
@@ -479,7 +488,10 @@ impl Api {
         let turn = cfg.turn.clone().map(Turn::new);
         let backups = Backups::new(std::mem::take(&mut cfg.backup), cfg.data.as_deref());
         let resim = cfg.resim.is_some();
+        let live = Arc::new(crate::live::Live::from_env());
+        relay.set_live(live.clone());
         Arc::new_cyclic(|me| Self {
+            live,
             store,
             rooms: Mutex::new(HashMap::new()),
             queue: Mutex::new(Vec::new()),
@@ -597,6 +609,10 @@ impl Api {
         let n = self.relay.expire(Instant::now());
         if n > 0 {
             log::debug!("relay: {n} idle sessions expired");
+        }
+        let n = self.live.sweep();
+        if n > 0 {
+            log::debug!("live: {n} finished match logs dropped");
         }
     }
 
@@ -738,6 +754,8 @@ impl Api {
             "window_secs": (secs * 10.0).round() / 10.0,
             "ws": lock(&self.hub).online(),
             "relay_sessions": self.relay.session_count(),
+            "live_logs": self.live.usage().0,
+            "live_bytes": self.live.usage().1,
             "relay_pkt_s": ((now.3 - start_fwd) as f64 / secs * 10.0).round() / 10.0,
             "open_files": crate::sys::open_fds(),
             "max_open_files": crate::sys::fd_limit().map(|l| l.0),
@@ -840,6 +858,8 @@ impl Api {
             }
             ("GET", ["leaderboard"]) => self.leaderboard(&req, &v),
             ("GET", ["replay", id]) => self.replay(id),
+            ("GET", ["v1", "live"]) => ok(&self.live.list()),
+            ("GET", ["v1", "live", id]) => self.live_chunk(&req, &v, id),
             ("GET", ["rooms"]) => self.list_rooms(&req),
             ("POST", ["room"]) => self.create_room(&req, &v),
             ("POST", ["room", code, "join"]) => self.join_room(&req, &v, code),
@@ -1231,6 +1251,7 @@ impl Api {
                         max_spectators: r.max_spectators,
                         locked: r.password.is_some(),
                         in_match: r.running.is_some(),
+                        live_match: r.running.as_ref().map_or(0, |run| run.match_id),
                         api: r.api,
                         tournament: r.tournament.as_ref().map(|t| rugen_proto::TournamentBrief {
                             size: t.size,
@@ -1526,6 +1547,29 @@ impl Api {
             self.broadcast(s, &code, r);
         }
         ok(&self.room_view(s, &code, r, me.id))
+    }
+
+    // ---- live matches
+
+    /// `GET /v1/live/{id}?key=&from=N`: a live (or just finished) match's
+    /// stream from frame N, binary ([`rugen_proto::stream::Chunk`]; the
+    /// header when N is 0). Private rooms' matches: members only.
+    fn live_chunk(&self, req: &Request, v: &Value, id: &str) -> Res {
+        let id = id.parse::<u64>().map_err(|_| err(400, "bad id"))?;
+        let me = self.auth(&self.store, req, v)?;
+        let from = req
+            .query
+            .get("from")
+            .and_then(|f| f.parse::<u32>().ok())
+            .unwrap_or(0);
+        match self
+            .live
+            .chunk(id, from, crate::live::MAX_CHUNK_FRAMES, me.id)
+        {
+            Some(c) => Ok(Response::bytes(rugen_proto::stream::encode_chunk(&c))),
+            None if self.live.may_watch(id, me.id) => Err(err(404, "no such live match")),
+            None => Err(err(404, "no such live match (or a private room's)")),
+        }
     }
 
     // ---- tournaments
@@ -2635,6 +2679,48 @@ impl Api {
             .as_ref()
             .map(|t| t.take(store, m.id, session))
             .unwrap_or_default();
+        // the input log viewers watch (players feed it on the relay)
+        {
+            let content = |d: Option<&FighterDecl>| rugen_proto::stream::StreamContent {
+                fingerprint: d.map(|d| d.fingerprint.clone()).unwrap_or_default(),
+                name: d.map(|d| d.name.clone()).unwrap_or_default(),
+                size: d
+                    .and_then(|d| store.package(&d.fingerprint).ok().flatten())
+                    .map_or_else(|| d.map_or(0, |d| d.size), |p| p.size),
+            };
+            let player = |id: u64| {
+                let p = Self::profile(store, id);
+                rugen_proto::stream::StreamPlayer {
+                    id,
+                    name: p.name,
+                    verified: p.verified,
+                }
+            };
+            let header = rugen_proto::stream::MatchHeader {
+                v: rugen_proto::stream::STREAM_VERSION,
+                match_id: m.id,
+                engine: m
+                    .ready
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|r| r.engine.clone())
+                    .unwrap_or_default(),
+                seed: rugen_proto::stream::online_seed(m.id),
+                rules: m.rules.clone(),
+                fighters: [content(m.fighter(0)), content(m.fighter(1))],
+                stage: content(m.stage.as_ref()),
+                players: [player(m.players[0]), player(m.players[1])],
+                ranked: m.ranked,
+                created: crate::store::now(),
+            };
+            let (public, members) = match &room {
+                Some(r) => (r.public, r.members.iter().map(|x| x.account).collect()),
+                None => (true, m.players.to_vec()),
+            };
+            self.live
+                .start(session, header, public, code.clone(), members);
+        }
         let run = Running {
             match_id: m.id,
             session,
@@ -2859,9 +2945,12 @@ impl Api {
         let me = self.auth(s, req, v)?;
         {
             let ms = lock(&self.matchups);
+            // players and spectators of a matchup, and viewers of a live
+            // match (who opened its stream)
             if !ms
                 .values()
                 .any(|m| m.involves(me.id) && m.declared().contains(&fp.as_str()))
+                && !self.live.watches_content(&fp, me.id)
             {
                 return Err(err(403, "not part of your matchup"));
             }
@@ -3669,6 +3758,43 @@ pub(crate) mod tests {
         let rv = json_of(api.handle(req("GET", &format!("/room/{code}?key={kc}"), Value::Null)));
         assert_eq!(rv["ready"], true);
         assert_eq!(rv["ticket"]["slot"], 2);
+        // the server keeps the input log: players feed it, spectators do not
+        assert_eq!(va["ticket"]["live"], true);
+        assert!(rv["ticket"].get("live").is_none());
+        let live = json_of(api.handle(req("GET", "/v1/live", Value::Null)));
+        assert_eq!(live[0]["match_id"].as_u64(), Some(id));
+        assert_eq!(live[0]["room"], code.as_str());
+        let list = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(list[0]["live_match"].as_u64(), Some(id));
+        let r = api.handle(req(
+            "GET",
+            &format!("/v1/live/{id}?key={kd}&from=0"),
+            Value::Null,
+        ));
+        assert_eq!(r.status, 200, "a public room's match: anyone");
+        let c = rugen_proto::stream::decode_chunk(&r.body).unwrap();
+        let h = c.header.unwrap();
+        assert_eq!(h.match_id, id);
+        assert_eq!(h.seed, rugen_proto::stream::online_seed(id));
+        assert_eq!(h.fighters[0].fingerprint, kit.a.0.fingerprint);
+        assert!(h.fighters[0].size > 0);
+        assert_eq!((c.total, c.ended), (0, false));
+        // its packages: a viewer may download them
+        let r = api.handle(req(
+            "GET",
+            &format!("/pkg/{}/data?key={kd}&offset=0&len=16", kit.a.0.fingerprint),
+            Value::Null,
+        ));
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            api.handle(req(
+                "GET",
+                "/v1/live/123?key=".to_string().as_str(),
+                Value::Null
+            ))
+            .status,
+            401
+        );
         // rematch: both players → a new matchup (files already on the server)
         json_of(api.handle(req(
             "POST",

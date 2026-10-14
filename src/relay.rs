@@ -151,6 +151,8 @@ pub struct Relay {
     pub queue_drops: AtomicU64,
     /// [`Presence`] of sessions closed or expired in the last [`ENDED_KEEP`].
     ended: Mutex<HashMap<u32, (Instant, Vec<Presence>)>>,
+    /// The input logs of live matches (players' `STREAM` uploads).
+    live: OnceLock<Arc<crate::live::Live>>,
 }
 
 pub fn random_token() -> [u8; TOKEN_LEN] {
@@ -162,6 +164,11 @@ pub fn random_token() -> [u8; TOKEN_LEN] {
 impl Relay {
     pub fn set_udp(&self, socket: Arc<UdpSocket>) {
         let _ = self.udp.set(socket);
+    }
+
+    /// Where players' `STREAM` uploads go.
+    pub fn set_live(&self, live: Arc<crate::live::Live>) {
+        let _ = self.live.set(live);
     }
 
     fn get(&self, id: u32) -> Option<Arc<Mutex<Session>>> {
@@ -225,6 +232,9 @@ impl Relay {
         if let Some(s) = gone {
             self.remember(id, &lock(&s));
             log::debug!("relay session {id:08x} closed");
+        }
+        if let Some(l) = self.live.get() {
+            l.end_session(id);
         }
     }
 
@@ -333,6 +343,11 @@ impl Relay {
             keep
         });
         std::mem::drop(map);
+        if let Some(l) = self.live.get() {
+            for (id, _) in &gone {
+                l.end_session(*id);
+            }
+        }
         let n = gone.len();
         let mut ended = lock(&self.ended);
         ended.retain(|_, (t, _)| now.duration_since(*t) < ENDED_KEEP);
@@ -450,6 +465,17 @@ impl Relay {
                 }
             }
             wire::PING => self.send(from, reply(wire::PONG, payload)),
+            // a player's confirmed inputs for the match's input log
+            wire::STREAM if h.from < 2 => {
+                std::mem::drop(s);
+                let held = rugen_proto::stream::decode_upload(payload).and_then(|(at, frames)| {
+                    self.live.get()?.upload(h.session, h.from, at, &frames)
+                });
+                match held {
+                    Some(n) => self.send(from, reply(wire::STREAM_ACK, &n.to_le_bytes())),
+                    None => reject(),
+                }
+            }
             wire::BYE => {
                 self.announce(h.session, &s, Some(h.from));
                 // both players are done: the match is over
@@ -629,6 +655,51 @@ mod tests {
         assert_eq!(got, WS_QUEUE);
         // the ACK took one place in B's queue
         assert_eq!(r.queue_drops.load(Relaxed), (n + 1 - WS_QUEUE) as u64);
+    }
+
+    #[test]
+    fn players_feed_the_input_log_and_get_acks() {
+        let r = Relay::default();
+        let live = Arc::new(crate::live::Live::default());
+        r.set_live(live.clone());
+        let (id, tokens) = r.create(&[1, 2, 3]).unwrap();
+        live.start(
+            id,
+            rugen_proto::stream::MatchHeader {
+                match_id: 50,
+                ..Default::default()
+            },
+            true,
+            None,
+            vec![],
+        );
+        let (c, mut rx) = r.ws_connect();
+        let c = Route::Ws(c);
+        let now = Instant::now();
+        let frames: Vec<[u16; 2]> = (0..30).map(|i| [i, i]).collect();
+        for slot in 0..2u8 {
+            let p = rugen_proto::stream::encode_upload(0, &frames);
+            r.on_packet(
+                &pkt(wire::STREAM, slot, 0xFF, id, &tokens[slot as usize], &p),
+                &c,
+                now,
+            );
+            let ack = rx.try_recv().unwrap();
+            let (h, body) = wire::decode_server(&ack).unwrap();
+            assert_eq!((h.kind, h.to), (wire::STREAM_ACK, slot));
+            assert_eq!(body, 30u32.to_le_bytes());
+        }
+        assert_eq!(live.chunk(50, 0, 100, 1).unwrap().total, 30);
+        // spectators never feed it; a bad token is dropped
+        let p = rugen_proto::stream::encode_upload(30, &frames);
+        let before = dropped(&r);
+        r.on_packet(&pkt(wire::STREAM, 2, 0xFF, id, &tokens[2], &p), &c, now);
+        r.on_packet(&pkt(wire::STREAM, 0, 0xFF, id, &tokens[1], &p), &c, now);
+        assert_eq!(dropped(&r), before + 2);
+        assert!(rx.try_recv().is_err());
+        // the session closing ends the match's log
+        r.close(id);
+        assert!(live.chunk(50, 0, 1, 1).unwrap().ended);
     }
 
     #[test]

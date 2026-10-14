@@ -106,6 +106,7 @@ mod elo;
 mod http;
 mod hub;
 mod legacy;
+mod live;
 mod loadgen;
 mod matchmaking;
 mod matchup;
