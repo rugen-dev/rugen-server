@@ -514,6 +514,7 @@ again (it is at least the current Unix time).
 | `RUGEN_PKG_TTL`    | `RUGEN_PKG_DAYS`   | a package expires this long after its last use (`90m`, `2d`, seconds), never later than `RUGEN_PKG_DAYS` |
 | `RUGEN_PKG_MAX_TOTAL` | `5GB`           | all packages together; least recently used evicted above it |
 | `RUGEN_PKG_MAX`    | `150MB`            | largest single package accepted |
+| `RUGEN_LIVE_VIEWERS` | `500`           | viewers per live match; one more is told "this match is full" |
 | `RUGEN_PKG_S3`     | –                  | bucket that also serves packages (Cloudflare R2), `RUGEN_BACKUP_S3` URL format; objects under `chars/` |
 | `RUGEN_PKG_S3_MAX_GB` | `8`             | stop copying new packages to that bucket above this many GB |
 | `RUGEN_PKG_RATE_ACCOUNT` | `1GB`        | upload bytes per account per hour |

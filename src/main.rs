@@ -22,6 +22,7 @@
 //! RUGEN_PKG_TTL                 package expiry after last use      RUGEN_PKG_DAYS
 //! RUGEN_PKG_MAX_TOTAL           all packages (LRU eviction)        5GB
 //! RUGEN_PKG_MAX                 one package                        150MB
+//! RUGEN_LIVE_VIEWERS            viewers per live match             500
 //! RUGEN_PKG_S3                  bucket that serves packages (R2),  (off)
 //!                               same URL format as RUGEN_BACKUP_S3; objects under chars/
 //! RUGEN_PKG_S3_MAX_GB           stop uploading to it above         8

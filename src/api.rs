@@ -29,7 +29,8 @@
 //! GET  /v1/replays/{code}       a shared replay: binary stream chunk (header + every frame)
 //! GET  /v1/live/{id}?key=&from= a live match's input stream from frame N, binary
 //!                               (rugen_proto::stream chunk, the header when N = 0);
-//!                               private rooms: members only
+//!                               private rooms: members only; 409 "this match is full"
+//!                               past RUGEN_LIVE_VIEWERS (500) viewers
 //! GET  /leaderboard?key=&season=  the live board, or a finished season's final
 //!                               standings (`finished`, `past` = seasons kept)
 //!      &fighter=FP | &fighters=1  a per-fighter board (players by their rating
@@ -1638,11 +1639,13 @@ impl Api {
             .unwrap_or(0);
         match self
             .live
-            .chunk(id, from, crate::live::MAX_CHUNK_FRAMES, me.id)
+            .chunk_for(id, from, crate::live::MAX_CHUNK_FRAMES, me.id)
         {
-            Some(c) => Ok(Response::bytes(rugen_proto::stream::encode_chunk(&c))),
-            None if self.live.may_watch(id, me.id) => Err(err(404, "no such live match")),
-            None => Err(err(404, "no such live match (or a private room's)")),
+            Ok(c) => Ok(Response::bytes(rugen_proto::stream::encode_chunk(&c))),
+            // RUGEN_LIVE_VIEWERS are watching already
+            Err(crate::live::Refused::Full) => Err(err(409, crate::live::FULL)),
+            Err(_) if self.live.may_watch(id, me.id) => Err(err(404, "no such live match")),
+            Err(_) => Err(err(404, "no such live match (or a private room's)")),
         }
     }
 

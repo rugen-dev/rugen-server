@@ -16,6 +16,13 @@
 //! acknowledged but not kept (the match itself is unaffected). A log is
 //! dropped [`KEEP_ENDED`] after its match ended (late viewers, sharing from
 //! the result screen) unless it is shared ([`crate::store`] keeps those).
+//!
+//! Fan-out is pull and batched: a viewer asks `GET /v1/live/{id}?from=N`
+//! about every 0.4 s (the game) and gets every frame since `N` in one
+//! response, so a viewer costs ~2.5 small responses a second, never one
+//! message per frame. At most `RUGEN_LIVE_VIEWERS` (500) viewers per match:
+//! one more is refused with [`FULL`] (a viewer keeps its seat while it
+//! keeps asking).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +36,19 @@ pub const KEEP_ENDED: Duration = Duration::from_secs(15 * 60);
 pub const MAX_CHUNK_FRAMES: usize = 60 * 60 * 5;
 /// A viewer counts as watching for this long after its last request.
 const VIEWER_SECS: u64 = 10;
+/// Viewers per match unless `RUGEN_LIVE_VIEWERS` says.
+pub const DEFAULT_VIEWERS: usize = 500;
+/// What a viewer past the cap is told.
+pub const FULL: &str = "this match is full: too many people are watching it, try another one";
+
+/// Why a viewer gets no chunk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// No such live match, or a private room's for an outsider.
+    Missing,
+    /// [`Live::max_viewers`] are watching already.
+    Full,
+}
 
 struct Log {
     header: MatchHeader,
@@ -81,6 +101,8 @@ struct Inner {
 pub struct Live {
     inner: Mutex<Inner>,
     budget: usize,
+    /// Viewers per match at most (`RUGEN_LIVE_VIEWERS`).
+    pub max_viewers: usize,
 }
 
 impl Default for Live {
@@ -99,16 +121,22 @@ impl Live {
         Self {
             inner: Mutex::new(Inner::default()),
             budget,
+            max_viewers: DEFAULT_VIEWERS,
         }
     }
 
-    /// `RUGEN_LIVE_MB` (default 64).
+    /// `RUGEN_LIVE_MB` (default 64), `RUGEN_LIVE_VIEWERS` (500).
     pub fn from_env() -> Self {
-        let mb = std::env::var("RUGEN_LIVE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(64);
-        Self::new(mb << 20)
+        let num = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        };
+        let mut l = Self::new(num("RUGEN_LIVE_MB").unwrap_or(64) << 20);
+        l.max_viewers = num("RUGEN_LIVE_VIEWERS")
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_VIEWERS);
+        l
     }
 
     /// A match started on relay session `session`.
@@ -191,16 +219,37 @@ impl Live {
     /// `viewer` counts as watching. `None`: no such live match, or not
     /// allowed (a private room's match for an outsider).
     pub fn chunk(&self, match_id: u64, from: u32, max: usize, viewer: u64) -> Option<Chunk> {
+        self.chunk_for(match_id, from, max, viewer).ok()
+    }
+
+    /// [`Self::chunk`] saying why there is none.
+    pub fn chunk_for(
+        &self,
+        match_id: u64,
+        from: u32,
+        max: usize,
+        viewer: u64,
+    ) -> Result<Chunk, Refused> {
+        let cap = self.max_viewers;
         let mut g = lock(&self.inner);
-        let log = g.logs.get_mut(&match_id)?;
+        let log = g.logs.get_mut(&match_id).ok_or(Refused::Missing)?;
         if !log.public && !log.members.contains(&viewer) {
-            return None;
+            return Err(Refused::Missing);
+        }
+        if !log.viewers.contains_key(&viewer)
+            || log.viewers[&viewer].elapsed().as_secs() >= VIEWER_SECS
+        {
+            log.viewers
+                .retain(|_, t| t.elapsed().as_secs() < VIEWER_SECS);
+            if log.viewers.len() >= cap {
+                return Err(Refused::Full);
+            }
         }
         log.viewers.insert(viewer, Instant::now());
         let total = log.len();
         let from = (from as usize).min(total);
         let to = (from + max.min(MAX_CHUNK_FRAMES)).min(total);
-        Some(Chunk {
+        Ok(Chunk {
             header: (from == 0).then(|| log.header.clone()),
             ended: log.ended.is_some(),
             total: total as u32,
@@ -383,6 +432,30 @@ mod tests {
         assert_eq!((h.match_id, all.len()), (1, 10));
         assert!(live.watches_content(&"a".repeat(64), 5));
         assert!(!live.watches_content(&"a".repeat(64), 6), "never opened it");
+    }
+
+    #[test]
+    fn viewers_past_the_cap_are_told_the_match_is_full() {
+        let mut live = Live::default();
+        assert_eq!(live.max_viewers, 500);
+        live.max_viewers = 3;
+        live.start(7, header(1), true, None, vec![]);
+        for v in 1..=3 {
+            assert!(live.chunk_for(1, 0, 10, v).is_ok());
+        }
+        assert_eq!(live.chunk_for(1, 0, 10, 4).unwrap_err(), Refused::Full);
+        // the seated keep watching
+        assert!(live.chunk_for(1, 0, 10, 2).is_ok());
+        assert_eq!(live.viewers(1), 3);
+        // a viewer that stopped asking frees its seat
+        lock(&live.inner)
+            .logs
+            .get_mut(&1)
+            .unwrap()
+            .viewers
+            .insert(3, Instant::now() - Duration::from_secs(VIEWER_SECS + 1));
+        assert!(live.chunk_for(1, 0, 10, 4).is_ok());
+        assert_eq!(live.chunk_for(9, 0, 10, 4).unwrap_err(), Refused::Missing);
     }
 
     #[test]
