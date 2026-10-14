@@ -49,6 +49,13 @@ services:
       RUGEN_BACKUP_INCLUDE: ${RUGEN_BACKUP_INCLUDE:-}
       # admin self-benchmark (POST /admin/bench); 1 = on, off by default
       RUGEN_BENCH: ${RUGEN_BENCH:-}
+      # fighter packages: kept this many days; optional R2 copy served by
+      # presigned links (same one-line URL format as RUGEN_BACKUP_S3)
+      RUGEN_PKG_DAYS: ${RUGEN_PKG_DAYS:-3}
+      RUGEN_PKG_S3: ${RUGEN_PKG_S3:-}
+      RUGEN_PKG_S3_MAX_GB: ${RUGEN_PKG_S3_MAX_GB:-8}
+      # live watching: viewers per match
+      RUGEN_LIVE_VIEWERS: ${RUGEN_LIVE_VIEWERS:-500}
     volumes:
       - rugen-data:/data
     # no "ports:": only the tunnel reaches the server
