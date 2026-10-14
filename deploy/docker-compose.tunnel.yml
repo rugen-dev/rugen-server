@@ -47,6 +47,8 @@ services:
       RUGEN_BACKUP_S3: ${RUGEN_BACKUP_S3:-}
       RUGEN_BACKUP_RETENTION_DAYS: ${RUGEN_BACKUP_RETENTION_DAYS:-7}
       RUGEN_BACKUP_INCLUDE: ${RUGEN_BACKUP_INCLUDE:-}
+      # admin self-benchmark (POST /admin/bench); 1 = on, off by default
+      RUGEN_BENCH: ${RUGEN_BENCH:-}
     volumes:
       - rugen-data:/data
     # no "ports:": only the tunnel reaches the server
@@ -60,6 +62,10 @@ services:
       - rugen
       - dokploy-network
     read_only: true
+    # the only writable path besides /data: the self-benchmark's throw-away
+    # server (in RAM, counted in mem_limit)
+    tmpfs:
+      - /tmp:size=128m
     security_opt:
       - no-new-privileges:true
     cap_drop:
