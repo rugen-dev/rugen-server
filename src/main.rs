@@ -117,6 +117,7 @@ mod s3;
 #[cfg(test)]
 mod s3_fake;
 mod store;
+mod sys;
 #[cfg(test)]
 mod testkit;
 mod truth;
@@ -264,6 +265,9 @@ fn main() {
         return;
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if let (Some((before, _)), Some((soft, hard))) = (sys::fd_limit(), sys::raise_fd_limit()) {
+        log::info!("open files: limit {soft} (was {before}, hard {hard})");
+    }
     if let Err(e) = run(s) {
         log::error!("{e}");
         std::process::exit(1);
