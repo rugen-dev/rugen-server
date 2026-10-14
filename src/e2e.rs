@@ -103,6 +103,13 @@ fn server_with(data: &Path, turn: Option<crate::turn::TurnConfig>) -> Server {
     }
 }
 
+/// A client of a player who agreed to send fighters to the server.
+fn player(url: &str) -> OnlineClient {
+    let mut c = OnlineClient::new(url, None);
+    c.consent = true;
+    c
+}
+
 /// A player's machine: a content library in its own folder.
 fn machine(root: &Path, reference: &Path) -> Library {
     std::fs::create_dir_all(root.join("chars")).unwrap();
@@ -300,8 +307,8 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     )
     .unwrap();
 
-    let mut a = OnlineClient::new(&srv.url, None);
-    let mut b = OnlineClient::new(&srv.url, None);
+    let mut a = player(&srv.url);
+    let mut b = player(&srv.url);
     let (ida, idb) = (a.register().unwrap().id, b.register().unwrap().id);
     let room = a
         .create_room("", &rugen_net::online::RoomOptions::default())
@@ -376,7 +383,7 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     // the server's input log: the same confirmed inputs, from frame 0, with
     // the header (both players fed it on the relay). A private room's
     // match: members only
-    let mut outsider = OnlineClient::new(&srv.url, None);
+    let mut outsider = player(&srv.url);
     outsider.register().unwrap();
     assert!(outsider.live_chunk(id, 0).is_err());
     let viewer = a.clone();
@@ -408,7 +415,7 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     // B shares the match: the code plays the server's log of it
     let shared = b.share_replay(id).unwrap();
     assert_eq!(shared.code.len(), 8);
-    let anyone = OnlineClient::new(&srv.url, None);
+    let anyone = player(&srv.url);
     let replay = anyone.shared_replay(&shared.code).unwrap();
     assert!(replay.ended && replay.header.is_some());
     let got = rugen_proto::stream::inputs_to_bytes(&replay.inputs);
@@ -449,8 +456,8 @@ fn naruto_vs_sasuke_real_characters() {
     let s = decl(&lib_b, "G6_Sasuke_Rinnegan", false);
     let st = decl(&lib_a, "stage0", true);
     eprintln!("prepare + fingerprint + profile: {:?}", t.elapsed());
-    let mut a = OnlineClient::new(&srv.url, None);
-    let mut b = OnlineClient::new(&srv.url, None);
+    let mut a = player(&srv.url);
+    let mut b = player(&srv.url);
     a.register().unwrap();
     b.register().unwrap();
     let room = a
@@ -585,8 +592,8 @@ fn turn_match_through_a_tunnel_only_server() {
     let lib_b = machine(&tmp.join("b"), &reference);
     copy_dir(&reference.join("chars/kfm"), &tmp.join("b/chars/kfm"));
 
-    let mut a = OnlineClient::new(&srv.url, None);
-    let mut b = OnlineClient::new(&srv.url, None);
+    let mut a = player(&srv.url);
+    let mut b = player(&srv.url);
     let ida = a.register().unwrap().id;
     b.register().unwrap();
     let room = a
@@ -763,13 +770,13 @@ fn turn_match_through_a_tunnel_only_server() {
 fn named_account_moves_between_devices() {
     let tmp = crate::testkit::tmp("e2e-accounts");
     let srv = server(&tmp.join("server"));
-    assert!(OnlineClient::new(&srv.url, None).info().unwrap().accounts);
+    assert!(player(&srv.url).info().unwrap().accounts);
     // device 1: create, then a rating to recognise
-    let mut one = OnlineClient::new(&srv.url, None);
+    let mut one = player(&srv.url);
     let s = one.create_account("Axel", "simple").unwrap();
     assert_eq!(one.key.as_deref(), Some(s.key.as_str()));
     assert!(s.profile.verified);
-    let opponent = OnlineClient::new(&srv.url, None).register().unwrap();
+    let opponent = player(&srv.url).register().unwrap();
     {
         let st = srv.api.store();
         let m = st.new_match([s.id, opponent.id], true, "{}").unwrap();
@@ -785,7 +792,7 @@ fn named_account_moves_between_devices() {
     one.logout(false).unwrap();
     assert!(one.account().is_err(), "logged out");
     // device 2: a fresh client logs in
-    let mut two = OnlineClient::new(&srv.url, None);
+    let mut two = player(&srv.url);
     let wrong = two.login("axel", "simplE").unwrap_err().to_string();
     assert!(wrong.contains("WRONG USERNAME OR PASSWORD"), "{wrong}");
     let l = two.login("axel", "simple").unwrap();
@@ -797,7 +804,7 @@ fn named_account_moves_between_devices() {
     let board = two.leaderboard().unwrap();
     assert!(board.rows.iter().any(|r| r.name == "Axel" && r.verified));
     // change password on device 2: device 3 (logged in before) is logged out
-    let mut three = OnlineClient::new(&srv.url, None);
+    let mut three = player(&srv.url);
     three.login("AXEL", "simple").unwrap();
     two.change_password("simple", "better-one").unwrap();
     assert!(three.account().is_err());
@@ -805,11 +812,154 @@ fn named_account_moves_between_devices() {
     two.logout(true).unwrap();
     assert!(two.account().is_err());
     // an older device: anonymous account, then claimed
-    let mut old = OnlineClient::new(&srv.url, None);
+    let mut old = player(&srv.url);
     let anon = old.register().unwrap();
     assert!(!old.account().unwrap().named());
     let c = old.claim("OldTimer", "simple").unwrap();
     assert_eq!((c.id, c.key.as_str()), (anon.id, anon.key.as_str()));
     assert_eq!(old.account().unwrap().username, "OldTimer");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Without online consent nothing is uploaded: the match still runs when
+/// the opponent already has the fighter, and fails with a reason that says
+/// who lacks what when it does not.
+#[test]
+fn no_consent_plays_with_shared_files_and_never_uploads() {
+    let Some(reference) = reference() else {
+        eprintln!("reference tree missing; skipping");
+        return;
+    };
+    let tmp = crate::testkit::tmp("e2e-consent");
+    let srv = server(&tmp.join("server"));
+    // both machines hold KFM and the stage; B also has a tuned KFM (only
+    // to copy it to C below)
+    let lib_a = machine(&tmp.join("a"), &reference);
+    let lib_b = machine(&tmp.join("b"), &reference);
+    for m in ["a", "b"] {
+        copy_dir(&reference.join("chars/kfm"), &tmp.join(m).join("chars/kfm"));
+        copy_dir(
+            &reference.join("stages"),
+            &tmp.join(m).join("stages/stage0"),
+        );
+        std::fs::remove_file(tmp.join(m).join("stages/stage0/kfm.def")).unwrap();
+        std::fs::remove_file(tmp.join(m).join("stages/stage0/stage0-720.def")).unwrap();
+    }
+    copy_dir(&reference.join("chars/kfm"), &tmp.join("b/chars/kfm_tuned"));
+    let cns = tmp.join("b/chars/kfm_tuned/kfm.cns");
+    let text = std::fs::read_to_string(&cns)
+        .unwrap()
+        .replacen("[Data]", "; tuned by B\n[Data]", 1);
+    std::fs::write(&cns, text).unwrap();
+    std::fs::rename(
+        tmp.join("b/chars/kfm_tuned/kfm.def"),
+        tmp.join("b/chars/kfm_tuned/kfm_tuned.def"),
+    )
+    .unwrap();
+    let kfm = decl(&lib_a, "kfm", false);
+    let stage = decl(&lib_a, "stage0", true);
+    let tuned = decl(&lib_b, "kfm_tuned", false);
+    let fp = |v: &MatchupView, i: usize| v.fingerprints()[i].unwrap().to_string();
+    let ready = |c: &OnlineClient, v: &MatchupView| {
+        c.ready(
+            v.id,
+            &ReadyReport {
+                p1: fp(v, 0),
+                p2: fp(v, 1),
+                stage: fp(v, 2),
+                engine: ENGINE.into(),
+                rules: v.rules.clone(),
+            },
+        )
+        .unwrap()
+    };
+    // neither A nor B agreed to send fighters
+    let mut a = OnlineClient::new(&srv.url, None);
+    let mut b = OnlineClient::new(&srv.url, None);
+    a.register().unwrap();
+    b.register().unwrap();
+    let room = a
+        .create_room("", &rugen_net::online::RoomOptions::default())
+        .unwrap();
+    let id = b
+        .join_room(&room.code, "", "", false)
+        .unwrap()
+        .matchup
+        .unwrap()
+        .id;
+    a.pick(id, Some(&kfm), Some(&stage)).unwrap();
+    b.pick(id, Some(&kfm), None).unwrap();
+    a.accept(id, false).unwrap();
+    let v = b.accept(id, false).unwrap();
+    assert_eq!(v.phase, "sync", "{}", v.error);
+    let mut offline = v.offline.clone();
+    offline.sort();
+    let mut want = vec![kfm.fingerprint.clone(), stage.fingerprint.clone()];
+    want.sort();
+    assert_eq!(offline, want, "the fighter and A's stage never come");
+    // A's client refuses to upload; the server refuses an upload without consent
+    let (dir, m) = lib_a.find_fingerprint(&kfm.fingerprint).unwrap();
+    let pkg = lib_a.package(&dir, &m).unwrap();
+    let e = a
+        .upload_package(&kfm.fingerprint, &pkg, &Transfer::new())
+        .unwrap_err();
+    assert!(e.to_string().contains("did not agree"), "{e}");
+    let key = a.key.clone().unwrap();
+    let r = ureq::post(format!(
+        "{}/pkg/{}/upload?key={key}&offset=0&total=4&consent=0",
+        srv.url, kfm.fingerprint
+    ))
+    .header("X-Rugen-Api", "5")
+    .send(&[0u8; 4][..]);
+    assert!(
+        matches!(r, Err(ureq::Error::StatusCode(403))),
+        "{:?}",
+        r.map(|r| r.status())
+    );
+    // both hold every file: ready → started, nothing on the server
+    ready(&a, &v);
+    ready(&b, &v);
+    let v = poll_until(&a, id, 30, |v| v.ticket.is_some());
+    assert_eq!(v.phase, "started", "{}", v.error);
+    assert!(!srv.api.packages.has(&kfm.fingerprint), "never uploaded");
+    assert!(!srv.api.packages.has(&stage.fingerprint));
+
+    // C has only the tuned KFM and joins a room of A (still no consent)
+    let lib_c = machine(&tmp.join("c"), &reference);
+    copy_dir(&reference.join("chars/kfm"), &tmp.join("c/chars/kfm_tuned"));
+    std::fs::copy(&cns, tmp.join("c/chars/kfm_tuned/kfm.cns")).unwrap();
+    std::fs::rename(
+        tmp.join("c/chars/kfm_tuned/kfm.def"),
+        tmp.join("c/chars/kfm_tuned/kfm_tuned.def"),
+    )
+    .unwrap();
+    let tuned_c = decl(&lib_c, "kfm_tuned", false);
+    assert_eq!(tuned_c.fingerprint, tuned.fingerprint);
+    let mut c = player(&srv.url);
+    c.register().unwrap();
+    let room = a
+        .create_room("", &rugen_net::online::RoomOptions::default())
+        .unwrap();
+    let id = c
+        .join_room(&room.code, "", "", false)
+        .unwrap()
+        .matchup
+        .unwrap()
+        .id;
+    a.pick(id, Some(&kfm), Some(&stage)).unwrap();
+    c.pick(id, Some(&tuned_c), None).unwrap();
+    a.accept(id, false).unwrap();
+    let v = c.accept(id, false).unwrap();
+    assert!(v.offline.contains(&kfm.fingerprint));
+    // C lacks A's KFM and the stage: it leaves and says why
+    assert!(lib_c.find_fingerprint(&kfm.fingerprint).is_none());
+    c.leave_matchup_missing(id, &kfm.fingerprint).unwrap();
+    let v = a.matchup(id).unwrap();
+    assert_eq!(v.phase, "failed");
+    assert!(
+        v.error.contains("P2 does not have") && v.error.contains("no online consent"),
+        "{}",
+        v.error
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -276,10 +276,13 @@ quick match, ranked) starts with a **matchup**:
    `chars/`), reports ready with the fingerprints, rules and game version,
    and the server hands out the relay tickets once both agree.
 
-Packages are **temporary caches**: they expire `RUGEN_PKG_TTL` after their
-last use, the oldest go first above `RUGEN_PKG_MAX_TOTAL`, and only packages
-of stored ranked replays are kept longer (`RUGEN_PKG_REPLAY_TTL`). Uploads
-are only accepted for a fighter the account declared in a live matchup,
+Packages are **temporary caches**: every package is deleted
+`RUGEN_PKG_DAYS` (3) days after its upload, whatever uses it; before that
+one expires `RUGEN_PKG_TTL` after its last use and the oldest go first above
+`RUGEN_PKG_MAX_TOTAL` (packages of stored replays last). Uploads are only
+accepted for a fighter the account declared in a live matchup, from a
+player who agreed to send fighters to this server (the game asks once per
+server; rugen 0.6.0–0.6.3 clients predate the question and keep working),
 capped per package and per hour (account and IP). Every verified result
 moves a **community Elo per fingerprint**, shown on the cards.
 
@@ -478,12 +481,13 @@ again (it is at least the current Unix time).
 | `RUGEN_UDP_PUBLIC` | public URL host + port | `host:port` clients send UDP to (must not be Cloudflare-proxied); `off` = no UDP relay at all |
 | `RUGEN_DATA`       | `/data`            | directory of `rugen.db` |
 | `RUST_LOG`         | `info`             | `error` … `debug` |
-| `RUGEN_PKG_TTL`    | `24h`              | a package expires this long after its last use (`90m`, `2d`, seconds) |
+| `RUGEN_PKG_DAYS`   | `3`                | days a package is kept after its upload, whatever uses it; players see it in the game's consent dialog |
+| `RUGEN_PKG_TTL`    | `RUGEN_PKG_DAYS`   | a package expires this long after its last use (`90m`, `2d`, seconds), never later than `RUGEN_PKG_DAYS` |
 | `RUGEN_PKG_MAX_TOTAL` | `5GB`           | all packages together; least recently used evicted above it |
 | `RUGEN_PKG_MAX`    | `150MB`            | largest single package accepted |
 | `RUGEN_PKG_RATE_ACCOUNT` | `1GB`        | upload bytes per account per hour |
 | `RUGEN_PKG_RATE_IP` | `2GB`             | upload bytes per client IP per hour |
-| `RUGEN_PKG_REPLAY_TTL` | `720`          | hours the packages of a stored ranked replay are kept |
+| `RUGEN_PKG_REPLAY_TTL` | `720`          | hours the packages of a stored ranked replay are evicted last (still deleted after `RUGEN_PKG_DAYS`) |
 | `RUGEN_FAIR_RATIO` | `1.6`              | power-score ratio above which a matchup is UNBALANCED |
 | `RUGEN_FAIR_COMMUNITY_GAP` | `200`      | community rating gap that is UNBALANCED |
 | `RUGEN_FAIR_MIN_GAMES` | `10`           | verified games before a character's community rating counts |
@@ -600,7 +604,9 @@ bucket can hold other things.
   delete those by hand if you had them).
 - Not included unless asked for with `RUGEN_BACKUP_INCLUDE`:
   - `packages`: uploaded incrementally to `<prefix>/backups/packages/` (a package
-    already in the bucket is not sent again); can be gigabytes.
+    already in the bucket is not sent again); can be gigabytes. A package
+    deleted on the server (`RUGEN_PKG_DAYS`) leaves the bucket at the next
+    backup.
   - `signing-key`: `<data>/signing.key`, the generated key of a community
     server. **Risk:** anyone who can read the bucket can then sign as your
     server. The official key normally comes from `RUGEN_SIGNING_KEY` and is

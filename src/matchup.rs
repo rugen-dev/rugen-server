@@ -11,8 +11,15 @@
 //! started  everything agreed: the relay session exists, tickets go out
 //! failed   a client lied (profile / fingerprint), left, or timed out
 //! ```
+//!
+//! A player without online consent picks with `uploads: false` and never
+//! uploads: its fighter (and P1's stage) are `offline` in the view, and the
+//! match starts without them on the server once both clients report ready
+//! (they hold every file). A client that lacks an offline fighter leaves
+//! with `reason: "missing"`; one that never says (rugen 0.6.0-0.6.3) fails
+//! the matchup after [`OFFLINE_WAIT`].
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rugen_fair::verdict::{Thresholds, verdict};
 use rugen_proto::{
@@ -22,6 +29,10 @@ use rugen_proto::{
 
 use crate::store::{PackageRow, Store};
 use crate::truth::Truth;
+
+/// How long a player may stay unready in sync while it lacks a fighter
+/// that is never uploaded (older clients cannot say so).
+pub const OFFLINE_WAIT: Duration = Duration::from_secs(90);
 
 /// Accounts by relay slot and their tokens once the match runs.
 #[derive(Clone, Debug)]
@@ -59,6 +70,11 @@ pub struct Matchup {
     /// Queue matches: the estimate is above the high-ping threshold, so
     /// clients show it on the confirm screen (both must accept anyway).
     pub high_ping: bool,
+    /// Per player: picked with `uploads: false` (no online consent), so
+    /// what it brings is never uploaded.
+    pub no_upload: [bool; 2],
+    /// When the sync phase began (the offline wait counts from it).
+    pub sync_since: Option<Instant>,
 }
 
 impl Matchup {
@@ -89,6 +105,8 @@ impl Matchup {
             touched: Instant::now(),
             est_ping_ms: None,
             high_ping: false,
+            no_upload: [false, false],
+            sync_since: None,
         }
     }
 
@@ -175,6 +193,66 @@ impl Matchup {
     pub fn reset_progress(&mut self) {
         self.accepted = [false, false];
         self.ready = [None, None];
+        self.sync_since = None;
+    }
+
+    /// Whether `fp` is never uploaded: every player that brings it plays
+    /// without online consent.
+    fn never_uploaded(&self, fp: &str) -> bool {
+        let who = self.declarers(fp);
+        !who.is_empty() && who.iter().all(|&side| self.no_upload[side])
+    }
+
+    /// Fingerprints the server lacks and will never get (see [`Self::never_uploaded`]).
+    pub fn offline(&self, has: &dyn Fn(&str) -> bool) -> Vec<String> {
+        self.missing(has)
+            .into_iter()
+            .filter(|fp| self.never_uploaded(fp))
+            .collect()
+    }
+
+    /// Every fingerprint of `missing` is never uploaded.
+    pub fn offline_only(&self, missing: &[String]) -> bool {
+        missing.iter().all(|fp| self.never_uploaded(fp))
+    }
+
+    /// Why the match cannot run: side `lacking` does not have `fp`, which
+    /// its owner never uploads.
+    pub fn missing_offline(&self, lacking: usize, fp: &str) -> String {
+        let name = self
+            .picks
+            .iter()
+            .chain(std::iter::once(&self.stage))
+            .flatten()
+            .find(|d| d.fingerprint == fp)
+            .map_or_else(|| "a fighter".to_string(), |d| d.name.clone());
+        let owner = self.declarers(fp).first().map_or(0, |s| s + 1);
+        format!(
+            "P{} does not have {name}, and P{owner} plays without sending fighters (no online consent)",
+            lacking + 1
+        )
+    }
+
+    /// Sync phase: fail once a player has stayed unready for
+    /// [`OFFLINE_WAIT`] while it may lack a fighter that never comes (a
+    /// client too old to say so).
+    pub fn check_offline_wait(&mut self, has: &dyn Fn(&str) -> bool) {
+        if self.phase() != "sync" {
+            return;
+        }
+        let since = *self.sync_since.get_or_insert_with(Instant::now);
+        let offline = self.offline(has);
+        if offline.is_empty() || since.elapsed() < OFFLINE_WAIT {
+            return;
+        }
+        for fp in &offline {
+            let owners = self.declarers(fp);
+            if let Some(side) = (0..2).find(|s| self.ready[*s].is_none() && !owners.contains(s)) {
+                let why = self.missing_offline(side, fp);
+                self.fail(why);
+                return;
+            }
+        }
     }
 
     pub fn fail(&mut self, why: String) {
@@ -380,6 +458,7 @@ impl Matchup {
             mirror: self.mirror,
             ticket,
             signed: self.verdict.as_ref().and(self.signed.clone()),
+            offline: self.offline(has),
         }
     }
 }

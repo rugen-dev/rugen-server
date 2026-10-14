@@ -41,12 +41,16 @@
 //!
 //! bring-your-own-character matchup (rooms and queue; see crate::matchup)
 //! GET  /matchup/{id}?key=       MatchupView (also pushed on /ws)
-//! POST /matchup/{id}/pick       {key, fighter: FighterDecl, stage?: FighterDecl}
+//! POST /matchup/{id}/pick       {key, fighter: FighterDecl, stage?: FighterDecl,
+//!                               uploads?: false (no online consent: never uploads)}
 //! POST /matchup/{id}/accept     {key, unbalanced?}
 //! POST /matchup/{id}/ready      {key, ready: ReadyReport}
-//! POST /matchup/{id}/leave      {key}
+//! POST /matchup/{id}/leave      {key, reason?: "missing", fingerprint?} (we lack a
+//!                               fighter that is never uploaded: the failure says so)
 //! GET  /pkg/{fp}?key=           PackageStatus ("HAS")
-//! POST /pkg/{fp}/upload?key=&offset=&total=   raw chunk, resumable
+//! POST /pkg/{fp}/upload?key=&offset=&total=&consent=1   raw chunk, resumable; refused
+//!                               (403) with consent other than 1, and without it from
+//!                               rugen 0.6.4+ (0.6.0-0.6.3 never send it: accepted)
 //! GET  /pkg/{fp}/data?key=&offset=&len=       raw bytes, resumable
 //! GET  /char/{fp}               community rating of a character fingerprint
 //! POST /match/{id}/desync       {key, frame}    a client saw a desync
@@ -86,7 +90,8 @@
 //!   (GET/POST /matchup/{id}..., the `matchup` lobby push, found.matchup)
 //! MatchInfo (`found` of GET/POST /queue and the `found` push)
 //!                                high_ping: bool
-//! GET /health                    relay: {sessions, forwarded, dropped, queue_drops}
+//! GET /health                    pkg_days (days packages are kept after upload)
+//!                                relay: {sessions, forwarded, dropped, queue_drops}
 //!                                backup: {configured, status, provider, retention_days,
 //!                                  last_success, last_error, last_size_bytes, next_at, running}
 //! ProfileInfo (profiles, boards, room members)
@@ -98,6 +103,8 @@
 //! RoomSummary                    tournament: {size, entrants, state}, live_match
 //! SessionTicket                  live: true (players send confirmed inputs on the relay)
 //! POST /result                   rounds: [p1, p2] (rounds won; the bracket's score)
+//! MatchupView                    offline: [fp] (never uploaded: their players
+//!                                  play without online consent)
 //! Leaderboard                    past: [season], finished: bool, fighter, fighters
 //!                                  (per-fighter boards)
 //! ```
@@ -818,6 +825,8 @@ impl Api {
             api_min: crate::compat::LEGACY_API,
             // named accounts (API 5)
             accounts: true,
+            // the game's consent dialog tells players this
+            pkg_days: self.packages.days(),
         })
     }
 
@@ -2713,6 +2722,13 @@ impl Api {
         if m.side_of(me.id).is_some() {
             m.touched = Instant::now();
         }
+        // a player that never gets an offline fighter (older clients poll)
+        if m.started.is_none() && m.failed.is_none() {
+            m.check_offline_wait(&|fp| self.stored(s, fp));
+            if m.failed.is_some() {
+                self.push_matchup(s, m);
+            }
+        }
         Ok(Response::json(200, &self.matchup_json(s, m, me.id)))
     }
 
@@ -2776,6 +2792,9 @@ impl Api {
                 if let Some(f) = fighter {
                     m.picks[side] = Some(f);
                 }
+                // `uploads: false`: this player sends nothing (no online
+                // consent); absent (older clients) = it uploads
+                m.no_upload[side] = v.get("uploads").and_then(Value::as_bool) == Some(false);
                 if let Some(st) = stage {
                     m.stage = Some(st);
                 }
@@ -2806,7 +2825,18 @@ impl Api {
                     m.fail(e);
                 }
             }
-            "leave" => m.fail(format!("P{} left", side + 1)),
+            "leave" => match v.get("reason").and_then(Value::as_str) {
+                // it lacks a fighter whose owner sends nothing
+                Some("missing") => {
+                    let fp = v.get("fingerprint").and_then(Value::as_str).unwrap_or("");
+                    let offline = m.offline(&|f| self.stored(s, f));
+                    match offline.iter().find(|f| *f == fp) {
+                        Some(fp) => m.fail(m.missing_offline(side, fp)),
+                        None => m.fail(format!("P{} left", side + 1)),
+                    }
+                }
+                _ => m.fail(format!("P{} left", side + 1)),
+            },
             _ => return Err(err(404, "no such matchup action")),
         }
         self.try_start(s, &mut rooms, m)?;
@@ -2836,7 +2866,16 @@ impl Api {
         {
             t.prepare(store, m.id, m.players, m.ranked, &m.rules);
         }
-        if m.phase() != "sync" || !m.missing(&|fp| self.stored(store, fp)).is_empty() {
+        if m.phase() != "sync" {
+            return Ok(false);
+        }
+        // every file on the server, or both players hold every file
+        // already (the fighter's owner plays without online consent: a
+        // client reports ready only once it has every file)
+        let missing = m.missing(&|fp| self.stored(store, fp));
+        if !missing.is_empty() && (m.ready.iter().any(Option::is_none) || !m.offline_only(&missing))
+        {
+            m.check_offline_wait(&|fp| self.stored(store, fp));
             return Ok(false);
         }
         match m.ready_agreed() {
@@ -2988,6 +3027,12 @@ impl Api {
         };
         if req.body.len() as u64 > MAX_CHUNK {
             return Err(err(413, "chunk too large"));
+        }
+        if let Err(why) = crate::compat::upload_consent(
+            req.query.get("consent").map(String::as_str),
+            req.engine.as_deref(),
+        ) {
+            return Err(err(403, why));
         }
         if total > self.cfg.pkg.max_pkg {
             return Err(err(
@@ -3767,7 +3812,7 @@ pub(crate) mod tests {
             max_pkg: 1 << 20,
             ..Default::default()
         });
-        let (_, ka) = register(&api);
+        let (aid, ka) = register(&api);
         let (_, kb) = register(&api);
         json_of(api.handle(req("POST", "/queue", json!({"key": ka, "ranked": false}))));
         let f = json_of(api.handle(req("POST", "/queue", json!({"key": kb, "ranked": false}))));
@@ -3785,6 +3830,25 @@ pub(crate) mod tests {
                 pkg[off..end].to_vec(),
             ))
         };
+        // online consent: a client that predates it (0.6.3) uploads without
+        // saying; a newer one must say yes
+        client_engine(Some("0.6.4"));
+        assert_eq!(up(0, 50).status, 403, "a 0.6.4 client must send consent");
+        let refused = api.handle(raw(
+            "POST",
+            &format!(
+                "/pkg/{}/upload?key={ka}&offset=0&total={n}&consent=0",
+                d.fingerprint
+            ),
+            pkg[..50].to_vec(),
+        ));
+        assert_eq!(refused.status, 403);
+        assert_eq!(
+            api.packages.partial_len(&d.fingerprint, aid),
+            0,
+            "nothing kept"
+        );
+        client_engine(Some("0.6.3"));
         json_of(up(0, 50));
         // a lost chunk: the server says where to resume
         let r = up(80, 100);
@@ -3875,6 +3939,51 @@ pub(crate) mod tests {
         let gone = pkgs.sweep(s);
         assert_eq!(gone, vec![kit.b.0.fingerprint.clone()]);
         assert!(pkgs.has(&kit.stage.0.fingerprint));
+    }
+
+    /// The consent dialog's promise: a package goes `RUGEN_PKG_DAYS` after
+    /// its upload, even while it is used every day or kept for a replay.
+    #[test]
+    fn packages_go_days_after_upload_whatever_uses_them() {
+        let kit = Kit::new();
+        let api = api_with(PkgConfig::default());
+        assert_eq!(
+            api.packages.cfg.max_age_secs,
+            3 * 86400,
+            "3 days by default"
+        );
+        assert_eq!(api.packages.days(), 3);
+        let info = json_of(api.handle(req("GET", "/health", Value::Null)));
+        assert_eq!(
+            info["pkg_days"], 3,
+            "the game shows it in its consent dialog"
+        );
+        let s = &api.store;
+        let t = crate::store::now();
+        for (i, (d, pkg)) in [&kit.a, &kit.b].into_iter().enumerate() {
+            std::fs::write(api.packages.path(&d.fingerprint), pkg).unwrap();
+            s.put_package(&crate::store::PackageRow {
+                fingerprint: d.fingerprint.clone(),
+                kind: d.kind.clone(),
+                size: pkg.len() as u64,
+                def: d.def.clone(),
+                // a: uploaded 3 days and a minute ago, b: 2 days ago
+                created: if i == 0 {
+                    t - 3 * 86400 - 60
+                } else {
+                    t - 2 * 86400
+                },
+                // both used a moment ago, and kept for a replay
+                last_used: t,
+                keep_until: t + 30 * 86400,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let gone = api.packages.sweep(s);
+        assert_eq!(gone, vec![kit.a.0.fingerprint.clone()]);
+        assert!(!api.packages.has(&kit.a.0.fingerprint));
+        assert!(api.packages.has(&kit.b.0.fingerprint));
     }
 
     #[test]

@@ -10,9 +10,13 @@
 //! clients are RGPK archives: unpacked into scratch space, checked against
 //! their `rugen-fp-1` fingerprint and stored as they came.
 //! Opponents download it (ranged reads, resumable). Packages are caches:
-//! they expire `RUGEN_PKG_TTL` after their last use, the oldest go first
-//! when the total passes `RUGEN_PKG_MAX_TOTAL`, and packages of stored
-//! ranked replays are kept until their `keep_until`.
+//! every package is deleted `RUGEN_PKG_DAYS` (3) days after its upload,
+//! whatever uses it (players agree to that in the game's consent dialog,
+//! which `/health` `pkg_days` feeds); before that one expires
+//! `RUGEN_PKG_TTL` after its last use (default: the same 3 days), the
+//! oldest go first when the total passes `RUGEN_PKG_MAX_TOTAL`, and
+//! packages of stored replays are evicted last (their `keep_until`, never
+//! past the age limit).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,6 +25,9 @@ use crate::store::{PackageRow, Store, now};
 
 #[derive(Clone, Debug)]
 pub struct PkgConfig {
+    /// Hard limit after the upload, seconds (`RUGEN_PKG_DAYS`): the promise
+    /// of the consent dialog.
+    pub max_age_secs: u64,
     /// Expiry after the last use, seconds.
     pub ttl_secs: u64,
     /// Total bytes kept (LRU eviction above).
@@ -33,10 +40,14 @@ pub struct PkgConfig {
     pub ip_rate: u64,
 }
 
+/// Days a package is kept after its upload unless `RUGEN_PKG_DAYS` says.
+pub const DEFAULT_DAYS: u64 = 3;
+
 impl Default for PkgConfig {
     fn default() -> Self {
         Self {
-            ttl_secs: 24 * 3600,
+            max_age_secs: DEFAULT_DAYS * 86400,
+            ttl_secs: DEFAULT_DAYS * 86400,
             max_total: 5 << 30,
             max_pkg: 150 << 20,
             account_rate: 1 << 30,
@@ -74,15 +85,27 @@ pub fn parse_duration(s: &str) -> Option<u64> {
 }
 
 impl PkgConfig {
-    /// From `RUGEN_PKG_TTL`, `RUGEN_PKG_MAX_TOTAL`, `RUGEN_PKG_MAX`,
-    /// `RUGEN_PKG_RATE_ACCOUNT`, `RUGEN_PKG_RATE_IP`.
+    /// From `RUGEN_PKG_DAYS`, `RUGEN_PKG_TTL`, `RUGEN_PKG_MAX_TOTAL`,
+    /// `RUGEN_PKG_MAX`, `RUGEN_PKG_RATE_ACCOUNT`, `RUGEN_PKG_RATE_IP`.
     pub fn from_env() -> Self {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] reading variables through `var`.
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
         let d = Self::default();
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let env = |k: &str| var(k).filter(|v| !v.trim().is_empty());
+        let max_age_secs = env("RUGEN_PKG_DAYS")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&days| days > 0)
+            .map_or(d.max_age_secs, |days| days * 86400);
         Self {
+            max_age_secs,
+            // the idle expiry never outlives the age limit
             ttl_secs: env("RUGEN_PKG_TTL")
                 .and_then(|v| parse_duration(&v))
-                .unwrap_or(d.ttl_secs),
+                .unwrap_or(max_age_secs)
+                .min(max_age_secs),
             max_total: env("RUGEN_PKG_MAX_TOTAL")
                 .and_then(|v| parse_size(&v))
                 .unwrap_or(d.max_total),
@@ -423,9 +446,14 @@ impl Packages {
         Ok(buf)
     }
 
-    /// Expire (TTL, unless kept for a replay) and evict (LRU above the total
-    /// cap) packages, drop stale partial uploads and orphan files. Returns
-    /// the fingerprints removed.
+    /// Days a package is kept after its upload (`/health` `pkg_days`).
+    pub fn days(&self) -> u32 {
+        self.cfg.max_age_secs.div_ceil(86400) as u32
+    }
+
+    /// Expire (age limit; TTL, unless kept for a replay) and evict (LRU
+    /// above the total cap) packages, drop stale partial uploads and
+    /// orphan files. Returns the fingerprints removed.
     pub fn sweep(&self, store: &Store) -> Vec<String> {
         let t = now();
         let mut removed = Vec::new();
@@ -438,7 +466,9 @@ impl Packages {
         };
         let mut live: Vec<PackageRow> = Vec::new();
         for r in rows {
-            let expired = r.last_used + self.cfg.ttl_secs < t && r.keep_until < t;
+            // the age limit holds whatever uses the package (replays too)
+            let expired = r.created + self.cfg.max_age_secs < t
+                || (r.last_used + self.cfg.ttl_secs < t && r.keep_until < t);
             if expired || !self.has(&r.fingerprint) {
                 removed.push(r.fingerprint.clone());
             } else {
@@ -527,5 +557,24 @@ mod tests {
         assert_eq!(parse_duration("90m"), Some(5400));
         assert_eq!(parse_duration("2d"), Some(172800));
         assert_eq!(parse_duration("30"), Some(30));
+    }
+
+    #[test]
+    fn days_and_ttl_from_the_environment() {
+        let with = |days: Option<&str>, ttl: Option<&str>| {
+            PkgConfig::from_vars(|k| match k {
+                "RUGEN_PKG_DAYS" => days.map(str::to_string),
+                "RUGEN_PKG_TTL" => ttl.map(str::to_string),
+                _ => None,
+            })
+        };
+        let c = with(None, None);
+        assert_eq!((c.max_age_secs, c.ttl_secs), (3 * 86400, 3 * 86400));
+        let c = with(Some("7"), Some("24h"));
+        assert_eq!((c.max_age_secs, c.ttl_secs), (7 * 86400, 86400));
+        // the idle expiry never outlives the age limit; junk keeps the default
+        assert_eq!(with(Some("1"), Some("2d")).ttl_secs, 86400);
+        assert_eq!(with(Some("zero"), None).max_age_secs, 3 * 86400);
+        assert_eq!(with(Some("0"), None).max_age_secs, 3 * 86400);
     }
 }

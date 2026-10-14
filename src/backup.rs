@@ -36,10 +36,11 @@
 //! uploads later; backups never touch anything outside `<prefix>/backups/`
 //! except the one-time cleanup of the legacy flat layout below.
 //!
-//! Packages are caches (24 h after last use by default) of files players
-//! upload again on demand, up to gigabytes: they are opt-in and uploaded
-//! incrementally (content-addressed names; an object of the same name and
-//! size is never sent twice). After each successful backup, backup sets
+//! Packages are caches (deleted `RUGEN_PKG_DAYS` after their upload) of
+//! files players upload again on demand, up to gigabytes: they are opt-in
+//! and uploaded incrementally (content-addressed names; an object of the
+//! same name and size is never sent twice), and a package deleted on the
+//! server leaves the bucket at the next backup. After each successful backup, backup sets
 //! older than the retention are deleted, the newest complete one always
 //! stays; only objects named like ours are ever touched.
 //!
@@ -751,10 +752,10 @@ impl Runner<'_> {
             }
             local.insert(key);
         }
-        // packages gone locally go once older than the retention
-        let cutoff = now().saturating_sub(self.cfg.retention_days * 86_400);
+        // packages gone locally (expired: RUGEN_PKG_DAYS) go from the
+        // bucket too: players were told they are deleted then
         for o in &remote {
-            if !local.contains(&o.key) && o.modified < cutoff && o.modified > 0 {
+            if !local.contains(&o.key) {
                 if let Err(e) = s3.delete(&o.key) {
                     log::warn!("backup: delete old package: {e}");
                 }

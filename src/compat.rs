@@ -16,6 +16,11 @@
 //!   the other one with a message saying who must update, uploads are
 //!   verified in the format of the uploader's API and downloads refuse a
 //!   package of the other generation.
+//! * Online consent (rugen 0.6.4+): uploads carry `consent=1` once the
+//!   player agreed to send fighters to the server; without it nothing is
+//!   uploaded and the match only runs when both players hold the files.
+//!   0.6.0-0.6.3 clients never send the flag and upload as before
+//!   ([`upload_consent`]).
 //! * The lobby lists every public room with an additive `api` field; for
 //!   API 4 clients (which do not know that field) rooms of the newer API
 //!   carry a `[0.6]` name prefix and come last.
@@ -119,6 +124,28 @@ pub fn engine_refusal(mine: &str, host: &str) -> String {
     }
 }
 
+/// The first game version that asks for online consent and says so on
+/// every upload (`consent=1`).
+pub const CONSENT_SINCE: &str = "0.6.4";
+
+/// Why an upload is refused over online consent, from its `consent`
+/// query value and the client's game version.
+///
+/// * `consent=1` (or `true`): the player agreed in the game's dialog.
+/// * `consent` with any other value: it did not, so nothing is stored.
+/// * no `consent` at all: rugen 0.6.0-0.6.3 (and 0.5), which predate the
+///   dialog, keep uploading as before; a client announcing
+///   [`CONSENT_SINCE`] or later must say it.
+pub fn upload_consent(consent: Option<&str>, engine: Option<&str>) -> Result<(), &'static str> {
+    const NO: &str = "online consent required: agree to send your fighters to this server";
+    match consent.map(str::trim) {
+        Some("1" | "true" | "yes") => Ok(()),
+        Some(_) => Err(NO),
+        None if engine.is_some_and(|v| version_key(v) >= version_key(CONSENT_SINCE)) => Err(NO),
+        None => Ok(()),
+    }
+}
+
 /// Why a package of the other generation cannot go to a client of `mine`.
 pub fn package_refusal(mine: u32) -> String {
     if is_legacy(mine) {
@@ -180,6 +207,25 @@ mod tests {
         assert!(can_resimulate(Some(sim)));
         assert!(!can_resimulate(None));
         assert!(!can_resimulate(Some("0.0.1")));
+    }
+
+    #[test]
+    fn uploads_need_consent_from_new_clients_only() {
+        // the flag decides when present
+        assert!(upload_consent(Some("1"), Some("0.6.4")).is_ok());
+        assert!(upload_consent(Some("true"), None).is_ok());
+        assert!(upload_consent(Some("0"), Some("0.6.4")).is_err());
+        assert!(upload_consent(Some("0"), Some("0.6.3")).is_err());
+        assert!(upload_consent(Some(""), None).is_err());
+        // 0.6.0-0.6.3 (and 0.5, tools) predate it: absent is fine
+        for v in ["0.5.2", "0.6.0", "0.6.3"] {
+            assert!(upload_consent(None, Some(v)).is_ok(), "{v}");
+        }
+        assert!(upload_consent(None, None).is_ok());
+        // newer clients must say it
+        for v in ["0.6.4", "0.6.10", "0.7.0", "1.0.0-rc1"] {
+            assert!(upload_consent(None, Some(v)).is_err(), "{v}");
+        }
     }
 
     #[test]

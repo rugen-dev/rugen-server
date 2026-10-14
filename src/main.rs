@@ -17,12 +17,15 @@
 //! RUGEN_NAME        --name      server name in server lists        rugen server
 //! RUGEN_MOTD                    message of the day
 //! RUST_LOG                      log filter                         info
-//! RUGEN_PKG_TTL                 package expiry after last use      24h
+//! RUGEN_PKG_DAYS                days a package is kept after its   3
+//!                               upload, whatever uses it (the game's consent dialog says it)
+//! RUGEN_PKG_TTL                 package expiry after last use      RUGEN_PKG_DAYS
 //! RUGEN_PKG_MAX_TOTAL           all packages (LRU eviction)        5GB
 //! RUGEN_PKG_MAX                 one package                        150MB
 //! RUGEN_PKG_RATE_ACCOUNT        uploads per account per hour       1GB
 //! RUGEN_PKG_RATE_IP             uploads per client IP per hour     2GB
-//! RUGEN_PKG_REPLAY_TTL          hours packages of ranked replays stay  720
+//! RUGEN_PKG_REPLAY_TTL          hours packages of ranked replays are  720
+//!                               evicted last (never past RUGEN_PKG_DAYS)
 //! RUGEN_FAIR_RATIO              power ratio that is UNBALANCED     1.6
 //! RUGEN_FAIR_COMMUNITY_GAP      community rating gap, UNBALANCED   200
 //! RUGEN_FAIR_MIN_GAMES          games before a rating counts       10
@@ -608,7 +611,8 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     };
     let pkg = packages::PkgConfig::from_env();
     log::info!(
-        "packages: ttl {} h, max {} MB each, {} MB total; fair ratio {}",
+        "packages: kept {} days (idle {} h), max {} MB each, {} MB total; fair ratio {}",
+        pkg.max_age_secs / 86400,
         pkg.ttl_secs / 3600,
         pkg.max_pkg >> 20,
         pkg.max_total >> 20,
