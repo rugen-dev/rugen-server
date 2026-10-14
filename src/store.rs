@@ -6,7 +6,9 @@
 //! renamed to `state.json.migrated`).
 
 use std::path::Path;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rugen_proto::{ProfileInfo, Season, rank_name};
@@ -384,18 +386,131 @@ fn tune(c: &Connection) -> DbResult<()> {
 /// distinct queries; rusqlite's default of 16 would keep re-parsing them).
 const STATEMENT_CACHE: usize = 256;
 
-/// The database: one writer connection (every write goes through it) and,
+/// The database: one writer connection driven by one writer thread, and,
 /// for a database file, a small pool of read-only connections for the
 /// read-only queries (WAL: readers never wait for the writer). An
 /// in-memory database (tests) reads through the writer connection.
 ///
-/// Every method is one unit: a write runs in a savepoint and has
-/// committed when it returns, so a read that follows (from any
-/// connection) sees it; a read runs in one read transaction (one
-/// consistent snapshot).
+/// Writes are queued to the writer thread (a bounded queue: a full queue
+/// makes callers wait), which commits whatever is queued as one
+/// transaction (group commit), each write in its own savepoint so a
+/// failing one changes nothing and leaves the others alone. A write
+/// returns only once its transaction has committed, so a read that
+/// follows (from any connection) sees it. A read runs in one read
+/// transaction (one consistent snapshot).
 pub struct Store {
-    writer: std::sync::Arc<Mutex<Connection>>,
+    writer: Arc<Mutex<Connection>>,
     readers: Option<Pool>,
+    queue: Option<SyncSender<Box<dyn Job>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<WriteStats>,
+}
+
+/// Writes waiting for the writer thread before callers have to wait.
+const WRITE_QUEUE: usize = 128;
+/// Most writes committed in one transaction.
+const MAX_BATCH: usize = 256;
+
+/// Group-commit counters.
+#[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct WriteStats {
+    batches: AtomicU64,
+    writes: AtomicU64,
+    last_batch: AtomicU64,
+    /// Writes that found the queue full and waited.
+    full: AtomicU64,
+}
+
+/// One queued write: runs on the writer thread inside the batch
+/// transaction, answers its caller once the batch committed.
+trait Job: Send {
+    fn run(&mut self, d: &Db<'_>);
+    fn finish(self: Box<Self>, commit: &DbResult<()>);
+}
+
+struct Write<T, F> {
+    f: Option<F>,
+    out: Option<DbResult<T>>,
+    reply: SyncSender<DbResult<T>>,
+}
+
+impl<T, F> Job for Write<T, F>
+where
+    F: FnOnce(&Db<'_>) -> DbResult<T> + Send,
+    T: Send,
+{
+    fn run(&mut self, d: &Db<'_>) {
+        let Some(f) = self.f.take() else { return };
+        if d.conn.is_autocommit() {
+            // the batch transaction is gone (SQLite rolled it back after a
+            // severe error): running now would commit on its own
+            self.out = Some(Err(failure("batch transaction lost")));
+            return;
+        }
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tx = d.tx()?;
+            let v = f(d)?;
+            tx.commit()?;
+            Ok(v)
+        }))
+        .unwrap_or_else(|_| Err(failure("write panicked")));
+        self.out = Some(out);
+    }
+
+    fn finish(self: Box<Self>, commit: &DbResult<()>) {
+        let out = match (self.out, commit) {
+            (Some(Ok(_)), Err(e)) => Err(failure(&format!("commit failed: {e}"))),
+            (Some(out), _) => out,
+            (None, Err(e)) => Err(failure(&format!("not run: {e}"))),
+            (None, Ok(())) => Err(failure("not run")),
+        };
+        let _ = self.reply.send(out);
+    }
+}
+
+/// An error for a write that could not complete (the batch's own error is
+/// not `Clone`).
+fn failure(msg: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(msg.to_string()),
+    )
+}
+
+/// The writer thread: one transaction per batch of queued writes.
+fn writer_loop(conn: Arc<Mutex<Connection>>, rx: Receiver<Box<dyn Job>>, stats: Arc<WriteStats>) {
+    while let Ok(first) = rx.recv() {
+        let c = lock(&conn);
+        // everything queued while we waited joins this transaction
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(j) => batch.push(j),
+                Err(_) => break,
+            }
+        }
+        let d = Db { conn: &c };
+        let commit = c.execute_batch("BEGIN IMMEDIATE").and_then(|()| {
+            for j in batch.iter_mut() {
+                j.run(&d);
+            }
+            c.execute_batch("COMMIT")
+        });
+        if commit.is_err() && !c.is_autocommit() {
+            let _ = c.execute_batch("ROLLBACK");
+        }
+        drop(c);
+        stats.batches.fetch_add(1, Relaxed);
+        stats.writes.fetch_add(batch.len() as u64, Relaxed);
+        stats.last_batch.store(batch.len() as u64, Relaxed);
+        if let Err(e) = &commit {
+            log::error!("store: a batch of {} writes failed: {e}", batch.len());
+        }
+        for j in batch {
+            j.finish(&commit);
+        }
+    }
 }
 
 /// Read-only connections; a reader waits for an idle one.
@@ -476,6 +591,16 @@ fn checksums_col(b: Option<Vec<u8>>) -> Vec<(u32, u64)> {
         .unwrap_or_default()
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // the writer finishes what is queued, then closes its connection
+        drop(self.queue.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 impl Pool {
     fn open(path: &Path, n: usize) -> DbResult<Self> {
         use rusqlite::OpenFlags;
@@ -530,6 +655,11 @@ impl Pool {
 impl Store {
     /// Open (or create) `<dir>/rugen.db`; `None` keeps everything in memory (tests).
     pub fn open(dir: Option<&Path>) -> DbResult<Self> {
+        Self::open_with(dir, WRITE_QUEUE)
+    }
+
+    /// [`Self::open`] with `queue` writes waiting before callers wait.
+    fn open_with(dir: Option<&Path>, queue: usize) -> DbResult<Self> {
         let conn = match dir {
             Some(d) => {
                 std::fs::create_dir_all(d).map_err(|e| {
@@ -567,9 +697,27 @@ impl Store {
             Some(d) => Some(Pool::open(&d.join("rugen.db"), READERS)?),
             None => None,
         };
+        Self::start(conn, readers, queue)
+    }
+
+    /// Start the writer thread on `conn`.
+    fn start(conn: Connection, readers: Option<Pool>, queue: usize) -> DbResult<Self> {
+        let writer = Arc::new(Mutex::new(conn));
+        let stats = Arc::new(WriteStats::default());
+        let (tx, rx) = sync_channel(queue);
+        let thread = {
+            let (w, st) = (writer.clone(), stats.clone());
+            std::thread::Builder::new()
+                .name("rugen-db-writer".into())
+                .spawn(move || writer_loop(w, rx, st))
+                .map_err(|e| failure(&format!("writer thread: {e}")))?
+        };
         Ok(Self {
-            writer: std::sync::Arc::new(Mutex::new(conn)),
+            writer,
             readers,
+            queue: Some(tx),
+            thread: Some(thread),
+            stats,
         })
     }
 
@@ -603,18 +751,43 @@ impl Store {
         F: FnOnce(&Db<'_>) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let c = lock(&self.writer);
-        let d = Db { conn: &c };
-        let out = d.tx().and_then(|tx| {
-            let v = f(&d)?;
-            tx.commit()?;
-            Ok(v)
+        use std::sync::mpsc::TrySendError;
+        let Some(queue) = &self.queue else {
+            return Err(failure("store closed"));
+        };
+        let (reply, answer) = sync_channel(1);
+        let job: Box<dyn Job> = Box::new(Write {
+            f: Some(f),
+            out: None,
+            reply,
         });
-        if !c.is_autocommit() {
-            // a failed COMMIT leaves the transaction open
-            let _ = c.execute_batch("ROLLBACK");
+        let sent = match queue.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(job)) => {
+                // backpressure: wait for room, never queue without bound
+                self.stats.full.fetch_add(1, Relaxed);
+                queue.send(job).map_err(|_| ())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        };
+        if sent.is_err() {
+            return Err(failure("writer thread gone"));
         }
-        out
+        answer
+            .recv()
+            .unwrap_or_else(|_| Err(failure("writer thread gone")))
+    }
+
+    /// (batches, writes, size of the last batch, writes that waited for room).
+    #[cfg(test)]
+    fn write_stats(&self) -> (u64, u64, u64, u64) {
+        let s = &self.stats;
+        (
+            s.batches.load(Relaxed),
+            s.writes.load(Relaxed),
+            s.last_batch.load(Relaxed),
+            s.full.load(Relaxed),
+        )
     }
 
     /// The writer connection (tests poke at the schema directly).
@@ -2840,7 +3013,7 @@ mod tests {
     #[test]
     fn readers_see_every_committed_write() {
         let dir = temp_dir("readers");
-        let s = std::sync::Arc::new(Store::open(Some(&dir)).unwrap());
+        let s = Arc::new(Store::open(Some(&dir)).unwrap());
         assert!(
             s.readers.is_some(),
             "a database file reads through the pool"
@@ -2870,7 +3043,7 @@ mod tests {
     #[test]
     fn reads_never_wait_for_the_writer() {
         let dir = temp_dir("nowait");
-        let s = std::sync::Arc::new(Store::open(Some(&dir)).unwrap());
+        let s = Arc::new(Store::open(Some(&dir)).unwrap());
         let id = s.register().unwrap().id;
         // the writer is in the middle of a transaction
         let w = s.writer_conn();
@@ -2884,6 +3057,104 @@ mod tests {
         drop(w);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait until `f` holds (a background thread got somewhere).
+    fn eventually(f: impl Fn() -> bool) {
+        let t = std::time::Instant::now();
+        while !f() {
+            assert!(t.elapsed().as_secs() < 10, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn group_commit_keeps_good_writes_of_a_failing_batch() {
+        let dir = temp_dir("group");
+        let s = Arc::new(Store::open(Some(&dir)).unwrap());
+        // hold the writer: everything below queues up for one batch
+        let w = s.writer_conn();
+        let done = Arc::new(AtomicU64::new(0));
+        let spawn = |f: Box<dyn FnOnce(&Store) -> bool + Send>| {
+            let (s, done) = (s.clone(), done.clone());
+            std::thread::spawn(move || {
+                let ok = f(&s);
+                done.fetch_add(1, Relaxed);
+                ok
+            })
+        };
+        let mut threads = Vec::new();
+        for i in 0..6 {
+            threads.push(spawn(Box::new(move |s: &Store| {
+                s.write(move |d| d.set_meta(&format!("good{i}"), i)).is_ok()
+            })));
+        }
+        // writes something, then fails: its savepoint rolls back
+        let bad = spawn(Box::new(|s: &Store| {
+            s.write(|d| {
+                d.set_meta("bad", 1)?;
+                d.conn.execute("INSERT INTO no_such_table VALUES (1)", [])?;
+                Ok(())
+            })
+            .is_ok()
+        }));
+        // a constraint violation in the middle of the batch
+        let dup = spawn(Box::new(|s: &Store| {
+            s.write(|d| {
+                d.conn
+                    .execute("INSERT INTO meta (k, v) VALUES ('next_id', 1)", [])?;
+                Ok(())
+            })
+            .is_ok()
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(done.load(Relaxed), 0, "nobody hears back before COMMIT");
+        let (batches, ..) = s.write_stats();
+        drop(w);
+        for t in threads {
+            assert!(t.join().unwrap(), "good writes commit");
+        }
+        assert!(!bad.join().unwrap() && !dup.join().unwrap());
+        let (after, writes, last, _) = s.write_stats();
+        assert_eq!(
+            (after - batches, last, writes),
+            (1, 8, 8),
+            "one transaction"
+        );
+        for i in 0..6 {
+            assert_eq!(s.read(|d| d.meta(&format!("good{i}"))).unwrap(), Some(i));
+        }
+        assert_eq!(s.read(|d| d.meta("bad")).unwrap(), None, "rolled back");
+        assert!(s.read(|d| d.meta("next_id")).unwrap().unwrap() >= 1000);
+        // and the writer carries on
+        assert!(s.register().is_ok());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_write_queue_makes_writers_wait() {
+        let s = Arc::new(Store::open_with(None, 2).unwrap());
+        let w = s.writer_conn();
+        let done = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (s, done) = (s.clone(), done.clone());
+                std::thread::spawn(move || {
+                    s.register().unwrap();
+                    done.fetch_add(1, Relaxed);
+                })
+            })
+            .collect();
+        // the writer took one write and waits for its connection, two wait
+        // in the queue: the others wait for room instead of piling up
+        eventually(|| s.write_stats().3 >= 5);
+        assert_eq!(done.load(Relaxed), 0);
+        drop(w);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(s.account_count().unwrap(), 8);
     }
 
     #[test]
