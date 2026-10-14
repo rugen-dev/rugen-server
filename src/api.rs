@@ -5186,7 +5186,8 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let before = listing(&data);
         let accounts = api.store().account_count().unwrap();
-        let plan = json!({"token": "tok", "steps": [4], "hold_secs": 6, "ramp_secs": 0});
+        let plan =
+            json!({"token": "tok", "steps": [4], "viewers": 6, "hold_secs": 6, "ramp_secs": 0});
         let r = api.handle(req("POST", "/admin/bench", plan.clone()));
         assert_eq!(r.status, 202);
         let id = serde_json::from_slice::<Value>(&r.body).unwrap()["id"]
@@ -5211,6 +5212,8 @@ pub(crate) mod tests {
         assert_eq!(st["id"], id.as_str());
         let row = &st["rows"][0];
         assert_eq!(row["clients"], 4);
+        assert_eq!(row["viewers"], 6);
+        assert_eq!(st["viewers"], json!([6]));
         assert!(row["req_s"].as_f64().unwrap() > 0.0, "{row}");
         assert!(st["note"].as_str().unwrap().contains("lower bound"));
         // its temporary directory is gone, the real data untouched

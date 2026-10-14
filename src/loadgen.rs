@@ -24,6 +24,13 @@
 //!   15 % idle   another 10 s of lobby
 //! ```
 //!
+//! Relayed players also feed the match's input log (a `STREAM` datagram
+//! every 15 frames, as the game does), and **viewers** ([`Load::grow_viewers`])
+//! watch live matches like the game's WATCH: `GET /v1/live` every 10 s to
+//! pick one (viewer `n` takes match `n` of the list, so viewers spread over
+//! the live matches), then `GET /v1/live/{id}?from=N` every 400 ms for the
+//! frames since the last answer, a new pick when the match ends or is full.
+//!
 //! Each client sends its own `CF-Connecting-IP` (as behind the Cloudflare
 //! Tunnel) and binds its UDP socket to its own 127.x.y.z, so per-IP limits
 //! apply per client as in production. Each client keeps one HTTP/1.1
@@ -99,6 +106,13 @@ struct Stats {
     relay_fail: AtomicU64,
     /// A few distinct failures (`route: status message`), for diagnosis.
     err_samples: Mutex<Vec<String>>,
+    /// Viewers: chunk requests, their latency (µs), bytes received,
+    /// "this match is full" answers, other failures.
+    viewer_polls: AtomicU64,
+    viewer_lat: Mutex<Vec<u32>>,
+    viewer_bytes: AtomicU64,
+    viewer_full: AtomicU64,
+    viewer_errors: AtomicU64,
 }
 
 /// Distinct failure messages kept per window.
@@ -129,6 +143,13 @@ pub struct Sample {
     pub relay_fail: u64,
     /// A few distinct failures (`route: status message`).
     pub err_samples: Vec<String>,
+    /// Viewers' live chunk requests, their latency (µs, sorted), bytes,
+    /// "this match is full" answers and other failures.
+    pub viewer_polls: u64,
+    pub viewer_lat: Vec<u32>,
+    pub viewer_bytes: u64,
+    pub viewer_full: u64,
+    pub viewer_errors: u64,
 }
 
 impl Sample {
@@ -148,6 +169,11 @@ impl Sample {
     pub fn relay_pct(&self, p: f64) -> f64 {
         pct(&self.relay_lat, p)
     }
+}
+
+/// Percentile `p` of sorted µs latencies, in ms.
+pub fn percentile_ms(v: &[u32], p: f64) -> f64 {
+    pct(v, p)
 }
 
 fn pct(v: &[u32], p: f64) -> f64 {
@@ -254,6 +280,8 @@ struct Ctx {
     alive: AtomicI64,
     presence: AtomicI64,
     relaying: AtomicI64,
+    /// Viewers following a match right now.
+    watching: AtomicI64,
     inputs_hex: String,
 }
 
@@ -262,6 +290,7 @@ pub struct Load {
     ctx: Arc<Ctx>,
     handles: Vec<tokio::task::JoinHandle<()>>,
     spawned: usize,
+    viewers: usize,
 }
 
 impl Load {
@@ -278,9 +307,11 @@ impl Load {
                 alive: AtomicI64::new(0),
                 presence: AtomicI64::new(0),
                 relaying: AtomicI64::new(0),
+                watching: AtomicI64::new(0),
             }),
             handles: Vec::new(),
             spawned: 0,
+            viewers: 0,
         }
     }
 
@@ -297,6 +328,28 @@ impl Load {
             c.presence.load(Relaxed),
             c.relaying.load(Relaxed),
         )
+    }
+
+    /// Viewers started so far, and those following a match right now.
+    pub fn viewers(&self) -> (usize, i64) {
+        (self.viewers, self.ctx.watching.load(Relaxed))
+    }
+
+    /// Start viewers up to `target`, spread over `ramp`.
+    pub async fn grow_viewers(&mut self, target: usize, ramp: Duration) {
+        let add = target.saturating_sub(self.viewers);
+        let gap = ramp.div_f64(add.max(1) as f64);
+        for _ in 0..add {
+            if self.ctx.stop.load(Relaxed) {
+                return;
+            }
+            self.viewers += 1;
+            self.handles
+                .push(tokio::spawn(viewer(self.ctx.clone(), self.viewers)));
+            if !gap.is_zero() {
+                tokio::time::sleep(gap).await;
+            }
+        }
     }
 
     /// Start clients up to `target`, spread over `ramp`.
@@ -338,7 +391,15 @@ impl Load {
             err_samples: std::mem::take(
                 &mut *s.err_samples.lock().unwrap_or_else(|p| p.into_inner()),
             ),
+            viewer_polls: s.viewer_polls.swap(0, Relaxed),
+            viewer_lat: std::mem::take(
+                &mut *s.viewer_lat.lock().unwrap_or_else(|p| p.into_inner()),
+            ),
+            viewer_bytes: s.viewer_bytes.swap(0, Relaxed),
+            viewer_full: s.viewer_full.swap(0, Relaxed),
+            viewer_errors: s.viewer_errors.swap(0, Relaxed),
         };
+        out.viewer_lat.sort_unstable();
         out.lat.sort_unstable();
         out.relay_lat.sort_unstable();
         out
@@ -893,6 +954,8 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sent_at = vec![None::<Instant>; RING];
     let (mut seq, mut peer_seq, mut acked) = (0u32, 0u32, 0u32);
+    // the match's input log: confirmed frames every 15 (as the game)
+    let mut streamed = 0u32;
     let mut lat = Vec::new();
     let mut last_hello = Instant::now();
     while Instant::now() < end && !ctx.stop.load(Relaxed) {
@@ -901,6 +964,13 @@ async fn relay(ctx: &Ctx, n: usize, t: &SessionTicket, dur: Duration) {
                 seq += 1;
                 sent_at[seq as usize % RING] = Some(Instant::now());
                 send(frame(wire::DATA, peer, &input_payload(seq, peer_seq))).await;
+                if t.live && seq - streamed >= 15 {
+                    let frames: Vec<[u16; 2]> =
+                        (streamed..seq).map(|f| [f as u16, f as u16]).collect();
+                    let p = rugen_proto::stream::encode_upload(streamed, &frames);
+                    send(frame(wire::STREAM, 0xFF, &p)).await;
+                    streamed = seq;
+                }
                 if last_hello.elapsed() >= Duration::from_secs(5) {
                     last_hello = Instant::now();
                     send(frame(wire::HELLO, 0, &[])).await;
@@ -968,6 +1038,86 @@ async fn client(ctx: Arc<Ctx>, n: usize) {
     }
     ctx.alive.fetch_sub(1, Relaxed);
     let _ = pres.await;
+}
+
+/// One viewer: pick a live match, follow it 400 ms at a time, pick again
+/// when it ends (or is full).
+async fn viewer(ctx: Arc<Ctx>, n: usize) {
+    let mut c = Client::new(ctx.clone(), 2_000_000 + n);
+    while let Err(e) = c.call("POST", "/register", None).await.and_then(|r| {
+        c.key = r["key"].as_str().ok_or("register: no key")?.to_string();
+        Ok(())
+    }) {
+        log::debug!("viewer {n}: {e}");
+        if !c.nap(Duration::from_secs(5)).await {
+            return;
+        }
+    }
+    let s = &ctx.stats;
+    while !c.stopped() {
+        let list = c
+            .call("GET", &format!("/v1/live?key={}", c.key), None)
+            .await
+            .unwrap_or_default();
+        let ids: Vec<u64> = list
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["match_id"].as_u64()).collect())
+            .unwrap_or_default();
+        let Some(&id) = ids.get(n % ids.len().max(1)) else {
+            if !c.nap(Duration::from_secs(2)).await {
+                return;
+            }
+            continue;
+        };
+        ctx.watching.fetch_add(1, Relaxed);
+        let mut have = 0u32;
+        let picked = Instant::now();
+        loop {
+            let t = Instant::now();
+            let path = format!("/v1/live/{id}?key={}&from={have}", c.key);
+            let r = tokio::time::timeout(ctx.mix.timeout, c.send("GET", &path, None)).await;
+            s.viewer_polls.fetch_add(1, Relaxed);
+            s.viewer_lat
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(t.elapsed().as_micros() as u32);
+            let again = match r {
+                Ok(Ok(b)) => {
+                    s.viewer_bytes.fetch_add(b.len() as u64, Relaxed);
+                    match rugen_proto::stream::decode_chunk(&b) {
+                        Some(ch) => {
+                            have = ch.from + ch.inputs.len() as u32;
+                            !(ch.ended && have >= ch.total)
+                        }
+                        None => false,
+                    }
+                }
+                Ok(Err(Fail::Status(409, _))) => {
+                    s.viewer_full.fetch_add(1, Relaxed);
+                    false
+                }
+                Ok(Err(Fail::Status(404, _))) => false,
+                Ok(Err(_)) | Err(_) => {
+                    if r.is_err() {
+                        c.conn = None;
+                    }
+                    s.viewer_errors.fetch_add(1, Relaxed);
+                    false
+                }
+            };
+            // a fresh pick every minute: new matches get viewers too
+            if !again || picked.elapsed() > Duration::from_secs(60) {
+                break;
+            }
+            if !c.nap(Duration::from_millis(400)).await {
+                break;
+            }
+        }
+        ctx.watching.fetch_sub(1, Relaxed);
+        if !c.nap(Duration::from_millis(500)).await {
+            return;
+        }
+    }
 }
 
 /// A client outside the load (setup steps: uploads, warm-up matchups).

@@ -96,6 +96,48 @@ limit …`); `/admin/stats` shows `open_files` / `max_open_files`. A read-only c
 `RUGEN_BENCH_DIR` (e.g. `tmpfs: /tmp` in compose). Run it off-peak: it
 competes with real players for the same CPU.
 
+### Viewers
+
+Live watching is pull and batched: a viewer asks `GET /v1/live/{id}?from=N`
+about every 0.4 s and gets every frame since its last answer in one small
+binary response (the players feed the log, never the viewers), so a viewer
+costs ~2.5 requests a second, not one message per frame. A match takes at
+most `RUGEN_LIVE_VIEWERS` (500) viewers; one more is told "this match is
+full" (409).
+
+The bench plan takes `viewers`: one number for every step, or one per step
+(at most 5000). They come on top of the clients, after each step's ramp,
+and spread over the live matches (viewer `n` follows match `n` of
+`GET /v1/live`, a fresh pick every minute or when its match ends). The
+relayed bench players feed their match's input log as the game does (a
+`STREAM` datagram every 15 frames), so the viewers receive real chunks.
+To measure 2,000 viewers in production:
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"steps":[500,1000],"viewers":[1000,2000],"hold_secs":30,"ramp_secs":15}' \
+  https://your.server/admin/bench
+```
+
+Each row adds `viewers` (asked), `watching` (following a match at the
+end), `viewer_req_s`, `viewer_p99_ms`, `viewer_kb_s`, `viewer_full` and
+`viewer_errors`. `examples/loadgen.rs --viewers N` does the same against
+any server.
+
+Laptop (Ryzen 5 5500U, no CPU cap, release build, the load generator in
+the same process), 30 s holds:
+
+| clients | viewers (watching) | req/s | p99 ms | viewer req/s | viewer p99 ms | viewer KB/s | CPU % | RSS MB | relay pkt/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 500 | 1000 (967) | 244 | 1.6 | 2,478 | 1.5 | 1,213 | 59 | 438 | 5,183 |
+| 1000 | 2000 (1935) | 476 | 3.0 | 4,954 | 2.6 | 2,308 | 118 | 781 | 10,717 |
+
+No errors and no "full" answers. 2,000 viewers cost about as much CPU as
+the 1,000 players they watch, and ~2.3 MB/s of responses; the memory per
+viewer is small (one connection) next to a player's. Production numbers
+under the 1 CPU / 768 MB cap are still to be taken with the plan above.
+
 `GET /admin/stats` (admin token; no `RUGEN_BENCH` needed): uptime,
 threads, RSS, CPU %, req/s and relay pkt/s over the last ~10 s, WebSockets,
-relay sessions, store write queue, re-simulation queue.
+relay sessions, store write queue, re-simulation queue, live logs, and
+`packages_r2` (the package bucket, when `RUGEN_PKG_S3` is set).

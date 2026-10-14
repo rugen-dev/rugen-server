@@ -60,6 +60,7 @@ struct Args {
     max_p99: u64,
     out: Option<PathBuf>,
     timeout: u64,
+    viewers: usize,
 }
 
 const HELP: &str = "loadgen [--server URL] [--steps 250,500,1000] [--ramp 10] [--hold 30]
@@ -67,7 +68,7 @@ const HELP: &str = "loadgen [--server URL] [--steps 250,500,1000] [--ramp 10] [-
   [--relay-share 0.3] [--dispute-share 0.1] [--public-share 0.25] [--named-share 0.02]
   [--dispute-frames 3600] [--kfm DIR] [--stages DIR] [--data DIR] [--stage training]
   [--work DIR] [--server-pid PID] [--max-err 0.01] [--max-p99 500] [--timeout 10]
-  [--out FILE.jsonl]";
+  [--out FILE.jsonl] [--viewers N (live match viewers on top of the clients)]";
 
 fn args() -> Args {
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -121,6 +122,7 @@ fn args() -> Args {
         max_p99: num("--max-p99", 500.0) as u64,
         out: get("--out").map(PathBuf::from),
         timeout: num("--timeout", 10.0) as u64,
+        viewers: num("--viewers", 0.0) as usize,
     }
 }
 
@@ -361,6 +363,8 @@ async fn main() {
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for &target in &a.steps {
         load.grow(target, Duration::from_secs(a.ramp)).await;
+        load.grow_viewers(a.viewers, Duration::from_secs(a.ramp / 2))
+            .await;
         // settle, then measure
         tokio::time::sleep(Duration::from_secs(3)).await;
         load.take();
@@ -382,6 +386,18 @@ async fn main() {
         let g1 = self_cpu_secs();
         let r = load.take();
         let (alive, presence, relaying) = load.alive();
+        if a.viewers > 0 {
+            eprintln!(
+                "viewers {} (watching {}): {:.0} req/s, p99 {:.1} ms, {:.0} KB/s, {} full, {} errors",
+                load.viewers().0,
+                load.viewers().1,
+                r.viewer_polls as f64 / secs,
+                loadgen::percentile_ms(&r.viewer_lat, 0.99),
+                r.viewer_bytes as f64 / 1024.0 / secs,
+                r.viewer_full,
+                r.viewer_errors
+            );
+        }
         let total = r.total();
         let err = r.err_rate();
         let (p50, p95, p99) = (r.pct(0.5), r.pct(0.95), r.pct(0.99));

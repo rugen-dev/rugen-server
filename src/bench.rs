@@ -36,6 +36,11 @@ use crate::store::{PackageRow, Store, now};
 
 /// Clients a step may ask for.
 pub const MAX_CLIENTS: u64 = 5000;
+/// Viewers a step may ask for.
+pub const MAX_VIEWERS: u64 = 5000;
+/// Descriptors and memory of a viewer (one HTTP connection, both ends).
+const FDS_PER_VIEWER: u64 = 2;
+const MB_PER_VIEWER: f64 = 0.1;
 /// Longest run (setup, every step, teardown excluded).
 pub const MAX_RUN: Duration = Duration::from_secs(300);
 /// A run aborts above this p99 ...
@@ -66,13 +71,16 @@ quota (and memory) with the instance it measures: read these numbers as a lower 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub steps: Vec<u64>,
+    /// Viewers of live matches per step (on top of the clients).
+    pub viewers: Vec<u64>,
     pub hold: Duration,
     pub ramp: Duration,
 }
 
 impl Plan {
-    /// Validate a request body (`steps`, `hold_secs` = 40, `ramp_secs` =
-    /// 10, `mix` = "default").
+    /// Validate a request body (`steps`, `viewers` = 0: one number for
+    /// every step or one per step, `hold_secs` = 40, `ramp_secs` = 10,
+    /// `mix` = "default").
     pub fn parse(v: &Value) -> Result<Self, String> {
         let steps: Vec<u64> = v
             .get("steps")
@@ -107,7 +115,29 @@ impl Plan {
             None | Some("default") => {}
             Some(m) => return Err(format!("mix: unknown {m:?} (only \"default\")")),
         }
-        let plan = Self { steps, hold, ramp };
+        let viewers: Vec<u64> = match v.get("viewers") {
+            None | Some(Value::Null) => vec![0; steps.len()],
+            Some(Value::Array(a)) => {
+                let list: Vec<u64> = a
+                    .iter()
+                    .map(|x| x.as_u64().ok_or("viewers: whole numbers"))
+                    .collect::<Result<_, _>>()?;
+                if list.len() != steps.len() {
+                    return Err("viewers: one number, or one per step".into());
+                }
+                list
+            }
+            Some(x) => vec![x.as_u64().ok_or("viewers: a whole number")?; steps.len()],
+        };
+        if let Some(&n) = viewers.iter().find(|&&n| n > MAX_VIEWERS) {
+            return Err(format!("viewers: {n}, at most {MAX_VIEWERS}"));
+        }
+        let plan = Self {
+            steps,
+            viewers,
+            hold,
+            ramp,
+        };
         if plan.duration() > MAX_RUN {
             return Err(format!(
                 "this plan takes {} s, at most {} s: fewer steps or a shorter hold",
@@ -151,6 +181,16 @@ pub struct Row {
     /// Relayed matches that could not start (UDP bind / handshake).
     pub relay_fail: u64,
     pub matches: u64,
+    /// Viewers asked for, and those following a match at the end.
+    pub viewers: u64,
+    pub watching: i64,
+    /// Viewers' live chunk requests per second, their p99, the bytes they
+    /// received per second, "this match is full" answers, other failures.
+    pub viewer_req_s: f64,
+    pub viewer_p99_ms: f64,
+    pub viewer_kb_s: f64,
+    pub viewer_full: u64,
+    pub viewer_errors: u64,
 }
 
 /// A run, as `GET /admin/bench` shows it.
@@ -162,6 +202,7 @@ pub struct Run {
     pub started: u64,
     pub finished: Option<u64>,
     pub steps: Vec<u64>,
+    pub viewers: Vec<u64>,
     pub hold_secs: u64,
     pub ramp_secs: u64,
     pub rows: Vec<Row>,
@@ -201,6 +242,7 @@ impl Bench {
                 started: now(),
                 finished: None,
                 steps: plan.steps.clone(),
+                viewers: plan.viewers.clone(),
                 hold_secs: plan.hold.as_secs(),
                 ramp_secs: plan.ramp.as_secs(),
                 rows: Vec::new(),
@@ -457,12 +499,14 @@ async fn steps(
     last: &Mutex<Option<Run>>,
     id: &str,
 ) -> Option<String> {
-    for &target in &plan.steps {
+    for (step, &target) in plan.steps.iter().enumerate() {
+        let watchers = plan.viewers.get(step).copied().unwrap_or(0);
         let aborted = |why: String| Some(format!("{target} clients: {why}"));
         // each client holds ~4 descriptors (its HTTP and WebSocket
         // connections, both ends) plus a UDP socket while relaying
         if let (Some((soft, _)), Some(open)) = (crate::sys::fd_limit(), crate::sys::open_fds()) {
-            let more = target.saturating_sub(load.clients() as u64) * FDS_PER_CLIENT;
+            let more = target.saturating_sub(load.clients() as u64) * FDS_PER_CLIENT
+                + watchers.saturating_sub(load.viewers().0 as u64) * FDS_PER_VIEWER;
             if open + more + FD_MARGIN > soft {
                 let can = (load.clients() as u64)
                     + soft.saturating_sub(open + FD_MARGIN) / FDS_PER_CLIENT;
@@ -478,7 +522,8 @@ async fn steps(
         let mem_cap = crate::sys::memory_limit_mb().map(|m| m * MAX_MEM_SHARE);
         if let Some(cap) = mem_cap {
             let rss = proc_sample(None).rss_mb;
-            let more = target.saturating_sub(load.clients() as u64) as f64 * MB_PER_CLIENT;
+            let more = target.saturating_sub(load.clients() as u64) as f64 * MB_PER_CLIENT
+                + watchers.saturating_sub(load.viewers().0 as u64) as f64 * MB_PER_VIEWER;
             if rss + more > cap {
                 return aborted(format!(
                     "would need about {:.0} MB of the {:.0} MB allowed (80 % of the memory limit)",
@@ -488,6 +533,8 @@ async fn steps(
             }
         }
         load.grow(target as usize, plan.ramp).await;
+        // viewers come once matches run
+        load.grow_viewers(watchers as usize, plan.ramp / 2).await;
         tokio::time::sleep(SETTLE).await;
         load.take();
         let p0 = proc_sample(None);
@@ -544,13 +591,22 @@ async fn steps(
             relay_pkt_s: s.udp_sent as f64 / secs,
             relay_fail: s.relay_fail,
             matches: s.matches,
+            viewers: watchers,
+            watching: load.viewers().1,
+            viewer_req_s: s.viewer_polls as f64 / secs,
+            viewer_p99_ms: crate::loadgen::percentile_ms(&s.viewer_lat, 0.99),
+            viewer_kb_s: s.viewer_bytes as f64 / 1024.0 / secs,
+            viewer_full: s.viewer_full,
+            viewer_errors: s.viewer_errors,
         };
         log::info!(
-            "bench {id}: {target} clients, {:.0} req/s, p99 {:.1} ms, {:.2} % errors, CPU {:.0} %",
+            "bench {id}: {target} clients + {watchers} viewers, {:.0} req/s, p99 {:.1} ms, {:.2} % errors, CPU {:.0} %; viewers {:.0} req/s p99 {:.1} ms",
             row.req_s,
             row.p99_ms,
             row.err_pct,
-            row.cpu_pct
+            row.cpu_pct,
+            row.viewer_req_s,
+            row.viewer_p99_ms
         );
         if let Some(r) = lock(last).as_mut().filter(|r| r.id == id) {
             r.rows.push(row);
@@ -592,5 +648,21 @@ mod tests {
             assert!(Plan::parse(&bad).is_err(), "{bad}");
         }
         assert!(Plan::parse(&json!({"steps": [5000], "hold_secs": 60})).is_ok());
+        // viewers: one number for every step, or one per step
+        let p = Plan::parse(&json!({"steps": [100, 200], "viewers": 2000})).unwrap();
+        assert_eq!(p.viewers, vec![2000, 2000]);
+        let p = Plan::parse(&json!({"steps": [100, 200], "viewers": [0, 500]})).unwrap();
+        assert_eq!(p.viewers, vec![0, 500]);
+        assert_eq!(
+            Plan::parse(&json!({"steps": [1]})).unwrap().viewers,
+            vec![0]
+        );
+        for bad in [
+            json!({"steps": [1, 2], "viewers": [1]}),
+            json!({"steps": [1], "viewers": 5001}),
+            json!({"steps": [1], "viewers": "many"}),
+        ] {
+            assert!(Plan::parse(&bad).is_err(), "{bad}");
+        }
     }
 }
