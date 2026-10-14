@@ -207,6 +207,7 @@ fn sync(
             stage: fp(2),
             engine: ENGINE.into(),
             rules: v.rules.clone(),
+            machine: None,
         },
     )
     .unwrap();
@@ -241,6 +242,8 @@ fn play(
                     // as the game does: the room's size, missing / unknown = normal
                     fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
                         .unwrap_or_default(),
+                    // as the game does: the room's LIFE
+                    life: crate::resim::room_life(u64::from(view.rules.life)),
                     // as the game does: the seed of the match id
                     seed: rugen_sim::headless::online_seed(view.id),
                 };
@@ -661,6 +664,8 @@ fn turn_match_through_a_tunnel_only_server() {
                     // as the game does: the room's size, missing / unknown = normal
                     fighter_size: rugen_sim::scale::FighterSize::parse(&view.rules.fighter_size)
                         .unwrap_or_default(),
+                    // as the game does: the room's LIFE
+                    life: crate::resim::room_life(u64::from(view.rules.life)),
                     // as the game does: the seed of the match id
                     seed: rugen_sim::headless::online_seed(view.id),
                 };
@@ -879,6 +884,7 @@ fn no_consent_plays_with_shared_files_and_never_uploads() {
                 stage: fp(v, 2),
                 engine: ENGINE.into(),
                 rules: v.rules.clone(),
+                machine: None,
             },
         )
         .unwrap()

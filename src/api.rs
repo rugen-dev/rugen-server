@@ -479,6 +479,9 @@ fn clean_rules(v: Option<&Value>) -> Rules {
     if !rugen_proto::FIGHTER_SIZES.contains(&r.fighter_size.as_str()) {
         r.fighter_size = "normal".into();
     }
+    // LIFE is simulated: 0 (each fighter's own) or the 1000..=10000 grid of
+    // 500; missing (clients before it) is the default 5000
+    r.life = crate::resim::room_life(u64::from(r.life)).map_or(0, |l| l as u16);
     r
 }
 
@@ -1806,7 +1809,24 @@ impl Api {
             players: [player(players[0]), player(players[1])],
             ranked,
             created: crate::store::now(),
+            machines: v
+                .get("machines")
+                .and_then(|m| serde_json::from_value(m.clone()).ok())
+                .unwrap_or_default(),
         }
+    }
+
+    /// The players' machine summaries from their ready reports, as shared
+    /// replays and viewers get them ([`rugen_proto::MachineSummary::shared`]:
+    /// version, OS, architecture). Empty for clients that send none.
+    fn machines(m: &Matchup) -> [Option<rugen_proto::MachineSummary>; 2] {
+        [0, 1].map(|i| {
+            m.ready[i]
+                .as_ref()
+                .and_then(|r| r.machine.as_ref())
+                .map(|s| s.clone().clean().shared())
+                .filter(|s| !s.is_empty())
+        })
     }
 
     /// Shared replays past their days or their total size go.
@@ -2954,6 +2974,9 @@ impl Api {
             // the game version both clients run (equal, see ready_agreed):
             // only a server simulating that version may re-simulate it
             "engine": m.ready[0].as_ref().and_then(|r| crate::compat::engine_version(&r.engine)),
+            // each player's machine summary for replays: version, OS and
+            // architecture only (no graphics details, nothing personal)
+            "machines": Self::machines(m),
         })
         .to_string();
         db(store.set_setup(m.id, &setup))?;
@@ -3001,6 +3024,7 @@ impl Api {
                 players: [player(m.players[0]), player(m.players[1])],
                 ranked: m.ranked,
                 created: crate::store::now(),
+                machines: Self::machines(m),
             };
             let (public, members) = match &room {
                 Some(r) => (r.public, r.members.iter().map(|x| x.account).collect()),
@@ -3422,6 +3446,18 @@ pub(crate) mod tests {
         assert_eq!(size(json!({"rounds": 3})), "normal");
         assert_eq!(size(json!({"fighter_size": "giant"})), "normal");
         assert_eq!(clean_rules(None).fighter_size, "normal");
+    }
+
+    #[test]
+    fn rooms_keep_a_known_life() {
+        let life = |v: Value| clean_rules(Some(&v)).life;
+        assert_eq!(life(json!({"life": 3000})), 3000);
+        assert_eq!(life(json!({"life": 4321})), 4500);
+        assert_eq!(life(json!({"life": 60000})), 10000);
+        assert_eq!(life(json!({"life": 0})), 0);
+        // clients from before the setting send none: 5000, as they play it
+        assert_eq!(life(json!({"rounds": 3})), 5000);
+        assert_eq!(clean_rules(None).life, 5000);
     }
     use crate::testkit::{declare, declare_legacy, tiny_char, tiny_stage, tmp};
     use rugen_fair::Kind;
@@ -4396,6 +4432,8 @@ pub(crate) mod tests {
             round_time: None,
             ai: [0, 0],
             fighter_size: rugen_sim::scale::FighterSize::Normal,
+            // the default rules' LIFE, as the clients play it
+            life: Some(5000),
             // as the clients do: the seed of the match id
             seed: rugen_sim::headless::online_seed(mid),
         };

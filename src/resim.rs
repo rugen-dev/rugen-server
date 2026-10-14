@@ -107,6 +107,9 @@ pub fn replay(
                 .and_then(serde_json::Value::as_u64)
         };
         let round_time = num("round_time").map(|t| if t == 0 { -1 } else { t as i32 });
+        // the room's LIFE (rugen 0.6.4): every fighter's LifeMax; setups
+        // without it are 5000, as the clients played them (0 = their own)
+        let life = room_life(num("life").unwrap_or(u64::from(rugen_proto::LIFE_DEFAULT)));
         let match_wins = num("rounds").map(|n| n.clamp(1, 9) as u8);
         let spec = rugen_sim::headless::MatchSpec {
             p1: &defs[0],
@@ -123,6 +126,7 @@ pub fn replay(
             round_time,
             ai: [0, 0],
             fighter_size,
+            life,
             // the clients' seed: derived from the match id on both sides
             seed: rugen_sim::headless::online_seed(match_id),
         };
@@ -150,4 +154,25 @@ pub fn replay(
     _stop_frame: Option<u32>,
 ) -> Result<Outcome, String> {
     Err("this server was built without --features resim".into())
+}
+
+/// A room's LIFE as the clients simulate it: 0 = each fighter's own life,
+/// anything else on the 1000..=10000 grid of 500 (rugen `clamp_life`).
+pub(crate) fn room_life(v: u64) -> Option<i32> {
+    (v > 0).then(|| {
+        let v = v.min(100_000) as i32;
+        ((v + 250).div_euclid(500) * 500).clamp(1000, 10000)
+    })
+}
+
+#[cfg(test)]
+mod life_tests {
+    #[test]
+    fn rooms_simulate_their_life() {
+        assert_eq!(super::room_life(5000), Some(5000));
+        assert_eq!(super::room_life(0), None, "each fighter's own");
+        assert_eq!(super::room_life(4321), Some(4500));
+        assert_eq!(super::room_life(99_999), Some(10000));
+        assert_eq!(super::room_life(1), Some(1000));
+    }
 }
