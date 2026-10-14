@@ -249,7 +249,23 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE accounts ADD COLUMN last_season INTEGER;
      ALTER TABLE accounts ADD COLUMN last_rating INTEGER;
      ALTER TABLE accounts ADD COLUMN last_rank INTEGER;",
+    // v8: per-fighter leaderboards: each player's rating and record with
+    // each fighter (fingerprint), per season
+    "CREATE TABLE fighter_ratings (
+         season INTEGER NOT NULL,
+         fingerprint TEXT NOT NULL,
+         account INTEGER NOT NULL,
+         name TEXT NOT NULL DEFAULT '',
+         rating INTEGER NOT NULL,
+         wins INTEGER NOT NULL DEFAULT 0,
+         losses INTEGER NOT NULL DEFAULT 0,
+         PRIMARY KEY (season, fingerprint, account)
+     );
+     CREATE INDEX fighter_ratings_board ON fighter_ratings(season, fingerprint, rating DESC);",
 ];
+
+/// Fighters a per-fighter board lists.
+pub const BOARD_FIGHTERS: usize = 50;
 
 /// Finished seasons a leaderboard can go back to.
 pub const PAST_SEASONS: usize = 12;
@@ -915,6 +931,26 @@ impl Store {
     /// Final standings of a finished season, best first.
     pub fn season_board(&self, number: u32, limit: usize) -> DbResult<Vec<ProfileInfo>> {
         self.read(|d| d.season_board(number, limit))
+    }
+
+    /// Fighters with a board in `season`, most played first.
+    pub fn board_fighters(&self, season: u32) -> DbResult<Vec<rugen_proto::FighterEntry>> {
+        self.read(|d| d.board_fighters(season))
+    }
+
+    /// One fighter's board in `season`, best first.
+    pub fn fighter_board(&self, season: u32, fp: &str, limit: usize) -> DbResult<Vec<ProfileInfo>> {
+        self.read(|d| d.fighter_board(season, fp, limit))
+    }
+
+    /// An account's position and line on a fighter's board.
+    pub fn fighter_rank_of(
+        &self,
+        season: u32,
+        fp: &str,
+        id: u64,
+    ) -> DbResult<Option<(usize, ProfileInfo)>> {
+        self.read(|d| d.fighter_rank_of(season, fp, id))
     }
 
     /// An account's final position and line in a finished season.
@@ -2242,6 +2278,11 @@ impl Db<'_> {
             .execute(params![fl, rl])?;
         }
         let mut deltas = [0, 0];
+        if ranked && let (Some(f1), Some(f2)) = (fp("p1_fp"), fp("p2_fp")) {
+            let name = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let (n1, n2) = (name("p1_char"), name("p2_char"));
+            Self::settle_fighters(tx, [(&f1, &n1), (&f2, &n2)], players, winner)?;
+        }
         if ranked {
             let rating = |id: u64| -> DbResult<Option<i32>> {
                 tx.prepare_cached("SELECT rating FROM accounts WHERE id = ?1")?
@@ -2277,6 +2318,133 @@ impl Db<'_> {
         }
         tx.prepare_cached("UPDATE matches SET resolved = 1, disputed = 0, winner = ?2, delta1 = ?3, delta2 = ?4 WHERE id = ?1")?.execute(params![match_id as i64, winner as i64, deltas[0], deltas[1]])?;
         Ok(deltas)
+    }
+
+    /// Per-fighter boards: each player's rating with its fighter moves like
+    /// its own (Elo K = 32) against the other player's with theirs. A
+    /// player new to a fighter this season starts from last season's
+    /// rating with it, soft-reset, else from the start rating.
+    fn settle_fighters(
+        tx: &Connection,
+        fighters: [(&String, &String); 2],
+        players: [u64; 2],
+        winner: u64,
+    ) -> DbResult<()> {
+        let season: i64 = tx
+            .prepare_cached("SELECT v FROM meta WHERE k = 'season'")?
+            .query_row([], |r| r.get(0))
+            .optional()?
+            .unwrap_or(1);
+        let mut ratings = [0i32; 2];
+        for i in 0..2 {
+            let (fp, name) = fighters[i];
+            let start = tx
+                .prepare_cached(
+                    "SELECT rating FROM fighter_ratings WHERE fingerprint = ?1 AND account = ?2
+                     AND season < ?3 ORDER BY season DESC LIMIT 1",
+                )?
+                .query_row(params![fp, players[i] as i64, season], |r| {
+                    r.get::<_, i32>(0)
+                })
+                .optional()?
+                .map_or(elo::START_RATING, rugen_proto::soft_reset);
+            tx.prepare_cached(
+                "INSERT INTO fighter_ratings (season, fingerprint, account, name, rating)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(season, fingerprint, account) DO UPDATE SET name = ?4",
+            )?
+            .execute(params![season, fp, players[i] as i64, name, start])?;
+            ratings[i] = tx
+                .prepare_cached(
+                    "SELECT rating FROM fighter_ratings WHERE season = ?1 AND fingerprint = ?2 AND account = ?3",
+                )?
+                .query_row(params![season, fp, players[i] as i64], |r| r.get(0))?;
+        }
+        let w = usize::from(players[1] == winner);
+        let (nw, nl) = elo::update(ratings[w], ratings[1 - w]);
+        for (i, rating, won) in [(w, nw, true), (1 - w, nl, false)] {
+            tx.prepare_cached(
+                "UPDATE fighter_ratings SET rating = ?4, wins = wins + ?5, losses = losses + ?6
+                 WHERE season = ?1 AND fingerprint = ?2 AND account = ?3",
+            )?
+            .execute(params![
+                season,
+                fighters[i].0,
+                players[i] as i64,
+                rating,
+                i64::from(won),
+                i64::from(!won)
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Fighters with a board in `season`, most played first.
+    pub fn board_fighters(&self, season: u32) -> DbResult<Vec<rugen_proto::FighterEntry>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT fingerprint, MAX(name), COUNT(*), SUM(wins + losses) FROM fighter_ratings
+             WHERE season = ?1 GROUP BY fingerprint
+             ORDER BY SUM(wins + losses) DESC, fingerprint LIMIT ?2",
+        )?;
+        st.query_map(params![season, BOARD_FIGHTERS as i64], |r| {
+            Ok(rugen_proto::FighterEntry {
+                fingerprint: r.get(0)?,
+                name: r.get(1)?,
+                players: r.get::<_, i64>(2)? as u32,
+                games: r.get::<_, i64>(3)? as u32,
+            })
+        })?
+        .collect()
+    }
+
+    /// One fighter's board in `season`: players by their rating with it.
+    pub fn fighter_board(&self, season: u32, fp: &str, limit: usize) -> DbResult<Vec<ProfileInfo>> {
+        let cols = Self::prefixed_cols();
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {cols}, f.rating, f.wins, f.losses, 0 FROM fighter_ratings f
+             JOIN accounts a ON a.id = f.account WHERE f.season = ?1 AND f.fingerprint = ?2
+             ORDER BY f.rating DESC, a.id LIMIT ?3"
+        ))?;
+        st.query_map(params![season, fp, limit as i64], Self::season_row)?
+            .map(|r| r.map(|(_, p)| p))
+            .collect()
+    }
+
+    /// An account's position and line on a fighter's board.
+    pub fn fighter_rank_of(
+        &self,
+        season: u32,
+        fp: &str,
+        id: u64,
+    ) -> DbResult<Option<(usize, ProfileInfo)>> {
+        let cols = Self::prefixed_cols();
+        let row = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {cols}, f.rating, f.wins, f.losses, 0 FROM fighter_ratings f
+                 JOIN accounts a ON a.id = f.account
+                 WHERE f.season = ?1 AND f.fingerprint = ?2 AND f.account = ?3"
+            ))?
+            .query_row(params![season, fp, id as i64], Self::season_row)
+            .optional()?;
+        let Some((_, p)) = row else { return Ok(None) };
+        let ahead: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM fighter_ratings WHERE season = ?1 AND fingerprint = ?2
+                 AND (rating > ?3 OR (rating = ?3 AND account < ?4))",
+            )?
+            .query_row(params![season, fp, p.rating, id as i64], |r| r.get(0))?;
+        Ok(Some((ahead as usize + 1, p)))
+    }
+
+    /// [`ACCOUNT_SELECT`] with the `a.` table prefix.
+    fn prefixed_cols() -> String {
+        ACCOUNT_SELECT
+            .split(", ")
+            .map(|c| format!("a.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn set_ending(

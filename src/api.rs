@@ -20,6 +20,9 @@
 //! GET  /replay/{match_id}       stored ranked replay
 //! GET  /leaderboard?key=&season=  the live board, or a finished season's final
 //!                               standings (`finished`, `past` = seasons kept)
+//!      &fighter=FP | &fighters=1  a per-fighter board (players by their rating
+//!                               with that fighter; the most played one with
+//!                               `fighters=1`), plus `fighters` with a board
 //! GET  /seasons/current
 //! GET  /ws?key=                 WebSocket: presence pushes + server-side RTT
 //! GET  /relay                   WebSocket: relayed match datagrams (fallback for UDP)
@@ -79,7 +82,8 @@
 //!                                  of the last season the player finished)
 //! Season (GET /seasons/current, leaderboard.season)
 //!                                started_at, secs_left
-//! Leaderboard                    past: [season], finished: bool
+//! Leaderboard                    past: [season], finished: bool, fighter, fighters
+//!                                  (per-fighter boards)
 //! ```
 //!
 //! `high_ping` is true when the estimated player ↔ player round trip is
@@ -897,6 +901,61 @@ impl Api {
             .get("season")
             .and_then(|n| n.parse::<u32>().ok())
             .filter(|&n| n != current.number);
+        // a per-fighter board: `fighter=FP`, or `fighters=1` for the most played
+        let fighter = req.query.get("fighter").map(|f| f.to_ascii_lowercase());
+        if fighter.is_some() || req.query.contains_key("fighters") {
+            let (season, finished) = match asked {
+                Some(n) => (
+                    db(s.past_season(n))?.ok_or_else(|| err(404, "no such season"))?,
+                    true,
+                ),
+                None => (current, false),
+            };
+            let fighters = db(s.board_fighters(season.number))?;
+            let chosen = match fighter.filter(|f| !f.is_empty()) {
+                Some(fp) => {
+                    if !is_fingerprint(&fp) {
+                        return Err(err(400, "bad fingerprint"));
+                    }
+                    fighters
+                        .iter()
+                        .find(|f| f.fingerprint == fp)
+                        .cloned()
+                        .unwrap_or(rugen_proto::FighterEntry {
+                            fingerprint: fp,
+                            ..Default::default()
+                        })
+                }
+                None => match fighters.first() {
+                    Some(f) => f.clone(),
+                    None => {
+                        return ok(&Leaderboard {
+                            season,
+                            rows: Vec::new(),
+                            me: None,
+                            past,
+                            finished,
+                            fighter: None,
+                            fighters,
+                        });
+                    }
+                },
+            };
+            let n = season.number;
+            let me = match me {
+                Some(a) => db(s.fighter_rank_of(n, &chosen.fingerprint, a.id))?,
+                None => None,
+            };
+            return ok(&Leaderboard {
+                rows: db(s.fighter_board(n, &chosen.fingerprint, 50))?,
+                season,
+                me,
+                past,
+                finished,
+                fighter: Some(chosen),
+                fighters,
+            });
+        }
         if let Some(n) = asked {
             let season = db(s.past_season(n))?.ok_or_else(|| err(404, "no such season"))?;
             let me = match me {
@@ -909,6 +968,8 @@ impl Api {
                 me,
                 past,
                 finished: true,
+                fighter: None,
+                fighters: Vec::new(),
             });
         }
         let me = match me {
@@ -921,6 +982,8 @@ impl Api {
             me,
             past,
             finished: false,
+            fighter: None,
+            fighters: Vec::new(),
         })
     }
 
@@ -3686,6 +3749,100 @@ pub(crate) mod tests {
             api.handle(req("GET", "/leaderboard?season=9", Value::Null))
                 .status,
             404
+        );
+    }
+
+    /// Ranked results move each player's rating with its fighter: the
+    /// FIGHTERS board lists the fighters by appearances and ranks the
+    /// players of one; a new season starts them from a soft reset.
+    #[test]
+    fn per_fighter_boards_rank_players_of_each_fighter() {
+        let api = official_api();
+        let (a, ka) = register(&api);
+        let (b, _) = register(&api);
+        let (c, _) = register(&api);
+        let (naruto, sasuke) = ("a".repeat(64), "b".repeat(64));
+        let play = |p1: u64, f1: &str, p2: u64, f2: &str, winner: u64| {
+            let s = api.store();
+            let setup = json!({"p1_fp": f1, "p2_fp": f2, "p1_char": "Naruto",
+                "p2_char": if f2 == naruto { "Naruto" } else { "Sasuke" }})
+            .to_string();
+            let m = s.new_match([p1, p2], true, &setup).unwrap();
+            let w = ReportData {
+                winner,
+                ..Default::default()
+            };
+            s.report(p1, m, &w).unwrap();
+            s.report(p2, m, &w).unwrap();
+        };
+        play(a, &naruto, b, &sasuke, a);
+        play(a, &naruto, b, &sasuke, a);
+        play(c, &naruto, a, &naruto, c);
+        let board = |q: &str| {
+            json_of(api.handle(req(
+                "GET",
+                &format!("/leaderboard?key={ka}&{q}"),
+                Value::Null,
+            )))
+        };
+        let top = board("fighters=1");
+        assert_eq!(top["fighter"]["fingerprint"], naruto, "most played first");
+        assert_eq!(top["fighter"]["name"], "Naruto");
+        assert_eq!(top["fighters"][0]["games"], 4);
+        assert_eq!(top["fighters"][0]["players"], 2);
+        assert_eq!(top["fighters"][1]["fingerprint"], sasuke);
+        let rows = top["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // a: 2 wins then a loss with Naruto (1214); c: one win over a (1218)
+        let line = |id: u64| rows.iter().find(|r| r["id"].as_u64() == Some(id)).unwrap();
+        assert_eq!(
+            (line(a)["wins"].as_u64(), line(a)["losses"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            (line(c)["wins"].as_u64(), line(c)["losses"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert_eq!(rows[0]["id"].as_u64(), Some(c));
+        assert_eq!(top["me"][0], 2);
+        let sb = board(&format!("fighter={sasuke}"));
+        assert_eq!(sb["rows"][0]["id"].as_u64(), Some(b));
+        assert_eq!(sb["rows"][0]["losses"], 2);
+        assert!(sb["me"].is_null(), "a never played Sasuke");
+        // the players' board is untouched by the new fields
+        assert!(board("").get("fighters").is_none());
+        let rating = line(a)["rating"].as_i64().unwrap() as i32;
+        // a new season: the board restarts, a returning player starts soft-reset
+        api.handle(req("POST", "/v1/admin/season_end", json!({"token": "tok"})));
+        assert!(
+            board("fighters=1").get("fighters").is_none(),
+            "no fighter played yet"
+        );
+        let old = board("fighters=1&season=1");
+        assert_eq!(old["finished"], true);
+        assert_eq!(old["rows"][1]["id"].as_u64(), Some(a));
+        play(a, &naruto, b, &sasuke, b);
+        let now = board(&format!("fighter={naruto}"));
+        let nw = rugen_proto::soft_reset(rating);
+        let after = now["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_u64() == Some(a))
+            .unwrap()["rating"]
+            .as_i64()
+            .unwrap() as i32;
+        // b's Sasuke rating starts season 2 soft-reset too
+        let b_start = rugen_proto::soft_reset(sb["rows"][0]["rating"].as_i64().unwrap() as i32);
+        assert_eq!(
+            after,
+            crate::elo::update(b_start, nw).1,
+            "lost from the soft-reset rating"
+        );
+        assert_eq!(
+            api.handle(req("GET", "/leaderboard?fighter=nope", Value::Null))
+                .status,
+            400
         );
     }
 
