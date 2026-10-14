@@ -1,7 +1,7 @@
 [package]
 name = "rugen-server"
 description = "rugen-server: lobby, rooms, ranked (Elo), match relay over UDP / WebSocket, SQLite"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rugen-dev/rugen-server"
@@ -12,10 +12,10 @@ name = "rugen-server"
 path = "src/main.rs"
 
 [dependencies]
-rugen-proto = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
-rugen-fair = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
-rugen-formats = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
-rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2", optional = true }
+rugen-proto = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
+rugen-fair = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
+rugen-formats = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3", optional = true }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
@@ -52,9 +52,9 @@ libc = "0.2"
 resim = ["dep:rugen-sim"]
 
 [dev-dependencies]
-rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
-rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
-rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.2" }
+rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
+rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
+rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.3" }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 
