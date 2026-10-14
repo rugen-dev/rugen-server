@@ -405,6 +405,14 @@ fn bring_your_own_character_blocked_then_synced_relay_match() {
     assert!(!ack.disputed);
     let r = a.char_rating(&kfm.fingerprint).unwrap().unwrap();
     assert_eq!((r.games, r.wins), (1, 1));
+    // B shares the match: the code plays the server's log of it
+    let shared = b.share_replay(id).unwrap();
+    assert_eq!(shared.code.len(), 8);
+    let anyone = OnlineClient::new(&srv.url, None);
+    let replay = anyone.shared_replay(&shared.code).unwrap();
+    assert!(replay.ended && replay.header.is_some());
+    let got = rugen_proto::stream::inputs_to_bytes(&replay.inputs);
+    assert_eq!(got[..250 * 4], la_log[..250 * 4], "the replay is the match");
     let _ = (idb, &srv.api);
     let _ = std::fs::remove_dir_all(&tmp);
 }

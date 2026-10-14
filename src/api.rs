@@ -24,6 +24,9 @@
 //! POST /result                  {key, match_id, winner, frames?, checksum?, inputs? | inputs_rle?, checksums?, turn?}
 //! GET  /replay/{match_id}       stored ranked replay
 //! GET  /v1/live?key=            public live matches (LiveMatch[])
+//! POST /v1/replays             {key, match_id} → SharedReplay {code, expires, title, frames}
+//!                               (a player shares a finished match; kept RUGEN_REPLAY_DAYS)
+//! GET  /v1/replays/{code}       a shared replay: binary stream chunk (header + every frame)
 //! GET  /v1/live/{id}?key=&from= a live match's input stream from frame N, binary
 //!                               (rugen_proto::stream chunk, the header when N = 0);
 //!                               private rooms: members only
@@ -302,6 +305,28 @@ pub fn left_first(
         && (theirs.bye || now.saturating_duration_since(theirs.heard) >= SLOT_GONE)
         && mine.heard >= theirs.heard + OUTLASTED
 }
+/// Replays one account may share in a day.
+const SHARES_PER_DAY: u32 = 50;
+
+/// Days a shared replay is kept (`RUGEN_REPLAY_DAYS`, default 30).
+pub fn replay_days() -> u64 {
+    std::env::var("RUGEN_REPLAY_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(30)
+}
+
+/// All shared replays together keep at most this much (`RUGEN_REPLAY_MB`,
+/// default 256 MB; the oldest go first).
+fn replay_max_bytes() -> u64 {
+    std::env::var("RUGEN_REPLAY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(256)
+        << 20
+}
+
 /// Started / failed matchups are forgotten after this long.
 const MATCHUP_KEEP: Duration = Duration::from_secs(4 * 3600);
 /// Largest chunk of an upload / download.
@@ -860,6 +885,8 @@ impl Api {
             ("GET", ["replay", id]) => self.replay(id),
             ("GET", ["v1", "live"]) => ok(&self.live.list()),
             ("GET", ["v1", "live", id]) => self.live_chunk(&req, &v, id),
+            ("POST", ["v1", "replays"]) => self.share_replay(&req, &v),
+            ("GET", ["v1", "replays", code]) => self.shared_replay(code),
             ("GET", ["rooms"]) => self.list_rooms(&req),
             ("POST", ["room"]) => self.create_room(&req, &v),
             ("POST", ["room", code, "join"]) => self.join_room(&req, &v, code),
@@ -1572,6 +1599,175 @@ impl Api {
         }
     }
 
+    // ---- shared replays
+
+    /// `POST /v1/replays {key, match_id}`: a player of a finished match
+    /// shares it under a short code, kept [`replay_days`] days. The stream
+    /// is the server's input log of the match, else the longest input
+    /// stream the players reported. Sharing a match again gives its code.
+    fn share_replay(&self, req: &Request, v: &Value) -> Res {
+        use rugen_proto::stream::{SharedReplay, inputs_from_bytes, replay_code};
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
+        let id = v
+            .get("match_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| err(400, "match_id required"))?;
+        let players = db(s.match_players(id))?.ok_or_else(|| err(404, "no such match"))?;
+        if !players.contains(&me.id) {
+            return Err(err(403, "only its players share a match"));
+        }
+        let answer = |row: &crate::store::SharedRow| {
+            let title = serde_json::from_str::<rugen_proto::stream::MatchHeader>(&row.header)
+                .map(|h| h.title())
+                .unwrap_or_default();
+            ok(&SharedReplay {
+                code: row.code.clone(),
+                expires: row.expires,
+                match_id: row.match_id,
+                title,
+                frames: (row.inputs.len() / 4) as u32,
+            })
+        };
+        if let Some(row) = db(s.shared_of_match(id))? {
+            return answer(&row);
+        }
+        if self.live.running(id) {
+            return Err(err(409, "the match is still running"));
+        }
+        let day = crate::store::now().saturating_sub(24 * 3600);
+        if db(s.shares_since(me.id, day))? >= SHARES_PER_DAY {
+            return Err(err(429, "too many shared replays today"));
+        }
+        let (header, frames) = match self.live.finished(id) {
+            Some(x) => x,
+            None => {
+                let Some((setup, ranked, players, reports)) = db(s.match_evidence(id))? else {
+                    return Err(err(404, "no such match"));
+                };
+                let longest = reports
+                    .iter()
+                    .map(|(_, r)| &r.inputs)
+                    .max_by_key(|i| i.len())
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    self.header_from_setup(s, id, &setup, ranked, players),
+                    inputs_from_bytes(&longest),
+                )
+            }
+        };
+        if frames.is_empty() {
+            return Err(err(404, "this server kept no input stream of that match"));
+        }
+        let mut code = String::new();
+        for _ in 0..16 {
+            let c = replay_code::generate(|| {
+                let mut b = [0u8; 1];
+                let _ = getrandom::getrandom(&mut b);
+                b[0]
+            });
+            if db(s.shared_replay(&c))?.is_none() {
+                code = c;
+                break;
+            }
+        }
+        let t = crate::store::now();
+        let row = crate::store::SharedRow {
+            code,
+            match_id: id,
+            header: serde_json::to_string(&header).unwrap_or_default(),
+            inputs: rugen_proto::stream::inputs_to_bytes(&frames),
+            account: me.id,
+            created: t,
+            expires: t + replay_days() * 24 * 3600,
+        };
+        let fps = [
+            header.fighters[0].fingerprint.clone(),
+            header.fighters[1].fingerprint.clone(),
+            header.stage.fingerprint.clone(),
+        ];
+        let row = db(s.share_replay(&row, fps))?;
+        log::info!("match {id}: shared as replay {}", row.code);
+        answer(&row)
+    }
+
+    /// `GET /v1/replays/{code}`: a shared replay, binary (a stream chunk
+    /// with the header and every frame). No account needed to read it.
+    fn shared_replay(&self, code: &str) -> Res {
+        let code = rugen_proto::stream::replay_code::normalize(code)
+            .ok_or_else(|| err(400, "not a replay code"))?;
+        let row = db(self.store.shared_replay(&code))?
+            .ok_or_else(|| err(404, "no such replay (it may have expired)"))?;
+        let header = serde_json::from_str(&row.header).ok();
+        let inputs = rugen_proto::stream::inputs_from_bytes(&row.inputs);
+        let c = rugen_proto::stream::Chunk {
+            header,
+            ended: true,
+            total: inputs.len() as u32,
+            from: 0,
+            inputs,
+        };
+        Ok(Response::bytes(rugen_proto::stream::encode_chunk(&c)))
+    }
+
+    /// A match header from its stored setup (the live log is gone).
+    fn header_from_setup(
+        &self,
+        s: &Store,
+        id: u64,
+        setup: &str,
+        ranked: bool,
+        players: [u64; 2],
+    ) -> rugen_proto::stream::MatchHeader {
+        let v: Value = serde_json::from_str(setup).unwrap_or_default();
+        let st = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let content = |fp: String, name: String| rugen_proto::stream::StreamContent {
+            size: s.package(&fp).ok().flatten().map_or(0, |p| p.size),
+            fingerprint: fp,
+            name,
+        };
+        let player = |id: u64| {
+            let p = Self::profile(s, id);
+            rugen_proto::stream::StreamPlayer {
+                id,
+                name: p.name,
+                verified: p.verified,
+            }
+        };
+        rugen_proto::stream::MatchHeader {
+            v: rugen_proto::stream::STREAM_VERSION,
+            match_id: id,
+            engine: v
+                .get("engine")
+                .and_then(Value::as_str)
+                .map(|e| format!("rugen {e}"))
+                .unwrap_or_default(),
+            seed: rugen_proto::stream::online_seed(id),
+            rules: v
+                .get("rules")
+                .and_then(|r| serde_json::from_value(r.clone()).ok())
+                .unwrap_or_default(),
+            fighters: [
+                content(st("p1_fp"), st("p1_char")),
+                content(st("p2_fp"), st("p2_char")),
+            ],
+            stage: content(st("stage_fp"), st("stage")),
+            players: [player(players[0]), player(players[1])],
+            ranked,
+            created: crate::store::now(),
+        }
+    }
+
+    /// Shared replays past their days or their total size go.
+    pub fn sweep_replays(&self) {
+        match self.store.sweep_shared(replay_max_bytes()) {
+            Ok(0) => {}
+            Ok(n) => log::info!("replays: {n} shared replays expired"),
+            Err(e) => log::warn!("replays: {e}"),
+        }
+    }
+
     // ---- tournaments
 
     /// `POST /room/{code}/start`: the host draws the bracket with the
@@ -2244,7 +2440,19 @@ impl Api {
                     .map(|l| Response::json(200, &l))
                     .map_err(|e| err(502, &e));
             }
-            "backup_status" => return ok(&self.backups.status()),
+            "backup_status" => {
+                // shared replays live in the database: every backup holds them
+                let mut st = serde_json::to_value(self.backups.status()).unwrap_or_default();
+                if let (Some(o), Ok((count, bytes))) =
+                    (st.as_object_mut(), self.store.shared_usage())
+                {
+                    o.insert(
+                        "shared_replays".into(),
+                        json!({ "count": count, "bytes": bytes }),
+                    );
+                }
+                return Ok(Response::json(200, &st));
+            }
             _ => {}
         }
         if op == "reset_password" {
@@ -2951,6 +3159,7 @@ impl Api {
                 .values()
                 .any(|m| m.involves(me.id) && m.declared().contains(&fp.as_str()))
                 && !self.live.watches_content(&fp, me.id)
+                && !s.shared_has(&fp).unwrap_or(false)
             {
                 return Err(err(403, "not part of your matchup"));
             }
@@ -4471,6 +4680,100 @@ pub(crate) mod tests {
         let t = view(&kh)["tournament"].clone();
         assert_eq!(t["state"], "done");
         assert_eq!(t["champion"].as_u64(), Some(q1));
+    }
+
+    /// A player shares a finished match: a short code, the stream from the
+    /// reports when the live log is gone, the same code again, nobody else
+    /// may share it, anyone may read it, its packages stay downloadable;
+    /// expired replays go.
+    #[test]
+    fn finished_matches_are_shared_by_code() {
+        let api = official_api();
+        let (a, ka) = register(&api);
+        let (b, kb) = register(&api);
+        let (_, kc) = register(&api);
+        let fp = "c".repeat(64);
+        let setup = json!({"p1_fp": fp, "p2_fp": fp, "stage_fp": "d".repeat(64),
+            "p1_char": "Naruto", "p2_char": "Sasuke", "rules": Rules::default(), "engine": "0.7.0"})
+        .to_string();
+        let s = api.store();
+        let m = s.new_match([a, b], false, &setup).unwrap();
+        let inputs: Vec<u8> = (0..400u32)
+            .flat_map(|i| (i as u16).to_le_bytes().repeat(2))
+            .collect();
+        for (who, n) in [(a, 300 * 4), (b, 400 * 4)] {
+            s.report(
+                who,
+                m,
+                &ReportData {
+                    winner: a,
+                    inputs: inputs[..n].to_vec(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let share =
+            |k: &str| api.handle(req("POST", "/v1/replays", json!({"key": k, "match_id": m})));
+        assert_eq!(share(&kc).status, 403, "not a player of it");
+        let r = json_of(share(&ka));
+        let code = r["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 8);
+        assert_eq!(r["title"], "NARUTO VS SASUKE");
+        assert_eq!(r["frames"], 400, "the longest report");
+        let days = (r["expires"].as_u64().unwrap() - crate::store::now()) / 86_400;
+        assert!((29..=30).contains(&days), "{days}");
+        assert_eq!(
+            json_of(share(&kb))["code"],
+            code.as_str(),
+            "one code per match"
+        );
+        // anyone reads it, with any spelling of the code
+        let shown = rugen_proto::stream::replay_code::display(&code).to_lowercase();
+        let r = api.handle(req("GET", &format!("/v1/replays/{shown}"), Value::Null));
+        assert_eq!(r.status, 200);
+        let c = rugen_proto::stream::decode_chunk(&r.body).unwrap();
+        assert!(c.ended);
+        assert_eq!(c.inputs.len(), 400);
+        assert_eq!(rugen_proto::stream::inputs_to_bytes(&c.inputs), inputs);
+        let h = c.header.unwrap();
+        assert_eq!((h.match_id, h.engine.as_str()), (m, "rugen 0.7.0"));
+        assert_eq!(h.seed, rugen_proto::stream::online_seed(m));
+        assert!(s.shared_has(&fp).unwrap());
+        assert_eq!(s.shared_usage().unwrap(), (1, 1600));
+        assert_eq!(
+            api.handle(req("GET", "/v1/replays/AAAAAAAA", Value::Null))
+                .status,
+            404
+        );
+        assert_eq!(
+            api.handle(req("GET", "/v1/replays/nope", Value::Null))
+                .status,
+            400
+        );
+        // the backup status counts them
+        let st = json_of(api.handle(req("GET", "/v1/admin/backup/status?token=tok", Value::Null)));
+        assert_eq!(st["shared_replays"]["count"], 1);
+        // size cap, then expiry
+        assert_eq!(s.sweep_shared(1 << 20).unwrap(), 0);
+        assert_eq!(
+            s.sweep_shared(100).unwrap(),
+            1,
+            "over the cap: the oldest goes"
+        );
+        assert!(!s.shared_has(&fp).unwrap());
+        let m2 = s.new_match([a, b], false, &setup).unwrap();
+        assert_eq!(
+            share(&ka).status,
+            200,
+            "the first match again (its row went with the cap)"
+        );
+        let r = api.handle(req(
+            "POST",
+            "/v1/replays",
+            json!({"key": ka, "match_id": m2}),
+        ));
+        assert_eq!(r.status, 404, "nobody reported inputs of this one");
     }
 
     fn official_api() -> Arc<Api> {

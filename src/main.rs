@@ -717,6 +717,8 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
                 every.tick().await;
                 let a = sweeper.clone();
                 let _ = tokio::task::spawn_blocking(move || a.sweep_packages()).await;
+                let a = sweeper.clone();
+                let _ = tokio::task::spawn_blocking(move || a.sweep_replays()).await;
             }
         });
         // community servers: keep the official feed fresh

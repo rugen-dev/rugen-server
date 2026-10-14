@@ -262,7 +262,54 @@ const MIGRATIONS: &[&str] = &[
          PRIMARY KEY (season, fingerprint, account)
      );
      CREATE INDEX fighter_ratings_board ON fighter_ratings(season, fingerprint, rating DESC);",
+    // v9: shared replays: a finished match's header and input stream under
+    // a short code, kept 30 days (in every backup)
+    "CREATE TABLE shared_replays (
+         code TEXT PRIMARY KEY,
+         match_id INTEGER NOT NULL UNIQUE,
+         header TEXT NOT NULL,
+         inputs BLOB NOT NULL,
+         frames INTEGER NOT NULL,
+         account INTEGER NOT NULL,
+         p1_fp TEXT NOT NULL DEFAULT '',
+         p2_fp TEXT NOT NULL DEFAULT '',
+         stage_fp TEXT NOT NULL DEFAULT '',
+         created INTEGER NOT NULL,
+         expires INTEGER NOT NULL
+     );
+     CREATE INDEX shared_replays_expires ON shared_replays(expires);
+     CREATE INDEX shared_replays_account ON shared_replays(account, created);",
 ];
+
+/// A stored shared replay.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SharedRow {
+    pub code: String,
+    pub match_id: u64,
+    /// [`rugen_proto::stream::MatchHeader`] JSON.
+    pub header: String,
+    /// 4 bytes per frame.
+    pub inputs: Vec<u8>,
+    pub account: u64,
+    pub created: u64,
+    pub expires: u64,
+}
+
+impl SharedRow {
+    fn from_row(r: &Row<'_>) -> DbResult<Self> {
+        Ok(Self {
+            code: r.get(0)?,
+            match_id: r.get::<_, i64>(1)? as u64,
+            header: r.get(2)?,
+            inputs: r.get(3)?,
+            account: r.get::<_, i64>(4)? as u64,
+            created: r.get::<_, i64>(5)? as u64,
+            expires: r.get::<_, i64>(6)? as u64,
+        })
+    }
+}
+
+const SHARED_COLS: &str = "code, match_id, header, inputs, account, created, expires";
 
 /// Fighters a per-fighter board lists.
 pub const BOARD_FIGHTERS: usize = 50;
@@ -936,6 +983,45 @@ impl Store {
     /// Fighters with a board in `season`, most played first.
     pub fn board_fighters(&self, season: u32) -> DbResult<Vec<rugen_proto::FighterEntry>> {
         self.read(|d| d.board_fighters(season))
+    }
+
+    /// Keep a shared replay; when the match is already shared, its row
+    /// stays and is returned instead. Packages of the three fingerprints are
+    /// kept as long as the replay.
+    pub fn share_replay(&self, row: &SharedRow, fps: [String; 3]) -> DbResult<SharedRow> {
+        let (row, fps) = (row.clone(), fps);
+        self.write(move |d| d.share_replay(&row, &fps))
+    }
+
+    pub fn shared_replay(&self, code: &str) -> DbResult<Option<SharedRow>> {
+        let code = code.to_string();
+        self.read(move |d| d.shared_replay(&code))
+    }
+
+    pub fn shared_of_match(&self, match_id: u64) -> DbResult<Option<SharedRow>> {
+        self.read(move |d| d.shared_of_match(match_id))
+    }
+
+    /// An unexpired shared replay needs this package.
+    pub fn shared_has(&self, fp: &str) -> DbResult<bool> {
+        let fp = fp.to_string();
+        self.read(move |d| d.shared_has(&fp))
+    }
+
+    /// Replays `account` shared since `since` (Unix seconds).
+    pub fn shares_since(&self, account: u64, since: u64) -> DbResult<u32> {
+        self.read(move |d| d.shares_since(account, since))
+    }
+
+    /// Drop expired shared replays, then the oldest while all of them take
+    /// more than `max_bytes`. Returns how many went.
+    pub fn sweep_shared(&self, max_bytes: u64) -> DbResult<usize> {
+        self.write(move |d| d.sweep_shared(max_bytes))
+    }
+
+    /// (shared replays, bytes of their streams).
+    pub fn shared_usage(&self) -> DbResult<(u64, u64)> {
+        self.read(|d| d.shared_usage())
     }
 
     /// One fighter's board in `season`, best first.
@@ -2436,6 +2522,112 @@ impl Db<'_> {
             )?
             .query_row(params![season, fp, p.rating, id as i64], |r| r.get(0))?;
         Ok(Some((ahead as usize + 1, p)))
+    }
+
+    pub fn share_replay(&self, row: &SharedRow, fps: &[String; 3]) -> DbResult<SharedRow> {
+        if let Some(old) = self.shared_of_match(row.match_id)? {
+            return Ok(old);
+        }
+        self.conn
+            .prepare_cached(
+                "INSERT INTO shared_replays (code, match_id, header, inputs, frames, account,
+                 p1_fp, p2_fp, stage_fp, created, expires)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?
+            .execute(params![
+                row.code,
+                row.match_id as i64,
+                row.header,
+                row.inputs,
+                (row.inputs.len() / 4) as i64,
+                row.account as i64,
+                fps[0],
+                fps[1],
+                fps[2],
+                row.created as i64,
+                row.expires as i64
+            ])?;
+        for f in fps.iter().filter(|f| !f.is_empty()) {
+            self.conn
+                .prepare_cached(
+                    "UPDATE packages SET keep_until = MAX(keep_until, ?2) WHERE fingerprint = ?1",
+                )?
+                .execute(params![f, row.expires as i64])?;
+        }
+        Ok(row.clone())
+    }
+
+    pub fn shared_replay(&self, code: &str) -> DbResult<Option<SharedRow>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {SHARED_COLS} FROM shared_replays WHERE code = ?1 AND expires > ?2"
+            ))?
+            .query_row(params![code, now() as i64], SharedRow::from_row)
+            .optional()
+    }
+
+    pub fn shared_of_match(&self, match_id: u64) -> DbResult<Option<SharedRow>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {SHARED_COLS} FROM shared_replays WHERE match_id = ?1 AND expires > ?2"
+            ))?
+            .query_row(params![match_id as i64, now() as i64], SharedRow::from_row)
+            .optional()
+    }
+
+    pub fn shared_has(&self, fp: &str) -> DbResult<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT 1 FROM shared_replays WHERE expires > ?2
+                 AND (p1_fp = ?1 OR p2_fp = ?1 OR stage_fp = ?1)",
+            )?
+            .exists(params![fp, now() as i64])
+    }
+
+    pub fn shares_since(&self, account: u64, since: u64) -> DbResult<u32> {
+        self.conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM shared_replays WHERE account = ?1 AND created >= ?2",
+            )?
+            .query_row(params![account as i64, since as i64], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as u32)
+    }
+
+    pub fn sweep_shared(&self, max_bytes: u64) -> DbResult<usize> {
+        let mut gone = self
+            .conn
+            .prepare_cached("DELETE FROM shared_replays WHERE expires <= ?1")?
+            .execute([now() as i64])?;
+        loop {
+            let (_, bytes) = self.shared_usage()?;
+            if bytes <= max_bytes {
+                break;
+            }
+            let n = self
+                .conn
+                .prepare_cached(
+                    "DELETE FROM shared_replays WHERE code =
+                     (SELECT code FROM shared_replays ORDER BY created, code LIMIT 1)",
+                )?
+                .execute([])?;
+            if n == 0 {
+                break;
+            }
+            gone += n;
+        }
+        Ok(gone)
+    }
+
+    pub fn shared_usage(&self) -> DbResult<(u64, u64)> {
+        self.conn
+            .prepare_cached(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(inputs)), 0) FROM shared_replays",
+            )?
+            .query_row([], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            })
     }
 
     /// [`ACCOUNT_SELECT`] with the `a.` table prefix.

@@ -262,11 +262,18 @@ impl Live {
 
     /// A finished match's header and whole stream (sharing); `None` while
     /// it runs or when the server kept no log.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finished(&self, match_id: u64) -> Option<(MatchHeader, Vec<[u16; 2]>)> {
         let g = lock(&self.inner);
         let l = g.logs.get(&match_id).filter(|l| l.ended.is_some())?;
         Some((l.header.clone(), (0..l.len()).map(|i| l.frame(i)).collect()))
+    }
+
+    /// The match is being fought (its log is not finished yet).
+    pub fn running(&self, match_id: u64) -> bool {
+        lock(&self.inner)
+            .logs
+            .get(&match_id)
+            .is_some_and(|l| l.ended.is_none())
     }
 
     /// `account` opened a kept match that has this fingerprint (viewers
