@@ -18,7 +18,8 @@
 //! DELETE /queue (or POST /queue/leave) {key}
 //! POST /result                  {key, match_id, winner, frames?, checksum?, inputs? | inputs_rle?, checksums?, turn?}
 //! GET  /replay/{match_id}       stored ranked replay
-//! GET  /leaderboard?key=
+//! GET  /leaderboard?key=&season=  the live board, or a finished season's final
+//!                               standings (`finished`, `past` = seasons kept)
 //! GET  /seasons/current
 //! GET  /ws?key=                 WebSocket: presence pushes + server-side RTT
 //! GET  /relay                   WebSocket: relayed match datagrams (fallback for UDP)
@@ -45,6 +46,8 @@
 //! GET  /v1/admin/blocklist?token=
 //! POST /v1/admin/reset_password {token, username} → {username, password} (temporary;
 //!                               every key of the account is revoked)
+//! POST /v1/admin/season_end     {token} → Season (the next one; ends the
+//!                               current season now: standings kept, soft reset)
 //! POST /v1/admin/backup         {token} → 202 {job} | 409 running | 429 (1 per 10 min)
 //! GET  /v1/admin/backups?token= backups in the bucket {backups: [{key, name, time, size, complete, legacy}]}
 //! GET  /v1/admin/backup/status?token=  the health `backup` object + job, includes
@@ -71,6 +74,12 @@
 //! GET /health                    relay: {sessions, forwarded, dropped, queue_drops}
 //!                                backup: {configured, status, provider, retention_days,
 //!                                  last_success, last_error, last_size_bytes, next_at, running}
+//! ProfileInfo (profiles, boards, room members)
+//!                                last_season: {season, rating, rank, tier} (the badge
+//!                                  of the last season the player finished)
+//! Season (GET /seasons/current, leaderboard.season)
+//!                                started_at, secs_left
+//! Leaderboard                    past: [season], finished: bool
 //! ```
 //!
 //! `high_ping` is true when the estimated player ↔ player round trip is
@@ -808,19 +817,7 @@ impl Api {
                 db(s.roll_season())?;
                 ok(&db(s.season())?)
             }
-            ("GET", ["leaderboard"]) => {
-                let s = &self.store;
-                db(s.roll_season())?;
-                let me = match self.auth(s, &req, &v) {
-                    Ok(a) => db(s.rank_of(a.id))?.map(|pos| (pos, a.info())),
-                    Err(_) => None,
-                };
-                ok(&Leaderboard {
-                    season: db(s.season())?,
-                    rows: db(s.leaderboard(50))?,
-                    me,
-                })
-            }
+            ("GET", ["leaderboard"]) => self.leaderboard(&req, &v),
             ("GET", ["replay", id]) => self.replay(id),
             ("GET", ["rooms"]) => self.list_rooms(&req),
             ("POST", ["room"]) => self.create_room(&req, &v),
@@ -882,6 +879,49 @@ impl Api {
             ("GET", ["v1", "admin", "backup", "status"]) => self.admin(&req, &v, "backup_status"),
             _ => Err(err(404, "no such route")),
         }
+    }
+
+    // ---- leaderboards
+
+    /// `GET /leaderboard?key=&season=N`: the live board of the current
+    /// season, or a finished season's final standings (`finished`); `past`
+    /// lists the finished seasons kept.
+    fn leaderboard(&self, req: &Request, v: &Value) -> Res {
+        let s = &self.store;
+        db(s.roll_season())?;
+        let current = db(s.season())?;
+        let me = self.auth(s, req, v).ok();
+        let past = db(s.past_seasons())?;
+        let asked = req
+            .query
+            .get("season")
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|&n| n != current.number);
+        if let Some(n) = asked {
+            let season = db(s.past_season(n))?.ok_or_else(|| err(404, "no such season"))?;
+            let me = match me {
+                Some(a) => db(s.season_rank_of(n, a.id))?,
+                None => None,
+            };
+            return ok(&Leaderboard {
+                season,
+                rows: db(s.season_board(n, 50))?,
+                me,
+                past,
+                finished: true,
+            });
+        }
+        let me = match me {
+            Some(a) => db(s.rank_of(a.id))?.map(|pos| (pos, a.info())),
+            None => None,
+        };
+        ok(&Leaderboard {
+            season: current,
+            rows: db(s.leaderboard(50))?,
+            me,
+            past,
+            finished: false,
+        })
     }
 
     // ---- rooms
@@ -1709,6 +1749,11 @@ impl Api {
         }
         match op {
             "backup" => return self.backup_now(),
+            "season_end" => {
+                let next = db(self.store.end_season_now())?;
+                log::warn!("admin: season ended early, {} started", next.name);
+                return ok(&next);
+            }
             "backups" => {
                 if self.backups.config().is_none() {
                     return Err(err(404, "backups are not configured (RUGEN_BACKUP_S3)"));
@@ -3574,6 +3619,74 @@ pub(crate) mod tests {
             },
             Arc::new(Relay::default()),
         )
+    }
+
+    /// A season ends (operator): the live board restarts, the finished
+    /// season's final standings stay under `?season=`, and the badge rides
+    /// on profiles; a client that ignores the new fields reads it as before.
+    #[test]
+    fn finished_seasons_keep_their_board_and_badges() {
+        let api = official_api();
+        let (a, ka) = register(&api);
+        let (b, _) = register(&api);
+        {
+            let s = api.store();
+            for _ in 0..3 {
+                let m = s.new_match([a, b], true, "{}").unwrap();
+                let w = ReportData {
+                    winner: a,
+                    ..Default::default()
+                };
+                s.report(a, m, &w).unwrap();
+                s.report(b, m, &w).unwrap();
+            }
+        }
+        let live = json_of(api.handle(req("GET", &format!("/leaderboard?key={ka}"), Value::Null)));
+        assert_eq!(live["season"]["number"], 1);
+        assert_eq!(live["finished"], false);
+        assert_eq!(live["past"], json!([]));
+        assert!(live["season"]["secs_left"].as_u64().unwrap() > 0);
+        assert_eq!(live["rows"].as_array().unwrap().len(), 2);
+        // only the operator ends a season
+        assert_eq!(
+            api.handle(req("POST", "/v1/admin/season_end", json!({"token": "bad"})))
+                .status,
+            403
+        );
+        let next =
+            json_of(api.handle(req("POST", "/v1/admin/season_end", json!({"token": "tok"}))));
+        assert_eq!(next["number"], 2);
+        let live = json_of(api.handle(req("GET", &format!("/leaderboard?key={ka}"), Value::Null)));
+        assert_eq!(live["season"]["number"], 2);
+        assert_eq!(live["rows"], json!([]), "records restart");
+        assert_eq!(live["past"], json!([1]));
+        let old = json_of(api.handle(req(
+            "GET",
+            &format!("/leaderboard?key={ka}&season=1"),
+            Value::Null,
+        )));
+        assert_eq!(old["finished"], true);
+        assert_eq!(old["season"]["number"], 1);
+        let rows = old["rows"].as_array().unwrap();
+        assert_eq!(rows[0]["id"].as_u64(), Some(a));
+        assert_eq!(rows[0]["wins"], 3);
+        assert_eq!(rows[0]["rating"], 1244);
+        assert_eq!(old["me"][0], 1);
+        // the profile keeps season 1's badge; the rating soft-reset
+        let p = json_of(api.handle(req("GET", &format!("/profile/{a}"), Value::Null)));
+        assert_eq!(p["rating"], 1222);
+        assert_eq!(
+            p["last_season"],
+            json!({"season": 1, "rating": 1244, "rank": 1, "tier": "SILVER"})
+        );
+        // typed as a client of 0.6 reads it
+        let typed: Leaderboard = serde_json::from_value(old).unwrap();
+        assert_eq!(typed.rows.len(), 2);
+        assert_eq!(
+            api.handle(req("GET", "/leaderboard?season=9", Value::Null))
+                .status,
+            404
+        );
     }
 
     fn official_api() -> Arc<Api> {

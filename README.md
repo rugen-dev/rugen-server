@@ -11,7 +11,8 @@ server: `play.rugen.dev`
 
 - **Accounts**: optional username and password (Argon2id), several devices.
 - **Lobby**: public and private rooms, spectators, rematch.
-- **Quick match and ranked**: Elo, seasons, leaderboard.
+- **Quick match and ranked**: Elo, 90-day seasons (final standings and tier
+  badges kept), leaderboards.
 - **Match relay**: UDP with a WebSocket fallback; players never see each
   other's IP. Optional Cloudflare TURN inside the free tier.
 - **Bring your own character**: matchup verdicts and verified temporary

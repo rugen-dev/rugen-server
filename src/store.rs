@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rugen_proto::{ProfileInfo, Season, rank_name};
+use rugen_proto::{ProfileInfo, Season, SeasonBadge, Standing, rank_name};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Deserialize;
 
@@ -33,6 +33,8 @@ pub struct Account {
     pub last_seen: u64,
     /// Named account (API 5): unique username (`name` equals it).
     pub username: Option<String>,
+    /// How the last season it played ended for it (the profile badge).
+    pub last_season: Option<SeasonBadge>,
 }
 
 impl Account {
@@ -47,6 +49,7 @@ impl Account {
             losses: self.losses,
             rank: rank_name(self.rating).to_string(),
             verified: self.username.is_some(),
+            last_season: self.last_season.clone(),
         }
     }
 
@@ -63,6 +66,16 @@ impl Account {
             created: r.get::<_, i64>(8)? as u64,
             last_seen: r.get::<_, i64>(9)? as u64,
             username: r.get(10)?,
+            last_season: match (
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, Option<i32>>(12)?,
+                r.get::<_, Option<i64>>(13)?,
+            ) {
+                (Some(n), Some(rating), Some(rank)) => {
+                    Some(SeasonBadge::new(n as u32, rating, rank as u32))
+                }
+                _ => None,
+            },
         })
     }
 }
@@ -71,8 +84,8 @@ impl Account {
 const ACCOUNT_COLS: &str =
     "id, key, name, avatar, rating, best_rating, wins, losses, created, last_seen";
 /// Columns [`Account::from_row`] reads.
-const ACCOUNT_SELECT: &str =
-    "id, key, name, avatar, rating, best_rating, wins, losses, created, last_seen, username";
+const ACCOUNT_SELECT: &str = "id, key, name, avatar, rating, best_rating, wins, losses, created, \
+     last_seen, username, last_season, last_rating, last_rank";
 
 /// Keys (devices) a named account keeps; the least recently used go first.
 pub const MAX_SESSIONS: i64 = 10;
@@ -215,7 +228,31 @@ const MIGRATIONS: &[&str] = &[
          last_used INTEGER NOT NULL
      );
      CREATE INDEX account_keys_account ON account_keys(account, last_used);",
+    // v7: ranked seasons: each finished season (dates, players), its final
+    // standings, and the badge of the last season an account finished
+    "CREATE TABLE seasons (
+         number INTEGER PRIMARY KEY,
+         start INTEGER NOT NULL,
+         end INTEGER NOT NULL,
+         players INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE TABLE season_results (
+         season INTEGER NOT NULL,
+         account INTEGER NOT NULL,
+         rating INTEGER NOT NULL,
+         wins INTEGER NOT NULL,
+         losses INTEGER NOT NULL,
+         rank INTEGER NOT NULL,
+         PRIMARY KEY (season, account)
+     );
+     CREATE INDEX season_results_rank ON season_results(season, rank);
+     ALTER TABLE accounts ADD COLUMN last_season INTEGER;
+     ALTER TABLE accounts ADD COLUMN last_rating INTEGER;
+     ALTER TABLE accounts ADD COLUMN last_rank INTEGER;",
 ];
+
+/// Finished seasons a leaderboard can go back to.
+pub const PAST_SEASONS: usize = 12;
 
 /// Rating every character fingerprint starts from.
 pub const CHAR_START_RATING: i32 = 1500;
@@ -855,6 +892,36 @@ impl Store {
         self.read(|d| d.season())
     }
 
+    /// End the current season now (operator): standings are kept, ratings
+    /// soft-reset, the next season starts at once.
+    pub fn end_season_now(&self) -> DbResult<Season> {
+        self.write(|d| {
+            d.set_meta("season_start", now() as i64 - SEASON_SECS as i64)?;
+            d.roll_season()?;
+            d.season()
+        })
+    }
+
+    /// A finished season (`None`: unknown, or the current one).
+    pub fn past_season(&self, number: u32) -> DbResult<Option<Season>> {
+        self.read(|d| d.past_season(number))
+    }
+
+    /// Finished seasons with standings, newest first.
+    pub fn past_seasons(&self) -> DbResult<Vec<u32>> {
+        self.read(|d| d.past_seasons())
+    }
+
+    /// Final standings of a finished season, best first.
+    pub fn season_board(&self, number: u32, limit: usize) -> DbResult<Vec<ProfileInfo>> {
+        self.read(|d| d.season_board(number, limit))
+    }
+
+    /// An account's final position and line in a finished season.
+    pub fn season_rank_of(&self, number: u32, id: u64) -> DbResult<Option<(usize, ProfileInfo)>> {
+        self.read(|d| d.season_rank_of(number, id))
+    }
+
     pub fn account_count(&self) -> DbResult<usize> {
         self.read(|d| d.account_count())
     }
@@ -1464,19 +1531,17 @@ impl Db<'_> {
         Ok(())
     }
 
-    /// Start a new season when the current one is over: ratings soft-reset toward 1200.
+    /// Start a new season when the current one is over: its standings are
+    /// kept, ratings soft-reset toward 1200 ([`rugen_proto::season_reset`]).
     pub fn roll_season(&self) -> DbResult<()> {
         let mut season = self.meta("season")?.unwrap_or(1);
         let mut start = self.meta("season_start")?.unwrap_or(now() as i64);
         let before = season;
         while now() as i64 >= start + SEASON_SECS as i64 {
+            let end = start + SEASON_SECS as i64;
+            self.end_season(season as u32, start, end)?;
             season += 1;
-            start += SEASON_SECS as i64;
-            self.conn
-                .prepare_cached(
-                    "UPDATE accounts SET rating = (rating + ?1) / 2, wins = 0, losses = 0",
-                )?
-                .execute([elo::START_RATING])?;
+            start = end;
         }
         if season != before {
             self.set_meta("season", season)?;
@@ -1484,6 +1549,124 @@ impl Db<'_> {
             log::info!("season {season} started");
         }
         Ok(())
+    }
+
+    /// Close season `number` ([`rugen_proto::season_reset`] decides):
+    /// final standings and badges of the players who played, then every
+    /// rating soft-resets and records restart at 0-0.
+    fn end_season(&self, number: u32, start: i64, end: i64) -> DbResult<()> {
+        let standings: Vec<Standing> = {
+            let mut st = self
+                .conn
+                .prepare_cached("SELECT id, rating, wins, losses FROM accounts")?;
+            st.query_map([], |r| {
+                Ok(Standing {
+                    account: r.get::<_, i64>(0)? as u64,
+                    rating: r.get(1)?,
+                    wins: r.get(2)?,
+                    losses: r.get(3)?,
+                })
+            })?
+            .collect::<DbResult<_>>()?
+        };
+        let reset = rugen_proto::season_reset(&standings);
+        self.conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO seasons (number, start, end, players) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![number, start, end, reset.results.len() as i64])?;
+        for &(account, rating, wins, losses, rank) in &reset.results {
+            self.conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO season_results (season, account, rating, wins, losses, rank)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?
+                .execute(params![number, account as i64, rating, wins, losses, rank])?;
+            self.conn
+                .prepare_cached(
+                    "UPDATE accounts SET last_season = ?2, last_rating = ?3, last_rank = ?4 WHERE id = ?1",
+                )?
+                .execute(params![account as i64, number, rating, rank])?;
+        }
+        let before: std::collections::HashMap<u64, i32> =
+            standings.iter().map(|s| (s.account, s.rating)).collect();
+        for &(account, rating) in &reset.ratings {
+            if before.get(&account) != Some(&rating) {
+                self.conn
+                    .prepare_cached("UPDATE accounts SET rating = ?2 WHERE id = ?1")?
+                    .execute(params![account as i64, rating])?;
+            }
+        }
+        self.conn
+            .prepare_cached("UPDATE accounts SET wins = 0, losses = 0")?
+            .execute([])?;
+        log::info!(
+            "season {number} ended: {} players ranked",
+            reset.results.len()
+        );
+        Ok(())
+    }
+
+    fn past_season(&self, number: u32) -> DbResult<Option<Season>> {
+        self.conn
+            .prepare_cached("SELECT start, end FROM seasons WHERE number = ?1")?
+            .query_row([number], |r| {
+                Ok(Season {
+                    number,
+                    name: format!("SEASON {number}"),
+                    started_at: r.get::<_, i64>(0)?.max(0) as u64,
+                    ends_at: r.get::<_, i64>(1)?.max(0) as u64,
+                    secs_left: 0,
+                })
+            })
+            .optional()
+    }
+
+    fn past_seasons(&self) -> DbResult<Vec<u32>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT number FROM seasons WHERE players > 0 ORDER BY number DESC LIMIT ?1",
+        )?;
+        st.query_map([PAST_SEASONS as i64], |r| r.get(0))?.collect()
+    }
+
+    /// A finished season's line of an account as a profile (its final
+    /// rating, record and tier).
+    fn season_row(r: &Row<'_>) -> DbResult<(usize, ProfileInfo)> {
+        let mut a = Account::from_row(r)?;
+        a.rating = r.get(14)?;
+        a.wins = r.get(15)?;
+        a.losses = r.get(16)?;
+        Ok((r.get::<_, i64>(17)? as usize, a.info()))
+    }
+
+    fn season_board(&self, number: u32, limit: usize) -> DbResult<Vec<ProfileInfo>> {
+        let cols = ACCOUNT_SELECT
+            .split(", ")
+            .map(|c| format!("a.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {cols}, s.rating, s.wins, s.losses, s.rank FROM season_results s
+             JOIN accounts a ON a.id = s.account WHERE s.season = ?1 ORDER BY s.rank LIMIT ?2"
+        ))?;
+        st.query_map(params![number, limit as i64], Self::season_row)?
+            .map(|r| r.map(|(_, p)| p))
+            .collect()
+    }
+
+    fn season_rank_of(&self, number: u32, id: u64) -> DbResult<Option<(usize, ProfileInfo)>> {
+        let cols = ACCOUNT_SELECT
+            .split(", ")
+            .map(|c| format!("a.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {cols}, s.rating, s.wins, s.losses, s.rank FROM season_results s
+                 JOIN accounts a ON a.id = s.account WHERE s.season = ?1 AND s.account = ?2"
+            ))?
+            .query_row(params![number, id as i64], Self::season_row)
+            .optional()
     }
 
     /// The current season is over ([`Self::roll_season`] has work to do).
@@ -1495,10 +1678,13 @@ impl Db<'_> {
     pub fn season(&self) -> DbResult<Season> {
         let number = self.meta("season")?.unwrap_or(1) as u32;
         let start = self.meta("season_start")?.unwrap_or(0) as u64;
+        let ends_at = start + SEASON_SECS;
         Ok(Season {
             number,
             name: format!("SEASON {number}"),
-            ends_at: start + SEASON_SECS,
+            ends_at,
+            started_at: start,
+            secs_left: ends_at.saturating_sub(now()),
         })
     }
 
@@ -1557,6 +1743,10 @@ impl Db<'_> {
             .execute([])?;
             tx.prepare_cached("DELETE FROM flags WHERE account IN (SELECT id FROM doomed)")?
                 .execute([])?;
+            tx.prepare_cached(
+                "DELETE FROM season_results WHERE account IN (SELECT id FROM doomed)",
+            )?
+            .execute([])?;
             tx.prepare_cached("DELETE FROM accounts WHERE id IN (SELECT id FROM doomed)")?
                 .execute([])?;
         }
@@ -1589,6 +1779,7 @@ impl Db<'_> {
             created: t,
             last_seen: t,
             username: None,
+            last_season: None,
         };
         self.conn.prepare_cached(&format!("INSERT INTO accounts ({ACCOUNT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"))?.execute(params![
                 a.id as i64, a.key, a.name, a.avatar, a.rating, a.best_rating, a.wins, a.losses,
@@ -2993,9 +3184,10 @@ mod tests {
             tx.commit().unwrap();
         }
         let s = Store::open(Some(&dir)).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 6);
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len());
         let a = s.by_key(&"cd".repeat(32)).unwrap().unwrap();
         assert_eq!((a.name.as_str(), a.rating, a.username), ("OLD", 1300, None));
+        assert!(a.last_season.is_none(), "no season finished yet");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3303,6 +3495,59 @@ mod tests {
         assert_eq!(s.season().unwrap().number, 2);
         let acc = s.by_id(a).unwrap().unwrap();
         assert_eq!((acc.rating, acc.wins), (1400, 0));
+        // season 1's standings stay, and the badge rides on the profile
+        assert_eq!(s.past_seasons().unwrap(), vec![1]);
+        let badge = acc.info().last_season.unwrap();
+        assert_eq!((badge.season, badge.rating, badge.rank), (1, 1600, 1));
+        assert_eq!(badge.tier, "PLATINUM");
+        let board = s.season_board(1, 10).unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!((board[0].rating, board[0].wins), (1600, 3));
+        let (pos, line) = s.season_rank_of(1, a).unwrap().unwrap();
+        assert_eq!((pos, line.rating), (1, 1600));
+        let past = s.past_season(1).unwrap().unwrap();
+        assert_eq!(past.ends_at - past.started_at, SEASON_SECS);
+        assert!(s.past_season(2).unwrap().is_none(), "season 2 is running");
+        let now_s = s.season().unwrap();
+        assert_eq!(now_s.started_at, past.ends_at);
+        assert!(now_s.secs_left > 0 && now_s.secs_left <= SEASON_SECS);
+    }
+
+    #[test]
+    fn an_operator_ends_a_season_with_only_players_ranked() {
+        let s = Store::open(None).unwrap();
+        let a = s.register().unwrap().id;
+        let b = s.register().unwrap().id;
+        let idle = s.register().unwrap().id;
+        s.writer_conn()
+            .execute_batch(&format!(
+                "UPDATE accounts SET rating = 1300, wins = 2, losses = 1 WHERE id = {a};
+                 UPDATE accounts SET rating = 1500, wins = 4 WHERE id = {b};
+                 UPDATE accounts SET rating = 1000 WHERE id = {idle};"
+            ))
+            .unwrap();
+        let next = s.end_season_now().unwrap();
+        assert_eq!(next.number, 2);
+        let board = s.season_board(1, 10).unwrap();
+        assert_eq!(
+            board.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![b, a],
+            "best first, idle accounts not ranked"
+        );
+        let ratings: Vec<i32> = [a, b, idle]
+            .iter()
+            .map(|&i| s.by_id(i).unwrap().unwrap().rating)
+            .collect();
+        assert_eq!(ratings, vec![1250, 1350, 1100]);
+        assert!(s.by_id(idle).unwrap().unwrap().last_season.is_none());
+        assert_eq!(s.by_id(a).unwrap().unwrap().last_season.unwrap().rank, 2);
+        assert_eq!(s.leaderboard(10).unwrap().len(), 0, "records restart");
+        // the profile of an account that never finished a season is unchanged
+        assert!(
+            !serde_json::to_string(&s.by_id(idle).unwrap().unwrap().info())
+                .unwrap()
+                .contains("last_season")
+        );
     }
 
     #[test]
