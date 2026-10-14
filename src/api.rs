@@ -7,12 +7,17 @@
 //! POST /profile                 {key, name?, avatar?}
 //! GET  /profile/{id}
 //! GET  /rooms                   public lobby (RoomSummary[])
-//! POST /room                    {key, char, name?, public?, password?, rules?, max_spectators?}
-//! POST /room/{code}/join        {key, char, password?, spectate?}
+//! POST /room                    {key, char, name?, public?, password?, rules?, max_spectators?,
+//!                               tournament?: 8 | 16}
+//! POST /room/{code}/join        {key, char, password?, spectate?, tournament?: true (the
+//!                               client knows brackets; required for tournament rooms)}
 //! GET  /room/{code}?key=        RoomInfo (also a heartbeat)
 //! POST /room/{code}/leave       {key}
 //! POST /room/{code}/kick        {key, id}       host only
 //! POST /room/{code}/rematch     {key}           both players → new match
+//! POST /room/{code}/start       {key}           host of a tournament room: draw the
+//!                               bracket (≥ 2 entrants, seeded by rating); the server
+//!                               then calls each match (room.tournament)
 //! POST /queue                   {key, char, ranked?, max_ping?, rtt_ms?}
 //! GET  /queue?key=              QueueStatus (found match once paired)
 //! DELETE /queue (or POST /queue/leave) {key}
@@ -82,6 +87,9 @@
 //!                                  of the last season the player finished)
 //! Season (GET /seasons/current, leaderboard.season)
 //!                                started_at, secs_left
+//! RoomInfo                       tournament: {size, state, entrants, rounds, live, champion}
+//! RoomSummary                    tournament: {size, entrants, state}
+//! POST /result                   rounds: [p1, p2] (rounds won; the bracket's score)
 //! Leaderboard                    past: [season], finished: bool, fighter, fighters
 //!                                  (per-fighter boards)
 //! ```
@@ -119,6 +127,7 @@ use crate::password;
 use crate::relay::Relay;
 use crate::resim::ResimConfig;
 use crate::store::{Account, DbResult, ReportData, Store, random_code, setup_fingerprints};
+use crate::tournament::{self, Bracket, Seed, Tournament};
 use crate::truth::{Truth, TruthConfig};
 use crate::turn::{Turn, TurnConfig};
 use crate::workers::Workers;
@@ -171,6 +180,12 @@ const MEMBER_TIMEOUT_SECS: u64 = 45;
 const ROOM_MAX_AGE_SECS: u64 = 6 * 3600;
 const MAX_ROOMS: usize = 5_000;
 const MAX_SPECTATORS: u8 = 6;
+/// Spectator seats of a tournament room (besides the entrants, who watch
+/// when they do not play).
+const TOURNAMENT_SPECTATORS: u8 = 16;
+/// Role of a tournament entrant (members: 0 host, 1 challenger, 2
+/// spectator, 3 entrant).
+const ROLE_ENTRANT: u8 = 3;
 
 struct Member {
     account: u64,
@@ -199,6 +214,8 @@ struct Room {
     /// The host's game version: only clients of the same version may join
     /// (both sides run the same simulation).
     engine: Option<String>,
+    /// A tournament room: its bracket (see [`crate::tournament`]).
+    tournament: Option<Tournament>,
 }
 
 impl Room {
@@ -830,6 +847,7 @@ impl Api {
             ("POST", ["room", code, "leave"]) => self.leave_room(&req, &v, code),
             ("POST", ["room", code, "kick"]) => self.kick(&req, &v, code),
             ("POST", ["room", code, "rematch"]) => self.rematch(&req, &v, code),
+            ("POST", ["room", code, "start"]) => self.start_tournament(&req, &v, code),
             ("POST", ["queue"]) => self.enter_queue(&req, &v),
             ("GET", ["queue"]) => self.poll_queue(&req, &v),
             ("DELETE", ["queue"]) | ("POST", ["queue", "leave"]) => self.leave_queue(&req, &v),
@@ -1049,6 +1067,16 @@ impl Api {
         });
         let hub = lock(&self.hub);
         let my_role = r.member(me).map_or(2, |m| m.role);
+        // a tournament room: the called pair plays as host / challenger
+        let called = r.tournament.as_ref().and_then(|t| {
+            let (round, i, _) = t.called?;
+            t.bracket.as_ref()?.players(round, i)
+        });
+        let my_role = match (&r.tournament, called) {
+            (Some(_), Some(p)) if p.contains(&me) => u8::from(p[1] == me),
+            (Some(_), _) => 2,
+            (None, _) => my_role,
+        };
         let host = r.player(0);
         let chal = r.player(1);
         let p1_char = host.map(|m| m.char_id.clone()).unwrap_or_default();
@@ -1057,9 +1085,12 @@ impl Api {
             (Some(c), _) => c.char_id.clone(),
             (None, _) => String::new(),
         };
-        let opponent = match my_role {
-            0 => chal.map(|m| Self::profile(store, m.account)),
-            1 => host.map(|m| Self::profile(store, m.account)),
+        let opponent = match (called, my_role) {
+            (Some(p), 0 | 1) if r.tournament.is_some() => {
+                Some(Self::profile(store, p[1 - my_role as usize]))
+            }
+            (_, 0) => chal.map(|m| Self::profile(store, m.account)),
+            (_, 1) => host.map(|m| Self::profile(store, m.account)),
             _ => None,
         };
         let est_ping_ms = match (host, chal) {
@@ -1100,6 +1131,31 @@ impl Api {
             est_ping_ms,
             ticket: my_ticket,
             matchup,
+            tournament: r.tournament.as_ref().map(|t| {
+                let seeds: Vec<(u64, u8)> = match &t.bracket {
+                    Some(b) => b
+                        .seeds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (s.account, i as u8 + 1))
+                        .collect(),
+                    None => t.entrants.iter().map(|&a| (a, 0)).collect(),
+                };
+                let entrants = seeds
+                    .into_iter()
+                    .map(|(a, seed)| {
+                        let p = Self::profile(store, a);
+                        rugen_proto::Entrant {
+                            id: a,
+                            name: p.name,
+                            verified: p.verified,
+                            rating: p.rating,
+                            seed,
+                        }
+                    })
+                    .collect();
+                t.view(entrants)
+            }),
         }
     }
 
@@ -1176,6 +1232,14 @@ impl Api {
                         locked: r.password.is_some(),
                         in_match: r.running.is_some(),
                         api: r.api,
+                        tournament: r.tournament.as_ref().map(|t| rugen_proto::TournamentBrief {
+                            size: t.size,
+                            entrants: match &t.bracket {
+                                Some(b) => b.seeds.len(),
+                                None => t.entrants.len(),
+                            } as u8,
+                            state: t.state().into(),
+                        }),
                     },
                 )
             })
@@ -1212,15 +1276,35 @@ impl Api {
         while rooms.contains_key(&code) {
             code = random_code();
         }
+        let tour = v
+            .get("tournament")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .map(|n| {
+                tournament::SIZES
+                    .iter()
+                    .copied()
+                    .find(|s| u64::from(*s) == n)
+                    .ok_or_else(|| err(400, "a tournament has 8 or 16 players"))
+            })
+            .transpose()?
+            .map(|size| {
+                let mut t = Tournament::new(size);
+                t.entrants.push(me.id);
+                t
+            });
         let room = Room {
             name,
             public: v.get("public").and_then(Value::as_bool).unwrap_or(true),
             password,
             rules,
-            max_spectators: v
-                .get("max_spectators")
-                .and_then(Value::as_u64)
-                .map_or(2, |n| n.min(MAX_SPECTATORS as u64) as u8),
+            max_spectators: if tour.is_some() {
+                TOURNAMENT_SPECTATORS
+            } else {
+                v.get("max_spectators")
+                    .and_then(Value::as_u64)
+                    .map_or(2, |n| n.min(MAX_SPECTATORS as u64) as u8)
+            },
             members: vec![Member {
                 account: me.id,
                 role: 0,
@@ -1234,6 +1318,7 @@ impl Api {
             matchup: None,
             api: req.api,
             engine: req.engine.clone(),
+            tournament: tour,
         };
         let view = self.room_view(s, &code, &room, me.id);
         rooms.insert(code.clone(), room);
@@ -1272,7 +1357,21 @@ impl Api {
                     return Err(err(403, "wrong password"));
                 }
             }
-            let role = if !spectate && r.player(1).is_none() {
+            // a bracket needs a client that knows brackets (0.6 does not)
+            if r.tournament.is_some() && v.get("tournament").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(err(
+                    409,
+                    "this room runs a tournament bracket: update rugen to join",
+                ));
+            }
+            let entrant = r
+                .tournament
+                .as_ref()
+                .is_some_and(|t| t.state() == "open" && !t.full());
+            let role = if r.tournament.is_some() && !spectate && entrant {
+                ROLE_ENTRANT
+            } else if r.tournament.is_none() && !spectate && r.player(1).is_none() {
                 1
             } else if r.spectators() < r.max_spectators {
                 2
@@ -1289,6 +1388,11 @@ impl Api {
                 ready: true,
             });
             log::info!("room {code}: {} joined as role {role}", me.id);
+            if role == ROLE_ENTRANT
+                && let Some(t) = r.tournament.as_mut()
+            {
+                t.entrants.push(me.id);
+            }
             if role == 1 && r.running.is_none() && r.matchup.is_none() {
                 self.start_match(s, r, &code)?;
             }
@@ -1309,6 +1413,11 @@ impl Api {
             m.last_seen = Instant::now();
         }
         self.expire_rooms(&mut rooms);
+        if let Some(r) = rooms.get_mut(&code)
+            && r.tournament.is_some()
+        {
+            self.tick_tournament(s, &code, r)?;
+        }
         let r = rooms.get(&code).ok_or_else(|| err(404, "no such room"))?;
         if r.member(me.id).is_none() {
             return Err(err(401, "not in this room"));
@@ -1324,8 +1433,17 @@ impl Api {
         if let Some(r) = rooms.get_mut(&code) {
             self.fail_matchup_of(s, r, me.id, "your opponent left");
             r.members.retain(|m| m.account != me.id);
+            if let Some(t) = r.tournament.as_mut()
+                && t.bracket.is_none()
+            {
+                t.entrants.retain(|&a| a != me.id);
+            }
             // a player left (or the host closed the room): the match is over
-            if r.player(0).is_none() || r.player(1).is_none() {
+            let gone = match r.running.as_ref() {
+                Some(run) if r.tournament.is_some() => run.slots[..2].contains(&me.id),
+                _ => r.player(0).is_none() || r.player(1).is_none(),
+            };
+            if gone {
                 if let Some(run) = r.running.take() {
                     self.relay.close(run.session);
                 }
@@ -1365,6 +1483,11 @@ impl Api {
         }
         self.fail_matchup_of(s, r, target, "a player was removed");
         r.members.retain(|m| m.account != target);
+        if let Some(t) = r.tournament.as_mut()
+            && t.bracket.is_none()
+        {
+            t.entrants.retain(|&a| a != target);
+        }
         r.kicked.push(target);
         if r.running
             .as_ref()
@@ -1387,6 +1510,9 @@ impl Api {
         let r = rooms
             .get_mut(&code)
             .ok_or_else(|| err(404, "no such room"))?;
+        if r.tournament.is_some() {
+            return Err(err(409, "the server calls the matches of a bracket"));
+        }
         let m = r
             .members
             .iter_mut()
@@ -1400,6 +1526,235 @@ impl Api {
             self.broadcast(s, &code, r);
         }
         ok(&self.room_view(s, &code, r, me.id))
+    }
+
+    // ---- tournaments
+
+    /// `POST /room/{code}/start`: the host draws the bracket with the
+    /// entrants so far (at least two; seeded by rating) and the server
+    /// starts calling matches. A finished tournament starts again.
+    fn start_tournament(&self, req: &Request, v: &Value, code: &str) -> Res {
+        let s = &self.store;
+        let me = self.auth(s, req, v)?;
+        let code = code.trim().to_ascii_uppercase();
+        let mut rooms = lock(&self.rooms);
+        let r = rooms
+            .get_mut(&code)
+            .ok_or_else(|| err(404, "no such room"))?;
+        if r.player(0).is_none_or(|h| h.account != me.id) {
+            return Err(err(403, "only the host starts the bracket"));
+        }
+        let members: Vec<u64> = r.members.iter().map(|m| m.account).collect();
+        let t = r
+            .tournament
+            .as_mut()
+            .ok_or_else(|| err(409, "not a tournament room"))?;
+        if t.state() == "running" {
+            return Err(err(409, "the bracket is running"));
+        }
+        if t.state() == "done" {
+            // a new tournament with whoever is still in the room
+            let old = t.bracket.take().map(|b| b.seeds).unwrap_or_default();
+            t.entrants = old
+                .iter()
+                .map(|s| s.account)
+                .filter(|a| members.contains(a))
+                .collect();
+            t.scores.clear();
+        }
+        t.entrants.retain(|a| members.contains(a));
+        if t.entrants.len() < 2 {
+            return Err(err(409, "a bracket needs at least two players"));
+        }
+        let mut seeds = Vec::new();
+        for &a in &t.entrants {
+            let rating = db(s.by_id(a))?.map_or(crate::elo::START_RATING, |x| x.rating);
+            seeds.push(Seed { account: a, rating });
+        }
+        t.bracket = Some(Bracket::draw(t.size as usize, &seeds));
+        t.called = None;
+        t.started = false;
+        t.next_at = None;
+        log::info!(
+            "room {code}: bracket of {} drawn ({} places)",
+            seeds.len(),
+            t.size
+        );
+        self.tick_tournament(s, &code, r)?;
+        self.broadcast(s, &code, r);
+        ok(&self.room_view(s, &code, r, me.id))
+    }
+
+    /// Every tournament room moves on (the server's timer).
+    pub fn sweep_tournaments(&self) {
+        let s = &self.store;
+        let mut rooms = lock(&self.rooms);
+        let codes: Vec<String> = rooms
+            .iter()
+            .filter(|(_, r)| {
+                r.tournament
+                    .as_ref()
+                    .is_some_and(|t| t.state() == "running")
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        for code in codes {
+            if let Some(r) = rooms.get_mut(&code)
+                && let Err(e) = self.tick_tournament(s, &code, r)
+            {
+                log::warn!("room {code}: bracket not advanced ({})", e.status);
+            }
+        }
+    }
+
+    /// Move a running bracket on: record the called match's settled result
+    /// (or a walkover), then call the next match after a pause. Broadcasts
+    /// when something changed.
+    fn tick_tournament(&self, store: &Store, code: &str, r: &mut Room) -> Result<(), Response> {
+        let members: Vec<u64> = r.members.iter().map(|m| m.account).collect();
+        let Some(t) = r.tournament.as_mut() else {
+            return Ok(());
+        };
+        if t.state() != "running" {
+            return Ok(());
+        }
+        let mut changed = false;
+        if let Some((round, i, at)) = t.called {
+            let Some(b) = t.bracket.as_mut() else {
+                return Ok(());
+            };
+            let Some(players) = b.players(round, i) else {
+                t.called = None;
+                return Ok(());
+            };
+            let match_id = b.rounds[round][i].match_id.unwrap_or(0);
+            let (started, failed, progress) = {
+                let ms = lock(&self.matchups);
+                match ms.get(&match_id) {
+                    Some(m) => (
+                        m.started.is_some(),
+                        m.failed.is_some(),
+                        [0, 1].map(|s| {
+                            u8::from(m.picks[s].is_some())
+                                + u8::from(m.accepted[s])
+                                + u8::from(m.ready[s].is_some())
+                        }),
+                    ),
+                    None => (false, true, [0, 0]),
+                }
+            };
+            if started && !t.started {
+                t.started = true;
+                changed = true;
+            }
+            let outcome = db(store.match_result(match_id, players[0]))?;
+            let decided: Option<u64> = match outcome {
+                Some((_, _, Some(w), _, _)) => Some(w),
+                Some((_, _, None, _, true)) => {
+                    // disputed: called again once, then the higher seed
+                    if b.rounds[round][i].replays < tournament::MAX_REPLAYS {
+                        b.rounds[round][i].replays += 1;
+                        t.called = None;
+                        t.started = false;
+                        t.next_at = Some(Instant::now());
+                        changed = true;
+                        None
+                    } else {
+                        Some(players[0])
+                    }
+                }
+                _ => None,
+            };
+            let walkover = || -> u64 {
+                // the one still here, else the one further on, else the higher seed
+                match (members.contains(&players[0]), members.contains(&players[1])) {
+                    (true, false) => players[0],
+                    (false, true) => players[1],
+                    _ if progress[1] > progress[0] => players[1],
+                    _ => players[0],
+                }
+            };
+            let gone = players.iter().any(|p| !members.contains(p));
+            let decided = decided.or_else(|| {
+                if t.called.is_none() {
+                    None
+                } else if failed && !started {
+                    if b.rounds[round][i].replays < tournament::MAX_REPLAYS && !gone {
+                        b.rounds[round][i].replays += 1;
+                        t.called = None;
+                        t.next_at = Some(Instant::now());
+                        changed = true;
+                        None
+                    } else {
+                        Some(walkover())
+                    }
+                } else if !started
+                    && (gone || at.elapsed().as_secs() > tournament::CALL_TIMEOUT_SECS)
+                {
+                    Some(walkover())
+                } else {
+                    None
+                }
+            });
+            if let Some(w) = decided {
+                let score = t.scores.get(&match_id).copied().unwrap_or([0, 0]);
+                b.record(round, i, w, score);
+                log::info!("room {code}: bracket match {match_id} won by {w}");
+                t.called = None;
+                t.started = false;
+                t.next_at = Some(Instant::now() + Duration::from_secs(tournament::NEXT_DELAY_SECS));
+                if let Some(c) = b.champion() {
+                    log::info!("room {code}: {c} wins the tournament");
+                }
+                changed = true;
+                // the room is free for the next match
+                if let Some(run) = r.running.take() {
+                    self.relay.close(run.session);
+                }
+                r.matchup = None;
+            }
+        }
+        let Some(t) = r.tournament.as_mut() else {
+            return Ok(());
+        };
+        let due = t.next_at.is_none_or(|n| Instant::now() >= n);
+        if t.called.is_none() && due && t.state() == "running" {
+            let Some(b) = t.bracket.as_mut() else {
+                return Ok(());
+            };
+            if let Some((round, i)) = b.next()
+                && let Some(players) = b.players(round, i)
+            {
+                let setup = json!({ "rules": r.rules, "tournament": true }).to_string();
+                let match_id = db(store.new_match(players, false, &setup))?;
+                b.rounds[round][i].match_id = Some(match_id);
+                let m = Matchup::new(
+                    match_id,
+                    players,
+                    false,
+                    r.rules.clone(),
+                    Some(code.to_string()),
+                );
+                lock(&self.matchups).insert(match_id, m);
+                if let Some(old) = r.running.take() {
+                    self.relay.close(old.session);
+                }
+                r.matchup = Some(match_id);
+                t.called = Some((round, i, Instant::now()));
+                t.started = false;
+                t.next_at = None;
+                log::info!(
+                    "room {code}: bracket calls {} v {} (match {match_id})",
+                    players[0],
+                    players[1]
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            self.broadcast(store, code, r);
+        }
+        Ok(())
     }
 
     // ---- queue (quick match and ranked)
@@ -1629,6 +1984,24 @@ impl Api {
         let out = db(s.report(me, match_id, &data))?;
         if !out.accepted {
             return Err(err(404, "not your match"));
+        }
+        // a bracket shows the score (rounds won by P1, P2: additive)
+        if let Some(r) = v
+            .get("rounds")
+            .and_then(|r| serde_json::from_value::<[u8; 2]>(r.clone()).ok())
+        {
+            for room in lock(&self.rooms).values_mut() {
+                if let Some(t) = room.tournament.as_mut()
+                    && t.bracket.as_ref().is_some_and(|b| {
+                        b.rounds
+                            .iter()
+                            .flatten()
+                            .any(|p| p.match_id == Some(match_id))
+                    })
+                {
+                    t.scores.insert(match_id, r.map(|n| n.min(9)));
+                }
+            }
         }
         // this player is done with TURN: settle and revoke its credential
         if let Some(t) = &self.turn {
@@ -2228,7 +2601,9 @@ impl Api {
         let code = m.room.clone();
         let room = code.as_ref().and_then(|c| rooms.get_mut(c));
         let mut slots = m.players.to_vec();
-        if let Some(r) = &room {
+        if let Some(r) = &room
+            && r.tournament.is_none()
+        {
             m.spectators = r
                 .members
                 .iter()
@@ -3844,6 +4219,132 @@ pub(crate) mod tests {
                 .status,
             400
         );
+    }
+
+    /// A tournament room: entrants join (clients that know brackets only),
+    /// the host draws the bracket, the server calls each match, records
+    /// settled results (with the reported score) and walkovers, and crowns
+    /// a champion.
+    #[test]
+    fn tournament_rooms_call_matches_to_a_champion() {
+        let api = api();
+        let people: Vec<(u64, String)> = (0..4).map(|_| register(&api)).collect();
+        let kh = people[0].1.clone();
+        let room = json_of(api.handle(req(
+            "POST",
+            "/room",
+            json!({"key": kh, "name": "Friday", "tournament": 8}),
+        )));
+        let code = room["code"].as_str().unwrap().to_string();
+        assert_eq!(room["tournament"]["state"], "open");
+        assert_eq!(room["tournament"]["size"], 8);
+        assert_eq!(room["max_spectators"], 16);
+        // a 0.6 client (no `tournament` flag) is told to update
+        let (_, old) = register(&api);
+        let r = api.handle(req(
+            "POST",
+            &format!("/room/{code}/join"),
+            json!({"key": old}),
+        ));
+        assert_eq!(r.status, 409);
+        for (_, k) in &people[1..] {
+            let v = json_of(api.handle(req(
+                "POST",
+                &format!("/room/{code}/join"),
+                json!({"key": k, "tournament": true}),
+            )));
+            assert_eq!(v["side"], 3, "entrants watch until called");
+            assert!(v["matchup"].is_null(), "joining starts no match");
+        }
+        let list = json_of(api.handle(req("GET", "/rooms", Value::Null)));
+        assert_eq!(list[0]["tournament"]["entrants"], 4);
+        // only the host starts
+        let r = api.handle(req(
+            "POST",
+            &format!("/room/{code}/start"),
+            json!({"key": people[1].1}),
+        ));
+        assert_eq!(r.status, 403);
+        let v = json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/start"),
+            json!({"key": kh}),
+        )));
+        let t = &v["tournament"];
+        assert_eq!(t["state"], "running");
+        assert_eq!(t["rounds"].as_array().unwrap().len(), 3);
+        // equal ratings: seeds in join order; 4 players in 8 places: seeds
+        // 1-4 face the empty places 8-5, so the semi-finals are called
+        assert_eq!(t["live"], json!([1, 0]));
+        let semi = &t["rounds"][1][0];
+        assert_eq!(semi["state"], "called");
+        let (p1, p2) = (semi["p1"].as_u64().unwrap(), semi["p2"].as_u64().unwrap());
+        assert_eq!((p1, p2), (people[0].0, people[3].0), "1 v 4");
+        let mid = semi["match_id"].as_u64().unwrap();
+        let view = |k: &str| {
+            json_of(api.handle(req("GET", &format!("/room/{code}?key={k}"), Value::Null)))
+        };
+        let key_of = |id: u64| people.iter().find(|p| p.0 == id).unwrap().1.clone();
+        let v1 = view(&key_of(p1));
+        assert_eq!(v1["side"], 1);
+        assert_eq!(v1["matchup"]["id"].as_u64(), Some(mid));
+        assert_eq!(v1["opponent"]["id"].as_u64(), Some(p2));
+        assert_eq!(view(&key_of(p2))["side"], 2);
+        assert_eq!(view(&people[1].1)["side"], 3);
+        // both report P2 won 2-1: recorded with the score after the sweep
+        for k in [key_of(p1), key_of(p2)] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": mid, "winner": p2, "rounds": [1, 2]}),
+            )));
+        }
+        api.sweep_tournaments();
+        let t = view(&kh)["tournament"].clone();
+        assert_eq!(t["rounds"][1][0]["winner"].as_u64(), Some(p2));
+        assert_eq!(t["rounds"][1][0]["score"], json!([1, 2]));
+        assert_eq!(t["rounds"][2][0]["p1"].as_u64(), Some(p2));
+        assert!(t["live"].is_null(), "a pause before the next call");
+        // skip the pause: the other semi-final is called
+        for r in lock(&api.rooms).values_mut() {
+            if let Some(t) = r.tournament.as_mut() {
+                t.next_at = None;
+            }
+        }
+        api.sweep_tournaments();
+        let t = view(&kh)["tournament"].clone();
+        assert_eq!(t["live"], json!([1, 1]));
+        // its P2 leaves the room: a walkover for the one still here
+        let semi2 = t["rounds"][1][1].clone();
+        let (q1, q2) = (semi2["p1"].as_u64().unwrap(), semi2["p2"].as_u64().unwrap());
+        json_of(api.handle(req(
+            "POST",
+            &format!("/room/{code}/leave"),
+            json!({"key": key_of(q2)}),
+        )));
+        api.sweep_tournaments();
+        let t = view(&kh)["tournament"].clone();
+        assert_eq!(t["rounds"][1][1]["winner"].as_u64(), Some(q1));
+        for r in lock(&api.rooms).values_mut() {
+            if let Some(t) = r.tournament.as_mut() {
+                t.next_at = None;
+            }
+        }
+        api.sweep_tournaments();
+        let t = view(&kh)["tournament"].clone();
+        assert_eq!(t["live"], json!([2, 0]), "the final");
+        let fin = t["rounds"][2][0]["match_id"].as_u64().unwrap();
+        for k in [key_of(p2), key_of(q1)] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": fin, "winner": q1}),
+            )));
+        }
+        api.sweep_tournaments();
+        let t = view(&kh)["tournament"].clone();
+        assert_eq!(t["state"], "done");
+        assert_eq!(t["champion"].as_u64(), Some(q1));
     }
 
     fn official_api() -> Arc<Api> {

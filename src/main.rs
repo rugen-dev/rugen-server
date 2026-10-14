@@ -120,6 +120,7 @@ mod store;
 mod sys;
 #[cfg(test)]
 mod testkit;
+mod tournament;
 mod truth;
 mod turn;
 mod udp;
@@ -702,6 +703,9 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
                 // flee / disconnect claims the relay can confirm
                 let a = r.clone();
                 let _ = tokio::task::spawn_blocking(move || a.sweep_claims()).await;
+                // tournament brackets: results, walkovers, the next call
+                let a = r.clone();
+                let _ = tokio::task::spawn_blocking(move || a.sweep_tournaments()).await;
             }
         });
         // package retention: TTL + LRU size cap

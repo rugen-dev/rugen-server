@@ -706,6 +706,7 @@ fn turn_match_through_a_tunnel_only_server() {
         compact: true,
         turn_bytes: s.turn.map(|t| (t.rx_wire, t.tx_wire)),
         ending: None,
+        rounds: None,
     };
     a.report(id, ida, &ev(&sa)).unwrap();
     let ack = b.report(id, ida, &ev(&sb)).unwrap();
