@@ -79,6 +79,11 @@ services:
     blkio_config:
       weight: 100
     pids_limit: 256
+    # Docker starts containers with 1024 open files: about 500 players
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     oom_score_adj: 500
     logging:
       driver: json-file
