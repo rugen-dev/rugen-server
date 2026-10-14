@@ -98,6 +98,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod api;
 mod backup;
+mod bench;
 mod compat;
 #[cfg(test)]
 mod e2e;
@@ -105,6 +106,7 @@ mod elo;
 mod http;
 mod hub;
 mod legacy;
+mod loadgen;
 mod matchmaking;
 mod matchup;
 mod packages;
@@ -625,6 +627,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
         truth: truth_cfg,
         turn: turn::TurnConfig::from_env(),
         high_ping_ms: env_f("RUGEN_HIGH_PING_MS").map_or(0, |v| v.max(1.0) as u32),
+        bench: std::env::var("RUGEN_BENCH").is_ok_and(|v| v.trim() == "1"),
         backup: backup::BackupSetting::from_env(),
     };
     if let backup::BackupSetting::Invalid(e) = &cfg.backup {
@@ -691,6 +694,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 every.tick().await;
                 r.sweep_relay();
+                r.sample_stats();
                 // flee / disconnect claims the relay can confirm
                 let a = r.clone();
                 let _ = tokio::task::spawn_blocking(move || a.sweep_claims()).await;

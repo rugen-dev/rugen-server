@@ -237,6 +237,8 @@ pub struct ApiConfig {
     pub high_ping_ms: u32,
     /// `RUGEN_BACKUP_*` ([`crate::backup`]).
     pub backup: BackupSetting,
+    /// `RUGEN_BENCH=1`: `POST /admin/bench` may run self-benchmarks.
+    pub bench: bool,
 }
 
 /// Matchups not started and untouched for this long fail.
@@ -300,6 +302,13 @@ pub struct Api {
     /// Re-simulations of disputed matches: one low-priority thread
     /// (when the server can re-simulate).
     resim: Option<Workers<u64>>,
+    /// Self-benchmark runs (`/admin/bench`).
+    bench: crate::bench::Bench,
+    started: Instant,
+    /// API requests handled (`/admin/stats` req/s).
+    requests: std::sync::atomic::AtomicU64,
+    /// (when, CPU seconds, requests, relayed datagrams), every few seconds.
+    samples: Mutex<std::collections::VecDeque<(Instant, f64, u64, u64)>>,
 }
 
 /// Disputes waiting for the re-simulation thread (match ids: a full queue
@@ -472,6 +481,10 @@ impl Api {
                     .ok()
                 })
                 .flatten(),
+            bench: crate::bench::Bench::default(),
+            started: Instant::now(),
+            requests: std::sync::atomic::AtomicU64::new(0),
+            samples: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -601,7 +614,105 @@ impl Api {
     }
 
     pub fn handle(&self, req: Request) -> Response {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.route(req).unwrap_or_else(|e| e)
+    }
+
+    /// Remember CPU / request / relay counters for `/admin/stats` (every
+    /// few seconds from the server's timer; the last 15 s are kept).
+    pub fn sample_stats(&self) {
+        let p = crate::loadgen::proc_sample(None);
+        let mut s = lock(&self.samples);
+        s.push_back((
+            Instant::now(),
+            p.cpu_secs,
+            self.requests.load(std::sync::atomic::Ordering::Relaxed),
+            self.relay
+                .forwarded
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
+        while s.len() > 1
+            && s.front()
+                .is_some_and(|f| f.0.elapsed() > Duration::from_secs(15))
+        {
+            s.pop_front();
+        }
+    }
+
+    /// Admin routes of the self-benchmark and live stats: `bench` routes
+    /// exist only with `RUGEN_BENCH=1`; all need the admin token (401).
+    fn ops_auth(&self, req: &Request, v: &Value, bench: bool) -> Result<(), Response> {
+        if bench && !self.cfg.bench {
+            return Err(err(404, "no such route"));
+        }
+        if self.truth.cfg.admin_token.is_none() {
+            return Err(err(404, "admin api disabled (set RUGEN_ADMIN_TOKEN)"));
+        }
+        let token = req
+            .bearer
+            .clone()
+            .or_else(|| v.get("token").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| req.query.get("token").cloned())
+            .unwrap_or_default();
+        if !self.truth.admin_ok(&token) {
+            return Err(err(401, "admin token required"));
+        }
+        Ok(())
+    }
+
+    /// `POST /admin/bench`: 202 {id} | 400 bad plan | 409 a run is going on.
+    fn bench_start(&self, req: &Request, v: &Value) -> Res {
+        self.ops_auth(req, v, true)?;
+        let plan = crate::bench::Plan::parse(v).map_err(|e| err(400, &e))?;
+        let secs = plan.duration().as_secs();
+        match self.bench.start(plan, self.cfg.data.clone()) {
+            Some(id) => {
+                log::warn!("admin: bench {id} started (about {secs} s)");
+                Ok(Response::json(
+                    202,
+                    &json!({ "id": id, "state": "running", "max_secs": secs, "note": crate::bench::NOTE }),
+                ))
+            }
+            None => Err(err(409, "a bench is running")),
+        }
+    }
+
+    /// `GET /admin/bench`: the last run.
+    fn bench_status(&self, req: &Request, v: &Value) -> Res {
+        self.ops_auth(req, v, true)?;
+        ok(&crate::bench::status_json(self.bench.status()))
+    }
+
+    /// `GET /admin/stats`: live numbers of this process.
+    fn admin_stats(&self, req: &Request, v: &Value) -> Res {
+        self.ops_auth(req, v, false)?;
+        let p = crate::loadgen::proc_sample(None);
+        let now = (
+            Instant::now(),
+            p.cpu_secs,
+            self.requests.load(std::sync::atomic::Ordering::Relaxed),
+            self.relay
+                .forwarded
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let first = lock(&self.samples).front().copied();
+        let (start_t, start_cpu, start_req, start_fwd) = first.unwrap_or((self.started, 0.0, 0, 0));
+        let secs = now.0.duration_since(start_t).as_secs_f64().max(0.001);
+        ok(&json!({
+            "uptime_secs": self.started.elapsed().as_secs(),
+            "threads": p.threads,
+            "rss_mb": (p.rss_mb * 10.0).round() / 10.0,
+            "cpu_pct": ((now.1 - start_cpu) / secs * 1000.0).round() / 10.0,
+            "req_s": ((now.2 - start_req) as f64 / secs * 10.0).round() / 10.0,
+            "window_secs": (secs * 10.0).round() / 10.0,
+            "ws": lock(&self.hub).online(),
+            "relay_sessions": self.relay.session_count(),
+            "relay_pkt_s": ((now.3 - start_fwd) as f64 / secs * 10.0).round() / 10.0,
+            "write_queue": self.store.write_queue(),
+            "resim_queue": self.resim.as_ref().map_or(0, |w| w.queued()),
+            "bench": self.bench.status().map(|r| r.state),
+        }))
     }
 
     pub fn info(&self) -> DbResult<ServerInfo> {
@@ -749,6 +860,15 @@ impl Api {
                     self.truth.official_blob()
                 };
                 blob.map_or_else(|| Err(err(404, "no official feed held")), |b| ok(&b))
+            }
+            ("POST", ["admin", "bench"]) | ("POST", ["v1", "admin", "bench"]) => {
+                self.bench_start(&req, &v)
+            }
+            ("GET", ["admin", "bench"]) | ("GET", ["v1", "admin", "bench"]) => {
+                self.bench_status(&req, &v)
+            }
+            ("GET", ["admin", "stats"]) | ("GET", ["v1", "admin", "stats"]) => {
+                self.admin_stats(&req, &v)
             }
             ("GET", ["v1", "identity"]) => self.identity(&req),
             ("GET", ["v1", "account"]) => self.account(&req, &v, "info"),
@@ -3551,6 +3671,165 @@ pub(crate) mod tests {
             Value::Null,
         ));
         assert_eq!(r.status, 404, "only the players");
+    }
+
+    fn bench_api(bench: bool, data: Option<&std::path::Path>) -> Arc<Api> {
+        Api::new(
+            Store::open(data).unwrap(),
+            ApiConfig {
+                name: "bench-test".into(),
+                bench,
+                data: data.map(std::path::Path::to_path_buf),
+                truth: TruthConfig {
+                    admin_token: Some("tok".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Arc::new(Relay::default()),
+        )
+    }
+
+    #[test]
+    fn bench_routes_need_the_env_and_the_token() {
+        let off = bench_api(false, None);
+        let start = json!({"token": "tok", "steps": [10]});
+        for (m, p) in [("POST", "/admin/bench"), ("GET", "/admin/bench")] {
+            assert_eq!(off.handle(req(m, p, start.clone())).status, 404, "{m} {p}");
+        }
+        // live stats exist without RUGEN_BENCH, the token still counts
+        assert_eq!(
+            off.handle(req("GET", "/admin/stats", json!({"token": "tok"})))
+                .status,
+            200
+        );
+        let on = bench_api(true, None);
+        for token in [None, Some("wrong")] {
+            let body = json!({"token": token, "steps": [10]});
+            for (m, p) in [
+                ("POST", "/admin/bench"),
+                ("GET", "/admin/bench"),
+                ("GET", "/admin/stats"),
+                ("POST", "/v1/admin/bench"),
+            ] {
+                assert_eq!(on.handle(req(m, p, body.clone())).status, 401, "{m} {p}");
+            }
+        }
+        let st = json_of(on.handle(req("GET", "/admin/bench", json!({"token": "tok"}))));
+        assert_eq!(st["state"], "none");
+        let stats = json_of(on.handle(req("GET", "/admin/stats", json!({"token": "tok"}))));
+        for k in [
+            "uptime_secs",
+            "threads",
+            "rss_mb",
+            "cpu_pct",
+            "req_s",
+            "ws",
+            "relay_sessions",
+            "relay_pkt_s",
+            "write_queue",
+            "resim_queue",
+        ] {
+            assert!(stats.get(k).is_some(), "{k} in {stats}");
+        }
+    }
+
+    #[test]
+    fn bench_plans_are_limited() {
+        let api = bench_api(true, None);
+        for bad in [
+            json!({"token": "tok"}),
+            json!({"token": "tok", "steps": [5001]}),
+            json!({"token": "tok", "steps": [100], "mix": "spicy"}),
+            // 6 steps of 52 s: over 5 minutes
+            json!({"token": "tok", "steps": [1, 2, 3, 4, 5, 6]}),
+        ] {
+            assert_eq!(
+                api.handle(req("POST", "/admin/bench", bad.clone())).status,
+                400,
+                "{bad}"
+            );
+        }
+        let st = json_of(api.handle(req("GET", "/admin/bench", json!({"token": "tok"}))));
+        assert_eq!(st["state"], "none", "nothing started");
+    }
+
+    #[test]
+    fn a_bench_runs_alone_on_its_own_data_and_cleans_up() {
+        let data = std::env::temp_dir().join(format!("rugen-bench-main-{}", random_code()));
+        std::fs::create_dir_all(&data).unwrap();
+        let api = bench_api(true, Some(&data));
+        let a = api.store().register().unwrap();
+        let listing = |d: &std::path::Path| -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = walk(d);
+            v.sort();
+            v
+        };
+        fn walk(d: &std::path::Path) -> Vec<(String, u64)> {
+            let mut out = Vec::new();
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    let m = e.metadata().unwrap();
+                    let t = m
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64;
+                    out.push((p.display().to_string(), t));
+                }
+            }
+            out
+        }
+        // settle the main database's files before looking at them
+        std::thread::sleep(Duration::from_millis(50));
+        let before = listing(&data);
+        let accounts = api.store().account_count().unwrap();
+        let plan = json!({"token": "tok", "steps": [4], "hold_secs": 6, "ramp_secs": 0});
+        let r = api.handle(req("POST", "/admin/bench", plan.clone()));
+        assert_eq!(r.status, 202);
+        let id = serde_json::from_slice::<Value>(&r.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            api.handle(req("POST", "/admin/bench", plan)).status,
+            409,
+            "one run at a time"
+        );
+        let t = Instant::now();
+        let st = loop {
+            let st = json_of(api.handle(req("GET", "/admin/bench", json!({"token": "tok"}))));
+            if st["state"] != "running" {
+                break st;
+            }
+            assert!(t.elapsed() < Duration::from_secs(90), "bench never ended");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert_eq!(st["state"], "done", "{st}");
+        assert_eq!(st["id"], id.as_str());
+        let row = &st["rows"][0];
+        assert_eq!(row["clients"], 4);
+        assert!(row["req_s"].as_f64().unwrap() > 0.0, "{row}");
+        assert!(st["note"].as_str().unwrap().contains("lower bound"));
+        // its temporary directory is gone, the real data untouched
+        assert!(
+            !std::env::temp_dir()
+                .join(format!("rugen-bench-{id}"))
+                .exists()
+        );
+        assert_eq!(
+            listing(&data),
+            before,
+            "nothing written to the data directory"
+        );
+        assert_eq!(api.store().account_count().unwrap(), accounts);
+        assert!(api.store().by_key(&a.key).unwrap().is_some());
+        drop(api);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

@@ -33,6 +33,13 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # RGPK packages and rugen-fp-1 fingerprints of API 4 (rugen 0.5) clients
 zstd = { version = "0.13", default-features = false }
 sha2 = "0.11"
+# self-benchmark clients (crate::loadgen): HTTP/1.1 and WebSocket over
+# loopback, the same hyper / tungstenite axum already brings
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 # global allocator: musl's is slow under many threads (the image is musl)
 mimalloc = { version = "0.1", default-features = false }
 
@@ -48,7 +55,7 @@ resim = ["dep:rugen-sim"]
 rugen-net = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.0" }
 rugen-content = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.0" }
 rugen-sim = { git = "https://github.com/rugen-dev/rugen-engine", tag = "v0.6.0" }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 
 [lints.rust]

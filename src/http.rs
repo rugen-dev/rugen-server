@@ -57,7 +57,7 @@ pub struct Limits {
     pub register: u32,
     /// `RUGEN_RATE_RELAY`: `/relay` WebSocket upgrades per IP per 10 s.
     pub relay: u32,
-    /// `RUGEN_RATE_ADMIN`: admin calls (`/v1/admin/*`) per IP per minute
+    /// `RUGEN_RATE_ADMIN`: admin calls (`/v1/admin/*`, `/admin/*`) per IP per minute
     /// (token guessing, bucket listings).
     pub admin: u32,
 }
@@ -326,7 +326,7 @@ async fn any(
             || (method == Method::POST && path.starts_with("/v1/account/"))
         {
             Call::Register
-        } else if path.starts_with("/v1/admin/") {
+        } else if path.starts_with("/v1/admin/") || path.starts_with("/admin/") {
             Call::Admin
         } else {
             Call::Api {

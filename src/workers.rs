@@ -7,12 +7,15 @@
 //! counts). A full queue refuses new work rather than growing: callers
 //! decide what a refusal means (see [`Workers::submit`]).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 pub struct Workers<T> {
     queue: SyncSender<T>,
     name: &'static str,
+    /// Jobs waiting for a thread.
+    queued: Arc<AtomicUsize>,
 }
 
 impl<T: Send + 'static> Workers<T> {
@@ -30,33 +33,54 @@ impl<T: Send + 'static> Workers<T> {
         let (tx, rx) = sync_channel::<T>(queue);
         let rx = Arc::new(Mutex::new(rx));
         let work = Arc::new(work);
+        let queued = Arc::new(AtomicUsize::new(0));
         for i in 0..threads.max(1) {
-            let (rx, work) = (rx.clone(), work.clone());
+            let (rx, work, q) = (rx.clone(), work.clone(), queued.clone());
             std::thread::Builder::new()
                 .name(format!("{name}-{i}"))
                 .spawn(move || {
                     lower_priority(nice);
-                    run(name, &rx, &*work);
+                    run(name, &rx, &q, &*work);
                 })?;
         }
-        Ok(Self { queue: tx, name })
+        Ok(Self {
+            queue: tx,
+            name,
+            queued,
+        })
     }
 
     /// Queue a job. False when the queue is full (the job is dropped and
     /// a warning logged) or the threads are gone.
     pub fn submit(&self, job: T) -> bool {
+        // counted first: a thread may take the job before try_send returns
+        self.queued.fetch_add(1, Ordering::Relaxed);
         match self.queue.try_send(job) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
                 log::warn!("{}: queue full, job dropped", self.name);
                 false
             }
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
         }
+    }
+
+    /// Jobs waiting for a thread.
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 }
 
-fn run<T>(name: &str, rx: &Mutex<Receiver<T>>, work: &(dyn Fn(T) + Send + Sync)) {
+fn run<T>(
+    name: &str,
+    rx: &Mutex<Receiver<T>>,
+    queued: &AtomicUsize,
+    work: &(dyn Fn(T) + Send + Sync),
+) {
     loop {
         let job = {
             let rx = rx.lock().unwrap_or_else(|p| p.into_inner());
@@ -65,6 +89,7 @@ fn run<T>(name: &str, rx: &Mutex<Receiver<T>>, work: &(dyn Fn(T) + Send + Sync))
                 Err(_) => return,
             }
         };
+        queued.fetch_sub(1, Ordering::Relaxed);
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(job))).is_err() {
             log::error!("{name}: a job panicked");
         }

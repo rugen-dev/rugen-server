@@ -495,6 +495,8 @@ again (it is at least the current Unix time).
 | `RUGEN_OFFICIAL_URL` | `https://play.rugen.dev` | where community servers pull the official feed, `off` disables |
 | `RUGEN_OFFICIAL_PULL` | `900` | seconds between feed pulls |
 | `RUGEN_ADMIN_TOKEN` | – | enables `/v1/admin/*` |
+| `RUGEN_BENCH` | – | `1` enables the self-benchmark `POST /admin/bench` (admin token; see `docs/performance.md`; uses this container's CPU quota, run it off-peak) |
+| `RUGEN_BENCH_DIR` | system temp dir | throw-away data of self-benchmark runs (never the data directory; read-only containers need a tmpfs here) |
 | `RUGEN_AUTO_BLOCK_LIARS` | `3` | players lying about a fingerprint before it is blocked (0 = off) |
 | `RUGEN_AUTO_BLOCK_DESYNCS` | `10` | desynced matches before a fingerprint is blocked (0 = off) |
 | `RUGEN_AUTO_BLOCK_ANALYSIS` | `on` | block fingerprints the server's analysis flags as cheats |

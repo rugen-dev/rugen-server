@@ -420,6 +420,8 @@ struct WriteStats {
     last_batch: AtomicU64,
     /// Writes that found the queue full and waited.
     full: AtomicU64,
+    /// Writes queued or running, not answered yet.
+    pending: AtomicU64,
 }
 
 /// One queued write: runs on the writer thread inside the batch
@@ -507,6 +509,7 @@ fn writer_loop(conn: Arc<Mutex<Connection>>, rx: Receiver<Box<dyn Job>>, stats: 
         if let Err(e) = &commit {
             log::error!("store: a batch of {} writes failed: {e}", batch.len());
         }
+        stats.pending.fetch_sub(batch.len() as u64, Relaxed);
         for j in batch {
             j.finish(&commit);
         }
@@ -765,6 +768,7 @@ impl Store {
             out: None,
             reply,
         });
+        self.stats.pending.fetch_add(1, Relaxed);
         let sent = match queue.try_send(job) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(job)) => {
@@ -775,11 +779,17 @@ impl Store {
             Err(TrySendError::Disconnected(_)) => Err(()),
         };
         if sent.is_err() {
+            self.stats.pending.fetch_sub(1, Relaxed);
             return Err(failure("writer thread gone"));
         }
         answer
             .recv()
             .unwrap_or_else(|_| Err(failure("writer thread gone")))
+    }
+
+    /// Writes waiting for (or in) the writer's current transaction.
+    pub fn write_queue(&self) -> u64 {
+        self.stats.pending.load(Relaxed)
     }
 
     /// (batches, writes, size of the last batch, writes that waited for room).

@@ -13,12 +13,27 @@ use crate::relay::{Relay, Route};
 const IP_PPS: u32 = 2000;
 
 pub fn serve(socket: Arc<UdpSocket>, relay: Arc<Relay>) -> std::io::Result<()> {
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     log::info!("udp relay listening on {}", socket.local_addr()?);
+    serve_until(socket, relay, None)
+}
+
+/// [`serve`] until `stop` is set (checked at least every 2 s).
+pub fn serve_until(
+    socket: Arc<UdpSocket>,
+    relay: Arc<Relay>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> std::io::Result<()> {
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut buf = [0u8; 2048];
     let mut per_ip: HashMap<IpAddr, (Instant, u32)> = HashMap::new();
     let mut last_expire = Instant::now();
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Ok(());
+        }
         let now = Instant::now();
         if now.duration_since(last_expire) > Duration::from_secs(5) {
             // (relay sessions expire on the server's own timer, UDP or not)
