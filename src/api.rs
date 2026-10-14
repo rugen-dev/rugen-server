@@ -1201,7 +1201,7 @@ impl Api {
                         }
                     })
                     .collect();
-                t.view(entrants)
+                Box::new(t.view(entrants))
             }),
         }
     }
