@@ -71,6 +71,13 @@ sibling `../rugen-engine`.
 
 Commits follow Conventional Commits: `type(scope): subject`.
 
+## Performance
+
+One CPU / 768 MB (the deploy limits) holds about 1250 concurrent clients
+of the default mix at p99 under 500 ms, CPU-bound; method, numbers and the
+built-in self-benchmark (`RUGEN_BENCH=1`, `POST /admin/bench`,
+`GET /admin/stats`) are in [`docs/performance.md`](docs/performance.md).
+
 ## License
 
 MIT OR Apache-2.0.
