@@ -88,7 +88,8 @@
 //! a named account, logs it out everywhere and prints the password (players
 //! have no e-mail: this is the only recovery; works while the server runs).
 
-#![forbid(unsafe_code)]
+// one audited exception: setpriority in crate::workers
+#![deny(unsafe_code)]
 
 mod api;
 mod backup;
@@ -114,6 +115,7 @@ mod testkit;
 mod truth;
 mod turn;
 mod udp;
+mod workers;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -376,6 +378,14 @@ fn reset_password_cli(store: &store::Store) -> Result<bool, Box<dyn std::error::
     );
     Ok(true)
 }
+
+/// Threads for blocking request handlers (store, Argon2id, packages); more
+/// requests wait in tokio's queue. The whole thread budget stays far below
+/// the container's `pids_limit` (256) under any load: this many, plus the
+/// async workers ([`worker_threads`]), main, the UDP relay, the store's
+/// writer, one re-simulation thread, two TURN API threads and the backup
+/// scheduler / job: about 45.
+const BLOCKING_THREADS: usize = 32;
 
 /// Async worker threads: `RUGEN_WORKERS`, else the CPU quota of this
 /// process's cgroup (containers: `--cpus`), else the cores available; at
@@ -661,7 +671,7 @@ fn run(s: Settings) -> Result<(), Box<dyn std::error::Error>> {
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
-        .max_blocking_threads(32)
+        .max_blocking_threads(BLOCKING_THREADS)
         .enable_all()
         .build()?;
     rt.block_on(async move {

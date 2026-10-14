@@ -108,6 +108,7 @@ use crate::resim::ResimConfig;
 use crate::store::{Account, DbResult, ReportData, Store, random_code, setup_fingerprints};
 use crate::truth::{Truth, TruthConfig};
 use crate::turn::{Turn, TurnConfig};
+use crate::workers::Workers;
 
 mod accounts;
 pub use accounts::LoginGuard;
@@ -296,7 +297,16 @@ pub struct Api {
     logins: Mutex<LoginGuard>,
     /// S3 backups: configuration, running job, schedule.
     pub backups: Arc<Backups>,
+    /// Re-simulations of disputed matches: one low-priority thread
+    /// (when the server can re-simulate).
+    resim: Option<Workers<u64>>,
 }
+
+/// Disputes waiting for the re-simulation thread (match ids: a full queue
+/// leaves a dispute as an ordinary, unsimulated one).
+const RESIM_QUEUE: usize = 4096;
+/// Nice value of the re-simulation thread: request handling comes first.
+const RESIM_NICE: i32 = 10;
 
 /// How long a computed `/health` body is served from the cache.
 const HEALTH_TTL: Duration = Duration::from_secs(1);
@@ -429,6 +439,7 @@ impl Api {
             .expect("a temporary packages directory");
         let turn = cfg.turn.clone().map(Turn::new);
         let backups = Backups::new(std::mem::take(&mut cfg.backup), cfg.data.as_deref());
+        let resim = cfg.resim.is_some();
         Arc::new_cyclic(|me| Self {
             store,
             rooms: Mutex::new(HashMap::new()),
@@ -447,6 +458,20 @@ impl Api {
             health: Mutex::new(None),
             logins: Mutex::new(LoginGuard::default()),
             backups,
+            resim: resim
+                .then(|| {
+                    let me = me.clone();
+                    Workers::spawn("rugen-resim", 1, RESIM_QUEUE, RESIM_NICE, move |id: u64| {
+                        if let Some(api) = me.upgrade() {
+                            api.resim_match(id);
+                        }
+                    })
+                    .map_err(|e| {
+                        log::error!("re-simulation thread: {e}; disputes stay unsimulated")
+                    })
+                    .ok()
+                })
+                .flatten(),
         })
     }
 
@@ -2274,73 +2299,80 @@ impl Api {
     /// (`--features resim` + `RUGEN_RESIM_DATA`), settling it with the
     /// simulated winner.
     fn spawn_resim(&self, match_id: u64) {
-        let (Some(cfg), Some(api)) = (self.cfg.resim.clone(), self.me.upgrade()) else {
+        if let Some(w) = &self.resim
+            && !w.submit(match_id)
+        {
+            log::warn!("match {match_id}: re-simulation queue full, left disputed");
+        }
+    }
+
+    /// Re-simulate one disputed match (on the re-simulation thread).
+    fn resim_match(&self, match_id: u64) {
+        let Some(cfg) = self.cfg.resim.clone() else {
             return;
         };
-        std::thread::spawn(move || {
-            let evidence = api.store.match_evidence(match_id).ok().flatten();
-            let Some((setup, _ranked, players, reports)) = evidence else {
-                return;
-            };
-            if reports.len() < 2 || !api.store.is_disputed(match_id).unwrap_or(false) {
-                return;
-            }
-            let Some((_, longest)) = reports.iter().max_by_key(|(_, r)| r.inputs.len()) else {
-                return;
-            };
-            // another engine version may simulate the match differently:
-            // its result stays as the reports leave it (an ordinary
-            // dispute), nobody is judged by a simulation they did not run
-            let engine = setup_engine(&setup);
-            if !crate::compat::can_resimulate(engine.as_deref()) {
-                let note = format!(
-                    "unverified (version): played on rugen {}, this server simulates rugen {}",
-                    engine.as_deref().unwrap_or("?"),
-                    crate::compat::SIM_ENGINE.unwrap_or("?")
-                );
-                log::info!("match {match_id}: {note}");
-                if let Err(e) = api.store.resolve_dispute(match_id, None, &note) {
-                    log::error!("match {match_id}: {e}");
-                }
-                return;
-            }
-            let note;
-            let winner =
-                match crate::resim::replay(&api.packages, &cfg, &setup, &longest.inputs, None) {
-                    Ok(o) => {
-                        // which report's checksum the simulation reproduces
-                        let honest: Vec<u64> = reports
-                            .iter()
-                            .filter(|(_, r)| {
-                                r.checksum.is_some_and(|c| {
-                                    crate::resim::replay(
-                                        &api.packages,
-                                        &cfg,
-                                        &setup,
-                                        &longest.inputs,
-                                        Some(r.frames),
-                                    )
-                                    .is_ok_and(|x| x.checksum == c)
-                                })
-                            })
-                            .map(|(who, _)| *who)
-                            .collect();
-                        note = format!(
-                            "resim: {} frames, winner {:?}, matching reports {honest:?}",
-                            o.frames, o.winner
-                        );
-                        o.winner.map(|w| players[w])
-                    }
-                    Err(e) => {
-                        note = format!("resim failed: {e}");
-                        None
-                    }
-                };
+        let evidence = self.store.match_evidence(match_id).ok().flatten();
+        let Some((setup, _ranked, players, reports)) = evidence else {
+            return;
+        };
+        if reports.len() < 2 || !self.store.is_disputed(match_id).unwrap_or(false) {
+            return;
+        }
+        let Some((_, longest)) = reports.iter().max_by_key(|(_, r)| r.inputs.len()) else {
+            return;
+        };
+        // another engine version may simulate the match differently:
+        // its result stays as the reports leave it (an ordinary
+        // dispute), nobody is judged by a simulation they did not run
+        let engine = setup_engine(&setup);
+        if !crate::compat::can_resimulate(engine.as_deref()) {
+            let note = format!(
+                "unverified (version): played on rugen {}, this server simulates rugen {}",
+                engine.as_deref().unwrap_or("?"),
+                crate::compat::SIM_ENGINE.unwrap_or("?")
+            );
             log::info!("match {match_id}: {note}");
-            if let Err(e) = api.store.resolve_dispute(match_id, winner, &note) {
+            if let Err(e) = self.store.resolve_dispute(match_id, None, &note) {
                 log::error!("match {match_id}: {e}");
             }
-        });
+            return;
+        }
+        let note;
+        let winner = match crate::resim::replay(&self.packages, &cfg, &setup, &longest.inputs, None)
+        {
+            Ok(o) => {
+                // which report's checksum the simulation reproduces
+                let honest: Vec<u64> = reports
+                    .iter()
+                    .filter(|(_, r)| {
+                        r.checksum.is_some_and(|c| {
+                            crate::resim::replay(
+                                &self.packages,
+                                &cfg,
+                                &setup,
+                                &longest.inputs,
+                                Some(r.frames),
+                            )
+                            .is_ok_and(|x| x.checksum == c)
+                        })
+                    })
+                    .map(|(who, _)| *who)
+                    .collect();
+                note = format!(
+                    "resim: {} frames, winner {:?}, matching reports {honest:?}",
+                    o.frames, o.winner
+                );
+                o.winner.map(|w| players[w])
+            }
+            Err(e) => {
+                note = format!("resim failed: {e}");
+                None
+            }
+        };
+        log::info!("match {match_id}: {note}");
+        if let Err(e) = self.store.resolve_dispute(match_id, winner, &note) {
+            log::error!("match {match_id}: {e}");
+        }
     }
 }
 

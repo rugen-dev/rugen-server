@@ -34,6 +34,10 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 zstd = { version = "0.13", default-features = false }
 sha2 = "0.11"
 
+# setpriority: the re-simulation thread runs at a lower priority
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 # re-simulate disputed ranked matches from stored packages (needs RUGEN_RESIM_DATA)
 resim = ["dep:rugen-sim"]

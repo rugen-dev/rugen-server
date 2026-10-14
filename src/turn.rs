@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 use crate::relay::Relay;
 use crate::store::{Store, TurnMonth, now};
+use crate::workers::Workers;
 
 /// Cloudflare bills decimal gigabytes.
 pub const GB: u64 = 1_000_000_000;
@@ -208,7 +209,19 @@ pub struct Turn {
     pub cfg: TurnConfig,
     agent: ureq::Agent,
     state: Mutex<State>,
+    /// Cloudflare API calls (credentials, revocations, analytics) run on
+    /// these few threads, never one thread per match.
+    calls: Workers<Call>,
 }
+
+/// One background Cloudflare API call.
+type Call = Box<dyn FnOnce() + Send>;
+/// Threads making Cloudflare API calls.
+const CALL_THREADS: usize = 2;
+/// Calls waiting for them; a full queue skips TURN for a match (it starts
+/// without, like when the credentials are late) or a revocation (the
+/// credential then expires with its TTL, already paid for in the budget).
+const CALL_QUEUE: usize = 256;
 
 fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -238,6 +251,10 @@ impl Turn {
                 month: month_of(now()),
                 ..Default::default()
             }),
+            calls: Workers::spawn("rugen-turn", CALL_THREADS, CALL_QUEUE, 0, |call: Call| {
+                call()
+            })
+            .expect("TURN API threads"),
         })
     }
 
@@ -362,7 +379,7 @@ impl Turn {
             );
         }
         let me = self.clone();
-        std::thread::spawn(move || {
+        let queued = self.calls.submit(Box::new(move || {
             let r = (0..2)
                 .map(|_| me.generate(ttl))
                 .collect::<Result<Vec<_>, String>>();
@@ -377,7 +394,11 @@ impl Turn {
                 drop(s);
                 me.revoke(v.into_iter().map(|(u, _)| u).collect());
             }
-        });
+        }));
+        if !queued {
+            // the match starts without TURN
+            lock(&self.state).prepared.remove(&match_id);
+        }
     }
 
     /// The `turn` transports for P1 and P2 if credentials are ready (the
@@ -539,10 +560,11 @@ impl Turn {
             {
                 s.last_poll = Some(Instant::now());
                 let me = self.clone();
-                std::thread::spawn(move || match me.cloudflare_usage(&month) {
-                    Ok(b) => lock(&me.state).cf_usage = Some((month, b)),
-                    Err(e) => log::warn!("turn: Cloudflare analytics: {e}"),
-                });
+                self.calls
+                    .submit(Box::new(move || match me.cloudflare_usage(&month) {
+                        Ok(b) => lock(&me.state).cf_usage = Some((month, b)),
+                        Err(e) => log::warn!("turn: Cloudflare analytics: {e}"),
+                    }));
             }
         }
         self.revoke(revoke);
@@ -625,7 +647,7 @@ impl Turn {
             self.cfg.token.clone(),
             self.agent.clone(),
         );
-        std::thread::spawn(move || {
+        self.calls.submit(Box::new(move || {
             for u in users {
                 let url = format!("{api}/turn/keys/{key}/credentials/{u}/revoke");
                 let r = agent
@@ -638,7 +660,7 @@ impl Turn {
                     Err(e) => log::debug!("turn: revoke: {e}"),
                 }
             }
-        });
+        }));
     }
 
     /// This month's TURN bytes (egress + ingress) from Cloudflare's GraphQL
