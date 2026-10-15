@@ -11,7 +11,10 @@
 //!                               tournament?: 8 | 16}
 //! POST /room/{code}/join        {key, char, password?, spectate?, tournament?: true (the
 //!                               client knows brackets; required for tournament rooms)}
-//! GET  /room/{code}?key=        RoomInfo (also a heartbeat)
+//! GET  /room/{code}?key=        RoomInfo (also a heartbeat); with no key at all, a
+//!                               tournament room's public view (no side, opponent,
+//!                               ticket, matchup or pings; `server_hosted`): the
+//!                               website mirrors the bracket
 //! POST /room/{code}/leave       {key}
 //! POST /room/{code}/kick        {key, id}       host only
 //! POST /room/{code}/rematch     {key}           both players → new match
@@ -71,6 +74,16 @@
 //!                               every key of the account is revoked)
 //! POST /v1/admin/season_end     {token} → Season (the next one; ends the
 //!                               current season now: standings kept, soft reset)
+//! POST /v1/admin/link           {token, code} → {account_id, username, profile}
+//!                               (redeems a link_code once; 404 unknown / expired)
+//! POST /v1/admin/tournament     {token, size: 8 | 16, name?, rules?, public?,
+//!                               entrants: [account_id...], seed?: "order" | "rating"}
+//!                               → {code, tournament} a bracket hosted by the server
+//!                               (no host member) for those accounts, seeded in the
+//!                               order given (or by rating); entrants join the room
+//!                               by its code, each pair is called once both are here
+//!                               (one here for 3 min: walkover)
+//! POST /v1/admin/tournament/{code}/cancel  {token} → {code, cancelled}
 //! POST /v1/admin/backup         {token} → 202 {job} | 409 running | 429 (1 per 10 min)
 //! GET  /v1/admin/backups?token= backups in the bucket {backups: [{key, name, time, size, complete, legacy}]}
 //! GET  /v1/admin/backup/status?token=  the health `backup` object + job, includes
@@ -84,6 +97,8 @@
 //! POST /v1/account/password     {key, password, new_password}    → Session (fresh key)
 //! POST /v1/account/logout       {key}
 //! POST /v1/account/logout_all   {key}
+//! POST /v1/account/link_code    {key} → {code, expires_at, expires_in} (6 characters
+//!                               for the website, valid 10 min, one per account)
 //! ```
 //!
 //! Additive JSON fields (older clients ignore them; typed `rugen_proto`
@@ -237,6 +252,11 @@ struct Room {
     engine: Option<String>,
     /// A tournament room: its bracket (see [`crate::tournament`]).
     tournament: Option<Tournament>,
+    /// Hosted by the server itself (`POST /v1/admin/tournament`): no host
+    /// member; the room lives until its bracket is done, cancelled or
+    /// [`ROOM_MAX_AGE_SECS`] old, and its pairs are called once both
+    /// players are here.
+    server_hosted: bool,
 }
 
 impl Room {
@@ -374,6 +394,8 @@ pub struct Api {
     health: Mutex<Option<(Instant, Value)>>,
     /// Failed logins per username / address ([`accounts`]).
     logins: Mutex<LoginGuard>,
+    /// Website link codes by code ([`accounts`]).
+    links: Mutex<HashMap<String, accounts::LinkCode>>,
     /// S3 backups: configuration, running job, schedule.
     pub backups: Arc<Backups>,
     /// Re-simulations of disputed matches: one low-priority thread
@@ -567,6 +589,7 @@ impl Api {
             seen: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
             logins: Mutex::new(LoginGuard::default()),
+            links: Mutex::new(HashMap::new()),
             backups,
             resim: resim
                 .then(|| {
@@ -993,6 +1016,10 @@ impl Api {
             ("GET", ["v1", "identity"]) => self.identity(&req),
             ("GET", ["v1", "account"]) => self.account(&req, &v, "info"),
             ("POST", ["v1", "account", op]) => self.account(&req, &v, op),
+            ("POST", ["v1", "admin", "tournament", code, "cancel"]) => {
+                self.admin_auth(&req, &v)?;
+                self.admin_cancel_tournament(code)
+            }
             ("POST", ["v1", "admin", op]) => self.admin(&req, &v, op),
             ("GET", ["v1", "admin", "blocklist"]) => self.admin(&req, &v, "blocklist"),
             ("GET", ["v1", "admin", "backups"]) => self.admin(&req, &v, "backups"),
@@ -1135,7 +1162,8 @@ impl Api {
                 .retain(|m| m.last_seen.elapsed().as_secs() < MEMBER_TIMEOUT_SECS);
         }
         rooms.retain(|code, r| {
-            let keep = r.player(0).is_some() && r.created.elapsed().as_secs() < ROOM_MAX_AGE_SECS;
+            let hosted = r.server_hosted || r.player(0).is_some();
+            let keep = hosted && r.created.elapsed().as_secs() < ROOM_MAX_AGE_SECS;
             if !keep && let Some(run) = &r.running {
                 self.relay.close(run.session);
                 log::info!(
@@ -1314,7 +1342,14 @@ impl Api {
             .iter()
             .filter(|(_, r)| r.public)
             .map(|(code, r)| {
-                let host = r.player(0).map(|m| Self::profile(s, m.account));
+                let mut host = r.player(0).map(|m| Self::profile(s, m.account));
+                if r.server_hosted {
+                    // the lobby shows who hosts: the server itself
+                    host = Some(ProfileInfo {
+                        name: self.cfg.name.clone(),
+                        ..ProfileInfo::default()
+                    });
+                }
                 (
                     r.api != req.api,
                     std::cmp::Reverse(r.created),
@@ -1418,6 +1453,7 @@ impl Api {
             api: req.api,
             engine: req.engine.clone(),
             tournament: tour,
+            server_hosted: false,
         };
         let view = self.room_view(s, &code, &room, me.id);
         rooms.insert(code.clone(), room);
@@ -1444,6 +1480,10 @@ impl Api {
             if r.api != req.api {
                 return Err(err(409, &crate::compat::room_refusal(req.api, r.api)));
             }
+            // a server-hosted room runs the game version of its first player
+            if r.server_hosted && r.engine.is_none() {
+                r.engine = req.engine.clone();
+            }
             // and simulate them the same way
             if let (Some(mine), Some(host)) = (&req.engine, &r.engine)
                 && mine != host
@@ -1464,10 +1504,12 @@ impl Api {
                     "this room runs a tournament bracket: update rugen to join",
                 ));
             }
-            let entrant = r
-                .tournament
-                .as_ref()
-                .is_some_and(|t| t.state() == "open" && !t.full());
+            // (an admin tournament's bracket is drawn: its entrants come
+            // back to their seats whenever they arrive)
+            let entrant = r.tournament.as_ref().is_some_and(|t| {
+                (t.state() == "open" && !t.full())
+                    || (r.server_hosted && t.state() != "done" && t.entrants.contains(&me.id))
+            });
             let role = if r.tournament.is_some() && !spectate && entrant {
                 ROLE_ENTRANT
             } else if r.tournament.is_none() && !spectate && r.player(1).is_none() {
@@ -1489,6 +1531,7 @@ impl Api {
             log::info!("room {code}: {} joined as role {role}", me.id);
             if role == ROLE_ENTRANT
                 && let Some(t) = r.tournament.as_mut()
+                && !t.entrants.contains(&me.id)
             {
                 t.entrants.push(me.id);
             }
@@ -1502,8 +1545,18 @@ impl Api {
 
     fn poll_room(&self, req: &Request, v: &Value, code: &str) -> Res {
         let s = &self.store;
-        let me = self.auth(s, req, v)?;
         let code = code.trim().to_ascii_uppercase();
+        if request_key(req, v).is_none() {
+            // no key at all: a tournament room's bracket is public (the
+            // website mirrors it); anything else still needs a member
+            let rooms = lock(&self.rooms);
+            let r = rooms.get(&code).ok_or_else(|| err(404, "no such room"))?;
+            if r.tournament.is_none() {
+                return Err(err(401, "bad key"));
+            }
+            return Ok(Response::json(200, &self.public_room_view(s, &code, r)));
+        }
+        let me = self.auth(s, req, v)?;
         let mut rooms = lock(&self.rooms);
         if let Some(m) = rooms
             .get_mut(&code)
@@ -1547,7 +1600,7 @@ impl Api {
                     self.relay.close(run.session);
                 }
             }
-            if r.player(0).is_none() {
+            if r.player(0).is_none() && !r.server_hosted {
                 // the host left: the room closes
                 let others: Vec<u64> = r.members.iter().map(|m| m.account).collect();
                 rooms.remove(&code);
@@ -2032,7 +2085,49 @@ impl Api {
             let Some(b) = t.bracket.as_mut() else {
                 return Ok(());
             };
-            if let Some((round, i)) = b.next()
+            let next = if r.server_hosted {
+                // nobody hosts: the first pending pair with both players
+                // here is called; a pair with one player here for
+                // CALL_TIMEOUT_SECS is that player's walkover
+                let now = Instant::now();
+                let mut call = None;
+                let mut decided = Vec::new();
+                for (round, i) in b.pending() {
+                    let Some(players) = b.players(round, i) else {
+                        continue;
+                    };
+                    match players.map(|p| members.contains(&p)) {
+                        [true, true] => {
+                            t.waiting.remove(&(round, i));
+                            call.get_or_insert((round, i));
+                        }
+                        [here, _] if here || members.contains(&players[1]) => {
+                            let since = *t.waiting.entry((round, i)).or_insert(now);
+                            if since.elapsed().as_secs() > tournament::CALL_TIMEOUT_SECS {
+                                decided.push((round, i, players[usize::from(!here)]));
+                            }
+                        }
+                        _ => {
+                            t.waiting.remove(&(round, i));
+                        }
+                    }
+                }
+                for (round, i, w) in decided {
+                    t.waiting.remove(&(round, i));
+                    b.record(round, i, w, [0, 0]);
+                    log::info!(
+                        "room {code}: bracket match {round}/{i} walkover for {w} (opponent absent)"
+                    );
+                    changed = true;
+                }
+                if let Some(c) = b.champion() {
+                    log::info!("room {code}: {c} wins the tournament");
+                }
+                call.filter(|_| b.champion().is_none())
+            } else {
+                b.next()
+            };
+            if let Some((round, i)) = next
                 && let Some(players) = b.players(round, i)
             {
                 let setup = json!({ "rules": r.rules, "tournament": true }).to_string();
@@ -2480,7 +2575,9 @@ impl Api {
     }
 
     /// Admin API (`RUGEN_ADMIN_TOKEN`): block / unblock / list fingerprints.
-    fn admin(&self, req: &Request, v: &Value, op: &str) -> Res {
+    /// `RUGEN_ADMIN_TOKEN` as `Authorization: Bearer`, the body's `token`
+    /// or `?token=`.
+    fn admin_auth(&self, req: &Request, v: &Value) -> Result<(), Response> {
         if self.truth.cfg.admin_token.is_none() {
             return Err(err(404, "admin api disabled (set RUGEN_ADMIN_TOKEN)"));
         }
@@ -2493,8 +2590,15 @@ impl Api {
         if !self.truth.admin_ok(&token) {
             return Err(err(403, "bad admin token"));
         }
+        Ok(())
+    }
+
+    fn admin(&self, req: &Request, v: &Value, op: &str) -> Res {
+        self.admin_auth(req, v)?;
         match op {
             "backup" => return self.backup_now(),
+            "link" => return self.admin_link(v),
+            "tournament" => return self.admin_tournament(v),
             "season_end" => {
                 let next = db(self.store.end_season_now())?;
                 log::warn!("admin: season ended early, {} started", next.name);
@@ -2574,6 +2678,139 @@ impl Api {
                 "sequence": f.sequence, "issued_at": f.issued_at, "blocked": f.blocked.len(),
             })),
         }))
+    }
+
+    /// `POST /v1/admin/tournament`: a bracket of 8 or 16 hosted by the
+    /// server for the accounts given (seeded in that order, or by rating
+    /// with `seed: "rating"`). Players enter the room code in the ONLINE
+    /// lobby; the bracket calls each pair once both are in the room.
+    fn admin_tournament(&self, v: &Value) -> Res {
+        let s = &self.store;
+        let size = v.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let size = tournament::SIZES
+            .iter()
+            .copied()
+            .find(|z| u64::from(*z) == size)
+            .ok_or_else(|| err(400, "size: 8 or 16"))?;
+        let ids: Vec<u64> = v
+            .get("entrants")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        if ids.len() < 2 || ids.len() > usize::from(size) {
+            return Err(err(400, "entrants: 2 to size account ids"));
+        }
+        let mut seeds = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            if seeds.iter().any(|x: &Seed| x.account == id) {
+                return Err(err(400, "entrants: an account is listed twice"));
+            }
+            let a = db(s.by_id(id))?.ok_or_else(|| err(404, "no such account"))?;
+            seeds.push(Seed {
+                account: id,
+                rating: a.rating,
+            });
+        }
+        let bracket = match v.get("seed").and_then(Value::as_str) {
+            Some("rating") => Bracket::draw(usize::from(size), &seeds),
+            Some("order") | None => Bracket::draw_seeded(usize::from(size), seeds),
+            Some(_) => return Err(err(400, "seed: \"order\" or \"rating\"")),
+        };
+        let name = str_field(v, "name", 64)
+            .map(|n| clean_name(&n))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "TOURNAMENT".into());
+        let mut t = Tournament::new(size);
+        t.entrants = bracket.seeds.iter().map(|x| x.account).collect();
+        t.bracket = Some(bracket);
+        let mut rooms = lock(&self.rooms);
+        self.expire_rooms(&mut rooms);
+        if rooms.len() >= MAX_ROOMS {
+            return Err(err(409, "too many rooms"));
+        }
+        let mut code = random_code();
+        while rooms.contains_key(&code) {
+            code = random_code();
+        }
+        let mut room = Room {
+            name,
+            public: v.get("public").and_then(Value::as_bool).unwrap_or(true),
+            password: None,
+            rules: clean_rules(v.get("rules")),
+            max_spectators: TOURNAMENT_SPECTATORS,
+            members: Vec::new(),
+            kicked: Vec::new(),
+            created: Instant::now(),
+            running: None,
+            matchup: None,
+            api: crate::compat::API,
+            engine: None,
+            tournament: Some(t),
+            server_hosted: true,
+        };
+        log::warn!(
+            "admin: tournament room {code} of {} ({} entrants) hosted by the server",
+            size,
+            ids.len()
+        );
+        self.tick_tournament(s, &code, &mut room)?;
+        let view = self.public_room_view(s, &code, &room);
+        rooms.insert(code.clone(), room);
+        Ok(Response::json(
+            200,
+            &json!({ "code": code, "tournament": view["tournament"] }),
+        ))
+    }
+
+    /// `POST /v1/admin/tournament/{code}/cancel`: the server-hosted room
+    /// closes; its members are told.
+    fn admin_cancel_tournament(&self, code: &str) -> Res {
+        let s = &self.store;
+        let code = code.trim().to_ascii_uppercase();
+        let mut rooms = lock(&self.rooms);
+        let r = rooms
+            .get_mut(&code)
+            .filter(|r| r.tournament.is_some())
+            .ok_or_else(|| err(404, "no such tournament room"))?;
+        if !r.server_hosted {
+            return Err(err(409, "a player hosts this room"));
+        }
+        let members: Vec<u64> = r.members.iter().map(|m| m.account).collect();
+        for &m in &members {
+            self.fail_matchup_of(s, r, m, "the tournament was cancelled");
+        }
+        if let Some(run) = r.running.take() {
+            self.relay.close(run.session);
+        }
+        rooms.remove(&code);
+        let hub = lock(&self.hub);
+        for a in &members {
+            hub.push(*a, &ServerMsg::Kicked { code: code.clone() });
+        }
+        log::warn!(
+            "admin: tournament room {code} cancelled ({} members)",
+            members.len()
+        );
+        ok(&json!({ "code": code, "cancelled": true }))
+    }
+
+    /// What anyone may see of a tournament room (`GET /room/{code}` with no
+    /// key): the room, its bracket and who is here, nothing of a player's
+    /// own (ticket, matchup, opponent, ping).
+    fn public_room_view(&self, store: &Store, code: &str, r: &Room) -> Value {
+        let mut v = serde_json::to_value(self.room_view(store, code, r, 0)).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            for k in ["side", "opponent", "est_ping_ms", "ticket", "matchup"] {
+                o.remove(k);
+            }
+            o.insert("server_hosted".into(), r.server_hosted.into());
+        }
+        if let Some(ms) = v.get_mut("members").and_then(Value::as_array_mut) {
+            for m in ms.iter_mut().filter_map(Value::as_object_mut) {
+                m.remove("rtt_ms");
+            }
+        }
+        v
     }
 
     /// `POST /v1/admin/backup`: start one now (202 + job id).
@@ -6571,6 +6808,230 @@ pub(crate) mod tests {
         let r = bad.handle(req("POST", "/v1/admin/backup", json!({"token": "tok"})));
         assert_eq!(r.status, 503);
         assert!(!String::from_utf8_lossy(&r.body).contains("SECRET"));
+    }
+
+    /// The game asks for a link code; the website redeems it with the
+    /// admin token, once; a new request replaces the old code; codes expire.
+    #[test]
+    fn link_codes_are_short_lived_and_used_once() {
+        let api = official_api();
+        let s = signup(&api, "axel", "correct horse battery");
+        let key = s["key"].as_str().unwrap().to_string();
+        let id = s["id"].as_u64().unwrap();
+        let ask = || json_of(account(&api, "link_code", json!({"key": key})));
+        let redeem = |token: &str, code: &str| {
+            api.handle(req(
+                "POST",
+                "/v1/admin/link",
+                json!({"token": token, "code": code}),
+            ))
+        };
+        assert_eq!(
+            account(&api, "link_code", json!({"key": "nope"})).status,
+            401
+        );
+        let first = ask();
+        let code = first["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 6);
+        assert!(
+            code.chars()
+                .all(|c| rugen_proto::room_code::ALPHABET.contains(c)),
+            "{code}"
+        );
+        assert_eq!(first["expires_in"], 600);
+        assert!(first["expires_at"].as_u64().unwrap() >= crate::store::now() + 599);
+        // asking again replaces the code
+        let second = ask()["code"].as_str().unwrap().to_string();
+        assert_ne!(second, code);
+        assert_eq!(redeem("tok", &code).status, 404, "replaced");
+        assert_eq!(redeem("wrong", &second).status, 403);
+        assert_eq!(redeem("tok", "").status, 404);
+        // redeemed once, lower case accepted
+        let got = json_of(redeem("tok", &second.to_ascii_lowercase()));
+        assert_eq!(got["account_id"].as_u64(), Some(id));
+        assert_eq!(got["username"], "axel");
+        assert_eq!(got["profile"]["id"].as_u64(), Some(id));
+        assert_eq!(got["profile"]["name"], "axel");
+        assert_eq!(redeem("tok", &second).status, 404, "used");
+        // expired codes are gone
+        let third = ask()["code"].as_str().unwrap().to_string();
+        if let Some(l) = lock(&api.links).get_mut(&third) {
+            l.expires = Instant::now() - Duration::from_secs(1);
+        }
+        assert_eq!(redeem("tok", &third).status, 404, "expired");
+        assert!(lock(&api.links).is_empty());
+        // anonymous accounts link too (no username)
+        let (aid, akey) = register(&api);
+        let c = json_of(account(&api, "link_code", json!({"key": akey})))["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let got = json_of(redeem("tok", &c));
+        assert_eq!(got["account_id"].as_u64(), Some(aid));
+        assert_eq!(got["username"], "");
+    }
+
+    /// An operator opens a bracket for named accounts: no host, public
+    /// bracket without a key, pairs called once both players are in the
+    /// room, a walkover when one never comes, cancel closes it.
+    #[test]
+    fn admin_tournaments_run_without_a_host() {
+        let api = official_api();
+        let people: Vec<(u64, String)> = (0..4).map(|_| register(&api)).collect();
+        let ids: Vec<u64> = people.iter().map(|p| p.0).collect();
+        let key_of = |id: u64| people.iter().find(|p| p.0 == id).unwrap().1.clone();
+        let create = |body: Value| api.handle(req("POST", "/v1/admin/tournament", body));
+        assert_eq!(
+            create(json!({"token": "tok", "size": 4, "entrants": ids})).status,
+            400
+        );
+        assert_eq!(
+            create(json!({"token": "tok", "size": 8, "entrants": [ids[0]]})).status,
+            400
+        );
+        assert_eq!(
+            create(json!({"token": "tok", "size": 8, "entrants": [ids[0], ids[0]]})).status,
+            400
+        );
+        assert_eq!(
+            create(json!({"token": "tok", "size": 8, "entrants": [ids[0], 999_999]})).status,
+            404
+        );
+        assert_eq!(
+            create(json!({"token": "nope", "size": 8, "entrants": ids})).status,
+            403
+        );
+        let made = json_of(create(json!({
+            "token": "tok", "size": 8, "name": "Site Cup", "rules": {"life": 7000},
+            "entrants": ids,
+        })));
+        let code = made["code"].as_str().unwrap().to_string();
+        assert_eq!(made["tournament"]["state"], "running");
+        // the public view, no key: the bracket, seeded in the order given
+        let public = || json_of(api.handle(req("GET", &format!("/room/{code}"), Value::Null)));
+        let v = public();
+        assert_eq!(v["name"], "Site Cup");
+        assert_eq!(v["rules"]["life"], 7000);
+        assert_eq!(v["server_hosted"], true);
+        assert!(v.get("ticket").is_none() && v.get("matchup").is_none() && v.get("side").is_none());
+        let t = &v["tournament"];
+        let seeds: Vec<u64> = t["entrants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seeds, ids, "seeded in the order given");
+        assert!(t["entrants"][0]["name"].is_string());
+        assert!(t["live"].is_null(), "nobody here: nothing called");
+        assert_eq!(t["rounds"][1][0]["state"], "next");
+        // an ordinary room stays private without a key
+        let (_, hk) = register(&api);
+        let plain = json_of(api.handle(req("POST", "/room", json!({"key": hk}))));
+        let r = api.handle(req(
+            "GET",
+            &format!("/room/{}", plain["code"].as_str().unwrap()),
+            Value::Null,
+        ));
+        assert_eq!(r.status, 401);
+        // seed 1 arrives alone: its semi-final waits for seed 4
+        let join = |k: &str| {
+            json_of(api.handle(req(
+                "POST",
+                &format!("/room/{code}/join"),
+                json!({"key": k, "tournament": true}),
+            )))
+        };
+        assert_eq!(
+            join(&key_of(ids[0]))["side"],
+            3,
+            "an entrant, not a spectator"
+        );
+        api.sweep_tournaments();
+        assert!(public()["tournament"]["live"].is_null());
+        // three minutes later nobody came: a walkover
+        for r in lock(&api.rooms).values_mut() {
+            if let Some(t) = r.tournament.as_mut() {
+                for w in t.waiting.values_mut() {
+                    *w = Instant::now() - Duration::from_secs(tournament::CALL_TIMEOUT_SECS + 1);
+                }
+            }
+        }
+        api.sweep_tournaments();
+        let t = public()["tournament"].clone();
+        assert_eq!(t["rounds"][1][0]["winner"].as_u64(), Some(ids[0]));
+        assert_eq!(t["rounds"][1][0]["score"], json!([0, 0]));
+        // seeds 2 and 3 arrive: their semi-final is called at once
+        join(&key_of(ids[1]));
+        join(&key_of(ids[2]));
+        api.sweep_tournaments();
+        let t = public()["tournament"].clone();
+        assert_eq!(t["live"], json!([1, 1]));
+        let semi = &t["rounds"][1][1];
+        assert_eq!(semi["state"], "called");
+        let (p1, p2) = (semi["p1"].as_u64().unwrap(), semi["p2"].as_u64().unwrap());
+        assert_eq!((p1, p2), (ids[1], ids[2]));
+        let mid = semi["match_id"].as_u64().unwrap();
+        let mine = json_of(api.handle(req(
+            "GET",
+            &format!("/room/{code}?key={}", key_of(p1)),
+            Value::Null,
+        )));
+        assert_eq!(mine["side"], 1);
+        assert_eq!(mine["matchup"]["id"].as_u64(), Some(mid));
+        for k in [key_of(p1), key_of(p2)] {
+            json_of(api.handle(req(
+                "POST",
+                "/result",
+                json!({"key": k, "match_id": mid, "winner": p2, "rounds": [0, 2]}),
+            )));
+        }
+        api.sweep_tournaments();
+        let t = public()["tournament"].clone();
+        assert_eq!(t["rounds"][1][1]["winner"].as_u64(), Some(p2));
+        assert_eq!(t["rounds"][2][0]["p1"].as_u64(), Some(ids[0]));
+        assert_eq!(t["rounds"][2][0]["p2"].as_u64(), Some(p2));
+        // nobody hosts: the room survives every player leaving
+        for id in [ids[0], ids[1], ids[2]] {
+            json_of(api.handle(req(
+                "POST",
+                &format!("/room/{code}/leave"),
+                json!({"key": key_of(id)}),
+            )));
+        }
+        assert_eq!(public()["members"].as_array().unwrap().len(), 0);
+        // the operator closes it
+        assert_eq!(
+            api.handle(req(
+                "POST",
+                &format!("/v1/admin/tournament/{code}/cancel"),
+                json!({"token": "bad"}),
+            ))
+            .status,
+            403
+        );
+        let r = json_of(api.handle(req(
+            "POST",
+            &format!("/v1/admin/tournament/{code}/cancel"),
+            json!({"token": "tok"}),
+        )));
+        assert_eq!(r["cancelled"], true);
+        assert_eq!(
+            api.handle(req("GET", &format!("/room/{code}"), Value::Null))
+                .status,
+            404
+        );
+        // a player's own tournament room cannot be cancelled this way
+        let own = json_of(api.handle(req("POST", "/room", json!({"key": hk, "tournament": 8}))));
+        let r = api.handle(req(
+            "POST",
+            &format!(
+                "/v1/admin/tournament/{}/cancel",
+                own["code"].as_str().unwrap()
+            ),
+            json!({"token": "tok"}),
+        ));
+        assert_eq!(r.status, 409);
     }
 
     #[test]

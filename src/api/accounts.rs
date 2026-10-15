@@ -13,6 +13,10 @@
 //! * API 4 (rugen 0.5) clients never see any of this: they keep their
 //!   anonymous accounts and free-form names, which can no longer be set to
 //!   somebody's username.
+//! * Website links: the game asks for a short code (`link_code`), the
+//!   player types it on the website, which redeems it with the admin token
+//!   (`/v1/admin/link`) and learns which account it is. Codes live in
+//!   memory for [`LINK_TTL`], one per account, and are used once.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -38,6 +42,35 @@ const BASE_LOCK: Duration = Duration::from_secs(30);
 const MAX_LOCK: Duration = Duration::from_secs(15 * 60);
 /// Strikes are forgotten this long after the last failure.
 const FORGET: Duration = Duration::from_secs(3600);
+
+/// A website link code is valid this long.
+pub const LINK_TTL: Duration = Duration::from_secs(10 * 60);
+/// Characters of a link code (the room-code alphabet: no look-alikes).
+pub const LINK_CODE_LEN: usize = 6;
+/// Live link codes kept at most (the oldest go when it is full).
+const LINK_MAX: usize = 10_000;
+
+/// A code handed to a player for the website, until it is redeemed.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkCode {
+    pub account: u64,
+    pub expires: Instant,
+}
+
+/// A fresh link code from the room-code alphabet.
+fn link_code() -> String {
+    let set = rugen_proto::room_code::ALPHABET.as_bytes();
+    let mut out = String::with_capacity(LINK_CODE_LEN);
+    while out.len() < LINK_CODE_LEN {
+        let mut b = [0u8; 1];
+        let _ = getrandom::getrandom(&mut b);
+        // rejection sampling keeps every character equally likely
+        if usize::from(b[0]) < 256 - 256 % set.len() {
+            out.push(set[usize::from(b[0]) % set.len()] as char);
+        }
+    }
+    out
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Strikes {
@@ -199,6 +232,7 @@ impl Api {
                 })
             }
             "password" => self.account_password(req, v),
+            "link_code" => self.account_link_code(req, v),
             "logout" | "logout_all" => {
                 let s = &self.store;
                 let a = self.auth(s, req, v)?;
@@ -317,6 +351,63 @@ impl Api {
             a.id
         );
         session(&a, key)
+    }
+
+    /// `POST /v1/account/link_code {key}` → `{code, expires_at, expires_in}`:
+    /// a code for the website, valid [`LINK_TTL`]; asking again replaces
+    /// the account's previous code.
+    fn account_link_code(&self, req: &Request, v: &Value) -> Res {
+        let a = self.me(req, v)?;
+        let now = Instant::now();
+        let mut links = lock(&self.links);
+        links.retain(|_, l| l.account != a.id && l.expires > now);
+        if links.len() >= LINK_MAX
+            && let Some(oldest) = links
+                .iter()
+                .min_by_key(|(_, l)| l.expires)
+                .map(|(c, _)| c.clone())
+        {
+            links.remove(&oldest);
+        }
+        let mut code = link_code();
+        while links.contains_key(&code) {
+            code = link_code();
+        }
+        links.insert(
+            code.clone(),
+            LinkCode {
+                account: a.id,
+                expires: now + LINK_TTL,
+            },
+        );
+        ok(&json!({
+            "code": code,
+            "expires_at": crate::store::now() + LINK_TTL.as_secs(),
+            "expires_in": LINK_TTL.as_secs(),
+        }))
+    }
+
+    /// `POST /v1/admin/link {token, code}` → `{account_id, username,
+    /// profile}`: the website redeems a code (once; 404 unknown or expired).
+    pub(super) fn admin_link(&self, v: &Value) -> Res {
+        let code = field(v, "code", 16)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        let link = {
+            let mut links = lock(&self.links);
+            let now = Instant::now();
+            links.retain(|_, l| l.expires > now);
+            links.remove(&code)
+        };
+        let link = link.ok_or_else(|| err(404, "unknown or expired code"))?;
+        let a = db(self.store.by_id(link.account))?.ok_or_else(|| err(404, "gone"))?;
+        log::info!("accounts: {} linked to the website", a.id);
+        ok(&json!({
+            "account_id": a.id,
+            "username": a.username.clone().unwrap_or_default(),
+            "profile": a.info(),
+        }))
     }
 
     /// Operator reset (`/v1/admin/reset_password`, `--reset-password`): a
