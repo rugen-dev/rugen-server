@@ -66,10 +66,15 @@ impl Bracket {
     /// least 2, at most `size`): seeded by rating (then the earlier entrant),
     /// empty positions are byes for the top seeds.
     pub fn draw(size: usize, entrants: &[Seed]) -> Self {
-        let size = size.max(entrants.len()).next_power_of_two().max(2);
         let mut seeds: Vec<(usize, Seed)> = entrants.iter().cloned().enumerate().collect();
         seeds.sort_by_key(|(i, s)| (std::cmp::Reverse(s.rating), *i));
-        let seeds: Vec<Seed> = seeds.into_iter().map(|(_, s)| s).collect();
+        Self::draw_seeded(size, seeds.into_iter().map(|(_, s)| s).collect())
+    }
+
+    /// Draw a bracket of `size` positions for `seeds` already in seed order
+    /// (the first is seed 1): an operator's own seeding.
+    pub fn draw_seeded(size: usize, seeds: Vec<Seed>) -> Self {
+        let size = size.max(seeds.len()).next_power_of_two().max(2);
         let pos = seed_positions(size);
         let first: Vec<Pair> = pos
             .chunks(2)
@@ -153,14 +158,21 @@ impl Bracket {
     /// The next pair to call: the earliest round's first pair with both
     /// entrants and no winner.
     pub fn next(&self) -> Option<(usize, usize)> {
+        self.pending().into_iter().next()
+    }
+
+    /// Every pair that can be called (both entrants, no winner), in
+    /// bracket order.
+    pub fn pending(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
         for (r, round) in self.rounds.iter().enumerate() {
             for (i, p) in round.iter().enumerate() {
                 if p.winner.is_none() && p.slots[0].is_some() && p.slots[1].is_some() {
-                    return Some((r, i));
+                    out.push((r, i));
                 }
             }
         }
-        None
+        out
     }
 
     /// The accounts of a pair (P1 = the higher seed).
@@ -272,6 +284,11 @@ pub struct Tournament {
     pub next_at: Option<std::time::Instant>,
     /// Rounds won per side reported by the players, by match id.
     pub scores: std::collections::HashMap<u64, [u8; 2]>,
+    /// Server-hosted brackets ([`crate::api`] admin tournaments) call a
+    /// pair once both players are in the room: since when exactly one of
+    /// them has been waiting, by pair (after [`CALL_TIMEOUT_SECS`] the one
+    /// here goes through).
+    pub waiting: std::collections::HashMap<(usize, usize), std::time::Instant>,
 }
 
 impl Tournament {
@@ -377,6 +394,16 @@ mod tests {
         assert_eq!(v[0][1].seeds, [4, 5]);
         assert_eq!(v[0][1].score, [1, 2]);
         assert_eq!(v[2][0].state, "done");
+    }
+
+    #[test]
+    fn an_operator_seeds_in_the_order_given() {
+        // the worst rating first: still seed 1
+        let b = Bracket::draw_seeded(8, seeds(&[1000, 1700, 1100, 1600]));
+        assert_eq!(b.seeds[0].account, 100);
+        assert_eq!(b.players(1, 0), Some([100, 103]), "1 v 4 after the byes");
+        assert_eq!(b.players(1, 1), Some([101, 102]), "2 v 3");
+        assert_eq!(b.pending(), vec![(1, 0), (1, 1)]);
     }
 
     #[test]

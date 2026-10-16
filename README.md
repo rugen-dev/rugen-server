@@ -12,6 +12,9 @@ server: `play.rugen.dev`
 - **Accounts**: optional username and password (Argon2id), several devices.
 - **Lobby**: public and private rooms, spectators, rematch, tournament
   brackets of 8 or 16 players (seeded by rating, matches called by the server).
+- **Website hooks** (admin token): link codes that tie a game account to a
+  rugen.dev login, and server-hosted tournament brackets with a public
+  bracket view for the site to mirror.
 - **Quick match and ranked**: Elo, 90-day seasons (final standings and tier
   badges kept), leaderboards.
 - **Match relay**: UDP with a WebSocket fallback; players never see each
