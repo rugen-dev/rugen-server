@@ -1635,8 +1635,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-cns"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "indexmap",
  "libm",
@@ -1648,8 +1648,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-content"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "blake3",
  "image-webp",
@@ -1667,8 +1667,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-fair"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "libm",
  "log",
@@ -1684,8 +1684,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-formats"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "bytemuck",
  "image-webp",
@@ -1702,8 +1702,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-net"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1727,16 +1727,16 @@ dependencies = [
 
 [[package]]
 name = "rugen-opus"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "unsafe-libopus",
 ]
 
 [[package]]
 name = "rugen-proto"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "serde",
  "serde_json",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "rugen-server"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1777,8 +1777,8 @@ dependencies = [
 
 [[package]]
 name = "rugen-sim"
-version = "0.7.2"
-source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.7.2#b9bf6845ffa24c4959480f5bc47b6dc455e4bbf6"
+version = "0.8.0"
+source = "git+https://github.com/rugen-dev/rugen-engine?tag=v0.8.0#e537dd3dec30c89f7de284382a09876915f4be6d"
 dependencies = [
  "bincode",
  "indexmap",
