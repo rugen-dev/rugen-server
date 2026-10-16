@@ -1256,6 +1256,7 @@ impl Api {
             match_id: r.running.as_ref().map_or(0, |run| run.match_id),
             est_ping_ms,
             ticket: my_ticket,
+            server_hosted: r.server_hosted,
             matchup,
             tournament: r.tournament.as_ref().map(|t| {
                 let seeds: Vec<(u64, u8)> = match &t.bracket {
